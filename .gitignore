@@ -1,0 +1,14 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.next/
+.pnpm-store/
+artifacts/verification/**
+!artifacts/verification/**/
+!artifacts/verification/**/summary.md
+coverage/
+dist/
+node_modules/
+var/assets/**
+!var/assets/.gitkeep

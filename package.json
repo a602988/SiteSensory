@@ -1,0 +1,38 @@
+{
+    "name": "sitesensory",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "packageManager": "pnpm@11.0.9",
+    "engines": {
+        "node": ">=24 <25",
+        "pnpm": ">=11 <12"
+    },
+    "scripts": {
+        "auth:hash": "tsx apps/api/src/hash-password.ts",
+        "check": "pnpm lint && pnpm typecheck && pnpm test",
+        "db:migrate": "tsx packages/database/src/cli.ts migrate",
+        "db:rollback": "tsx packages/database/src/cli.ts rollback",
+        "db:types": "kysely-codegen --dialect postgres --out-file packages/database/src/types.ts",
+        "infra:config": "docker compose -f compose.yaml config",
+        "infra:down": "docker compose -f compose.yaml down",
+        "infra:up": "docker compose -f compose.yaml up -d database",
+        "lint": "eslint .",
+        "test": "vitest run",
+        "typecheck": "tsc --noEmit"
+    },
+    "devDependencies": {
+        "@eslint/js": "10.0.1",
+        "@stylistic/eslint-plugin": "5.10.0",
+        "@types/node": "24.13.5",
+        "eslint": "10.10.0",
+        "globals": "17.12.0",
+        "kysely": "0.29.6",
+        "kysely-codegen": "0.20.0",
+        "tsx": "4.23.13",
+        "typescript": "6.0.3",
+        "typescript-eslint": "8.70.0",
+        "vitest": "5.0.1",
+        "yaml": "2.9.1"
+    }
+}
