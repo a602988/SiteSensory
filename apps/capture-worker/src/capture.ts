@@ -1482,6 +1482,7 @@ async function trimOnePhotoBelt(image: Buffer, width: number): Promise<Buffer>
                 const lowerSlice = signature.subarray(lower * rowBytes, (lower + bandRows) * rowBytes)
 
                 if (rowSliceVariance(lowerSlice) < SCENE_TRIM_MIN_VARIANCE) continue
+                if (verticalBandDifference(lowerSlice, rowBytes) <= PHOTO_BELT_THRESHOLD) continue
 
                 const pairDifference = contentMaskedDifference(upperSlice, lowerSlice)
 
@@ -1495,6 +1496,20 @@ async function trimOnePhotoBelt(image: Buffer, width: number): Promise<Buffer>
 
                 if (aboveDifference < Math.max(PHOTO_BELT_ABOVE_DELTA, pairDifference * 4)) {
                     continue
+                }
+
+                const belowStart = lower + bandRows
+
+                if (belowStart < signatureHeight) {
+                    const belowRows = Math.min(bandRows, signatureHeight - belowStart)
+                    const belowSlice = signature.subarray(
+                        belowStart * rowBytes,
+                        (belowStart + belowRows) * rowBytes,
+                    )
+                    const belowIsPage = rowSliceVariance(belowSlice) < SCENE_TRIM_MIN_VARIANCE
+                    const belowDifference = contentMaskedDifference(belowSlice, lowerSlice)
+
+                    if (!belowIsPage && belowDifference < PHOTO_BELT_ABOVE_DELTA) continue
                 }
 
                 cutStart = Math.round(lower * scale)
@@ -1587,6 +1602,27 @@ function contentMaskedDifference(left: Buffer, right: Buffer): number
     for (const value of kept) total += value
 
     return total / kept.length / 255
+}
+
+/**
+ * 腰帶本身必須上下有細節差，避免把一段均勻色塊從中間剖成兩條複製品。
+ *
+ * @param slice 帶的 RGB。
+ * @param rowBytes 一列位元組數。
+ * @returns 上半與下半的內容差異。
+ */
+function verticalBandDifference(slice: Buffer, rowBytes: number): number
+{
+    const rows = Math.floor(slice.length / rowBytes)
+
+    if (rows < 4 || rowBytes < 3) return 0
+
+    const half = Math.floor(rows / 2)
+
+    return contentMaskedDifference(
+        slice.subarray(0, half * rowBytes),
+        slice.subarray((rows - half) * rowBytes, rows * rowBytes),
+    )
 }
 
 /**
