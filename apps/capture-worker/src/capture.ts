@@ -432,7 +432,9 @@ function createCapturePositions(pageHeight: number, viewportHeight: number): num
 }
 
 /**
- * 判斷目前頁面是否以覆蓋大部分 viewport 的 fixed 或 sticky 元素呈現捲動內容。
+ * 判斷目前頁面是否以覆蓋大部分 viewport 的 fixed 元素呈現捲動內容。
+ * 接近整段 viewport 的 sticky 區塊是文件流裡的捲動場景，要保留預留高度，
+ * 不可當成可壓縮的虛擬畫布。
  *
  * @param page Playwright 頁面。
  * @returns 存在可見的虛擬捲動畫布時為 true。
@@ -443,7 +445,7 @@ async function detectsVirtualCanvas(page: import('playwright').Page): Promise<bo
         .some(element => {
             const style = getComputedStyle(element)
 
-            if (style.position !== 'fixed' && style.position !== 'sticky') return false
+            if (style.position !== 'fixed') return false
             if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false
 
             const bounds = element.getBoundingClientRect()
