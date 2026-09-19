@@ -259,6 +259,24 @@ async function photoWithWipeBars(): Promise<Buffer>
     return sharp(raw, { raw: { channels: 3, height: 1080, width: WIDTH } }).png().toBuffer()
 }
 
+async function headingOnCreamPng(): Promise<Buffer>
+{
+    const raw = Buffer.alloc(WIDTH * 1080 * 3)
+
+    for (let row = 0; row < 1080; row += 1) {
+        for (let column = 0; column < WIDTH; column += 1) {
+            const index = (row * WIDTH + column) * 3
+            const inGlyph = row >= 200 && row < 360 && (column + 80) % 220 < 140
+
+            raw[index] = inGlyph ? 24 : 242
+            raw[index + 1] = inGlyph ? 33 : 239
+            raw[index + 2] = inGlyph ? 43 : 232
+        }
+    }
+
+    return sharp(raw, { raw: { channels: 3, height: 1080, width: WIDTH } }).png().toBuffer()
+}
+
 async function lightGridPng(): Promise<Buffer>
 {
     const raw = Buffer.alloc(WIDTH * 1080 * 3)
