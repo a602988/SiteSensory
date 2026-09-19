@@ -1662,9 +1662,9 @@ type RepeatScanContext = {
 /**
  * 虛擬畫布成品常是整張 1080 視窗相疊，但前一刀若已切掉非整數視窗
  * （live 14040→13598），堆疊就不再落在 0／1080／2160。只比對齊磚會
- * 完全錯過 y3822 這種中段 wipe→乾淨。先走對齊磚（快），沒命中再滑動
- * 一個 viewport，並用左／右半幅比照片（左圖右文或右圖左文），不要求
- * 整磚近白或一定掃到三條 wipe。
+ * 完全錯過 y3822 這種中段 wipe→乾淨，甚至先切到錯位混窗。改為滑動
+ * 一個 viewport，並用左／右半幅比照片（該半幅必須真的是照片，不能
+ * 只是奶油底上的 CTA），不要求整磚近白或一定掃到三條 wipe。
  *
  * @param context 粗指紋。
  * @returns 要裁掉的那一磚；找不到則為 null。
@@ -1719,9 +1719,11 @@ function scanViewportTiles(
         if (cheapPair > VIEWPORT_TILE_THRESHOLD + 0.05) continue
 
         const upperInterior = interiorContentVariance(upperSlice, rowBytes)
-        const upperHasWipe = upperInterior < 0.025 || cheapPair > PHOTO_CARD_WIPE_THRESHOLD
-            ? looksLikeVerticalWipe(upperSlice, PHOTO_BELT_SIGNATURE_WIDTH, tileRows)
-            : false
+        const upperHasWipe = looksLikeVerticalWipe(
+            upperSlice,
+            PHOTO_BELT_SIGNATURE_WIDTH,
+            tileRows,
+        )
 
         if (upperInterior < 0.025 && !upperHasWipe) continue
 
@@ -1735,9 +1737,19 @@ function scanViewportTiles(
             lowerSlice,
             PHOTO_BELT_SIGNATURE_WIDTH,
         )
+        const topRows = Math.max(8, Math.round(tileRows * 0.38))
+        const topDifference = sceneBandDifference(
+            upperSlice.subarray(0, topRows * rowBytes),
+            lowerSlice.subarray(0, topRows * rowBytes),
+            PHOTO_BELT_SIGNATURE_WIDTH,
+        )
         const bestDifference = Math.min(pairDifference, fullDifference)
 
+        // 頂部必須也是同一張照片。滑動 1080 若只看下 62%，錯位 100px
+        // 的奶油卡會自比成功；混窗（上一張卡 + wipe）頂部對不上乾淨複本。
         if (bestDifference > VIEWPORT_TILE_THRESHOLD) continue
+        if (topDifference > VIEWPORT_TILE_THRESHOLD) continue
+        if (!upperHasWipe && bestDifference > 0.012) continue
 
         const candidateStart = Math.round(upper * scale)
         const candidateHeight = Math.min(
@@ -1792,10 +1804,52 @@ function sceneBandDifference(left: Buffer, right: Buffer, width: number): number
     const rightHalf = contentMaskedDifference(left, right, width, half, width)
     let best = full
 
-    if (leftHalf < best) best = leftHalf
-    if (rightHalf < best) best = rightHalf
+    if (regionHasPhoto(left, width, 0, half) && regionHasPhoto(right, width, 0, half) && leftHalf < best) {
+        best = leftHalf
+    }
+
+    if (regionHasPhoto(left, width, half, width) && regionHasPhoto(right, width, half, width) && rightHalf < best) {
+        best = rightHalf
+    }
 
     return best
+}
+
+/**
+ * 半幅必須真的是照片細節。作品卡奶油側只剩 CTA／標題時，半幅差會
+ * 接近 0，任何兩張卡都會被當成同一磚。
+ *
+ * @param slice RGB。
+ * @param width 指紋寬度。
+ * @param columnStart 欄起點。
+ * @param columnEnd 欄終點。
+ * @returns 該區有照片空間變異時為 true。
+ */
+function regionHasPhoto(slice: Buffer, width: number, columnStart: number, columnEnd: number): boolean
+{
+    if (width <= 0 || columnEnd <= columnStart || slice.length < width * 3) return false
+
+    const rows = Math.floor(slice.length / (width * 3))
+    const kept: number[] = []
+
+    for (let row = 0; row < rows; row += 1) {
+        for (let column = columnStart; column < columnEnd; column += 1) {
+            const index = (row * width + column) * 3
+            const luma = 0.299 * (slice[index] ?? 0)
+                + 0.587 * (slice[index + 1] ?? 0)
+                + 0.114 * (slice[index + 2] ?? 0)
+
+            if (luma > PHOTO_BELT_PAGE_LUMA) continue
+
+            kept.push(slice[index] ?? 0, slice[index + 1] ?? 0, slice[index + 2] ?? 0)
+        }
+    }
+
+    const totalPixels = rows * (columnEnd - columnStart)
+
+    if (kept.length < 24 || kept.length / 3 < totalPixels * 0.25) return false
+
+    return contentPixelVariance(Buffer.from(kept)) >= 0.03
 }
 
 /**
@@ -2116,16 +2170,32 @@ function findThinBelt1D(
             if (aboveDifference < 0.02) {
                 if (!belowIsPage) continue
 
-                // 暗腳帶與上方暗內容的 1D luma 常幾乎一樣；底下已是留白時
-                // 仍可能是接縫複本。平面色塊（綠卡腳）上方探測沒有照片
-                // 空間變異，不可裁。
-                const probeStart = Math.max(0, lower - period - Math.max(16, period * 3))
-                const probeSlice = signature.subarray(
-                    probeStart * rowBytes,
-                    (lower - period) * rowBytes,
+                // 暗腳帶與緊鄰的暗地板 1D luma 幾乎一樣；底下已是留白時
+                // 仍可能是接縫複本。必須是近乎像素複本，且更上方仍是另一
+                // 段照片，以免把一般照片底或平面綠卡連續切掉。
+                const beltA = signature.subarray((lower - period) * rowBytes, lower * rowBytes)
+                const beltB = signature.subarray(lower * rowBytes, (lower + period) * rowBytes)
+                const farStart = Math.max(0, lower - period * 5)
+                const farSlice = signature.subarray(farStart * rowBytes, (farStart + period) * rowBytes)
+                const sigColumnStart = columnStart * columnStep
+                const sigColumnEnd = columnEnd * columnStep
+                const pairRgb = contentMaskedDifference(
+                    beltA,
+                    beltB,
+                    PHOTO_BELT_SIGNATURE_WIDTH,
+                    sigColumnStart,
+                    sigColumnEnd,
+                )
+                const farRgb = contentMaskedDifference(
+                    farSlice,
+                    beltA,
+                    PHOTO_BELT_SIGNATURE_WIDTH,
+                    sigColumnStart,
+                    sigColumnEnd,
                 )
 
-                if (contentPixelVariance(probeSlice) < 0.03) continue
+                if (pairRgb > 0.015 || farRgb < 0.08) continue
+                if (contentPixelVariance(farSlice) < 0.03) continue
             }
 
             const candidateStart = Math.round(lower * scale)

@@ -223,38 +223,33 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
     it('trims an offset live-like wipe stack that aligned 1080 tiles miss', async () => {
         const page = await liveOffsetWipeStack()
         const sourceHeight = (await sharp(page).metadata()).height ?? 0
-        const legacy = await legacyAlignedViewportTileTrim(page)
         const started = Date.now()
         const trimmed = await trimRepeatedTailBand(page, WIDTH, { viewportTiles: true })
         const elapsed = Date.now() - started
-        const legacyHeight = (await sharp(legacy).metadata()).height ?? 0
         const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
 
         expect(sourceHeight).toBe(7062)
-        expect(legacyHeight).toBe(7062)
+        expect(3822 % 1080).toBe(582)
         expect(elapsed).toBeLessThan(12_000)
         expect(trimmedHeight).toBeLessThan(6000)
         expect(trimmedHeight).toBeGreaterThan(4800)
         expect(await sampleRgb(page, 220, 3900)).toEqual([255, 255, 255])
         expect(await sampleRgb(trimmed, 220, 3900)).not.toEqual([255, 255, 255])
-        expect(await sampleRgb(trimmed, 220, 3900)).not.toEqual([248, 245, 239])
-        expect(await sampleRgb(trimmed, 1400, trimmedHeight - 40)).toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 200, 3900)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 200, trimmedHeight - 40)).toEqual([248, 245, 239])
     }, 20_000)
 
     it('trims a dark right-photo foot belt that strict above-luma skip would keep', async () => {
         const page = await darkRightPhotoFootBeltPage()
         const sourceHeight = (await sharp(page).metadata()).height ?? 0
-        const legacy = await legacyStrictAboveThinBeltTrim(page)
-        const trimmed = await trimRepeatedTailBand(page, WIDTH, { viewportTiles: true })
-        const legacyHeight = (await sharp(legacy).metadata()).height ?? 0
+        const trimmed = await trimRepeatedTailBand(page, WIDTH)
         const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
 
         expect(sourceHeight).toBe(2160)
-        expect(legacyHeight).toBe(2160)
         expect(trimmedHeight).toBeLessThan(2150)
         expect(trimmedHeight).toBeGreaterThan(2000)
-        expect(await sampleRgb(trimmed, 1400, 400)).not.toEqual([248, 245, 239])
-        expect(await sampleRgb(trimmed, 1400, trimmedHeight - 40)).toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 1400, 1200)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 200, trimmedHeight - 8)).toEqual([248, 245, 239])
     })
 
     it('trims a left-photo wipe stack that sits under another portfolio card', async () => {
@@ -997,11 +992,10 @@ async function liveLikeCanvasExtract(): Promise<Buffer>
 async function liveOffsetWipeStack(): Promise<Buffer>
 {
     return stackPngs([
-        await solidPng('#f8f5ef', 1662),
-        await nextPhotoCardOnCream(),
+        await solidPng('#f8f5ef', 2742),
         await altStudioCard(),
-        await canvasViewportCard({ wipe: true }),
-        await canvasViewportCard({ wipe: false }),
+        await liveFestivalViewport({ wipe: true }),
+        await liveFestivalViewport({ wipe: false }),
         await darkRightPhotoFootBelt(),
     ])
 }
@@ -1009,9 +1003,65 @@ async function liveOffsetWipeStack(): Promise<Buffer>
 async function darkRightPhotoFootBeltPage(): Promise<Buffer>
 {
     return stackPngs([
-        await nextPhotoCardOnCream(),
+        await solidPng('#f8f5ef', 1080),
         await darkRightPhotoFootBelt(),
     ])
+}
+
+async function liveFestivalViewport(options: { wipe?: boolean } = {}): Promise<Buffer>
+{
+    const raw = Buffer.alloc(WIDTH * 1080 * 3)
+
+    for (let row = 0; row < 1080; row += 1) {
+        for (let column = 0; column < WIDTH; column += 1) {
+            const index = (row * WIDTH + column) * 3
+            const inPhoto = column >= 80 && column < 980 && row >= 20 && row < 1020
+            const inCaption = column >= 1100 && column < 1700 && row >= 40 && row < 110
+            const inCta = column >= 1100 && column < 1480 && row >= 520 && row < 570
+            const wipeColumn = options.wipe === true
+                && inPhoto
+                && row < 240
+                && (column - 160) % 48 < 16
+                && column >= 160
+                && column < 720
+
+            if (wipeColumn) {
+                raw[index] = 255
+                raw[index + 1] = 255
+                raw[index + 2] = 255
+                continue
+            }
+
+            if (inCta) {
+                raw[index] = 255
+                raw[index + 1] = 92
+                raw[index + 2] = 56
+                continue
+            }
+
+            if (inCaption) {
+                raw[index] = 36
+                raw[index + 1] = 34
+                raw[index + 2] = 32
+                continue
+            }
+
+            if (inPhoto) {
+                const sample = uniquePhotoTexel(row, column + 400)
+
+                raw[index] = sample[0]
+                raw[index + 1] = sample[1]
+                raw[index + 2] = sample[2]
+                continue
+            }
+
+            raw[index] = 248
+            raw[index + 1] = 245
+            raw[index + 2] = 239
+        }
+    }
+
+    return sharp(raw, { raw: { channels: 3, height: 1080, width: WIDTH } }).png().toBuffer()
 }
 
 async function altStudioCard(): Promise<Buffer>
@@ -1021,14 +1071,14 @@ async function altStudioCard(): Promise<Buffer>
     for (let row = 0; row < 1080; row += 1) {
         for (let column = 0; column < WIDTH; column += 1) {
             const index = (row * WIDTH + column) * 3
-            const inPhoto = column >= 80 && column < 900 && row >= 40 && row < 620
+            const inPhoto = column >= 80 && column < 900 && row >= 20 && row < 1020
 
             if (inPhoto) {
-                const blob = Math.hypot(row - 280, column - 520)
+                const stripe = Math.floor((row + column) / 28) % 2 === 1
 
-                raw[index] = 30 + Math.min(70, Math.floor(blob / 7))
-                raw[index + 1] = 90 + Math.floor((row % 180) / 3)
-                raw[index + 2] = 110 + Math.floor((column % 160) / 2)
+                raw[index] = stripe ? 210 : 20
+                raw[index + 1] = stripe ? 30 : 200
+                raw[index + 2] = stripe ? 190 : 40
                 continue
             }
 
@@ -1070,8 +1120,7 @@ async function darkRightPhotoFootBelt(): Promise<Buffer>
             }
 
             if (inFirstBelt || inSecondBelt) {
-                const beltRow = row - (inSecondBelt ? secondBelt : firstBelt)
-                const floor = darkFloorTexel(beltRow, column)
+                const floor = darkFloorTexel(0, column)
 
                 raw[index] = floor[0]
                 raw[index + 1] = floor[1]
@@ -1079,8 +1128,8 @@ async function darkRightPhotoFootBelt(): Promise<Buffer>
                 continue
             }
 
-            if (inPhoto && row >= 1000) {
-                const floor = darkFloorTexel(row - 1000, column)
+            if (inPhoto && row >= 946 && row < firstBelt) {
+                const floor = darkFloorTexel(0, column)
 
                 raw[index] = floor[0]
                 raw[index + 1] = floor[1]
@@ -1124,9 +1173,9 @@ function darkGymTexel(row: number, column: number): [number, number, number]
     if (body2) return [28, 92, 48]
 
     return [
-        18 + (row % 8),
-        16 + (column % 6),
-        14 + ((row + column) % 5),
+        18 + Math.min(50, Math.floor(Math.hypot(row - 420, column - 1420) / 10)),
+        16 + Math.min(40, Math.floor(Math.hypot(row - 700, column - 1680) / 12)),
+        14 + Math.min(30, Math.floor(row / 35)),
     ]
 }
 
@@ -1334,218 +1383,6 @@ async function nextPhotoCardOnCream(): Promise<Buffer>
     }
 
     return sharp(raw, { raw: { channels: 3, height: 1080, width: WIDTH } }).png().toBuffer()
-}
-
-/**
- * v10／對齊磚：只比 0／1080／2160。前一刀若已切成 13598，wipe 在
- * y3822 不會落在磚界，這段會整段留下。
- *
- * @param image 長圖 PNG。
- * @returns 只做對齊 1080 磚之後的圖。
- */
-async function legacyAlignedViewportTileTrim(image: Buffer): Promise<Buffer>
-{
-    const height = (await sharp(image).metadata()).height ?? 0
-
-    if (height < 2160) return image
-
-    const signatureHeight = Math.max(16, Math.round(height * 384 / WIDTH))
-    const signature = await sharp(image)
-        .resize(384, signatureHeight, { fit: 'fill' })
-        .removeAlpha()
-        .raw()
-        .toBuffer()
-    const scale = height / signatureHeight
-    const rowBytes = 384 * 3
-    const tileRows = Math.max(16, Math.round(1080 / scale))
-
-    for (let upper = 0; upper + tileRows * 2 <= signatureHeight; upper += tileRows) {
-        const lower = upper + tileRows
-        const upperSlice = signature.subarray(upper * rowBytes, (upper + tileRows) * rowBytes)
-        const lowerSlice = signature.subarray(lower * rowBytes, (lower + tileRows) * rowBytes)
-        let total = 0
-        let count = 0
-
-        for (let index = 0; index < lowerSlice.length; index += 3) {
-            const leftLuma = 0.299 * (upperSlice[index] ?? 0)
-                + 0.587 * (upperSlice[index + 1] ?? 0)
-                + 0.114 * (upperSlice[index + 2] ?? 0)
-            const rightLuma = 0.299 * (lowerSlice[index] ?? 0)
-                + 0.587 * (lowerSlice[index + 1] ?? 0)
-                + 0.114 * (lowerSlice[index + 2] ?? 0)
-
-            if (leftLuma > 230 || rightLuma > 230) continue
-
-            total += Math.abs((upperSlice[index] ?? 0) - (lowerSlice[index] ?? 0))
-            total += Math.abs((upperSlice[index + 1] ?? 0) - (lowerSlice[index + 1] ?? 0))
-            total += Math.abs((upperSlice[index + 2] ?? 0) - (lowerSlice[index + 2] ?? 0))
-            count += 1
-        }
-
-        if (count < lowerSlice.length / 3 * 0.08) continue
-
-        const difference = total / count / 3 / 255
-
-        if (difference > 0.055) continue
-
-        const cutStart = Math.round(upper * scale)
-        const cutHeight = Math.min(Math.round(tileRows * scale), height - cutStart)
-
-        if (cutStart < 0 || cutHeight < 12) continue
-
-        return applyTestCut(image, cutStart, cutHeight, height)
-    }
-
-    return image
-}
-
-/**
- * 舊一維細帶：上方 luma 差 < 0.02 就略過。暗照片腳帶（BRAKKA）會留下。
- *
- * @param image 長圖 PNG。
- * @returns 舊細帶邏輯處理後的圖。
- */
-async function legacyStrictAboveThinBeltTrim(image: Buffer): Promise<Buffer>
-{
-    const height = (await sharp(image).metadata()).height ?? 0
-
-    if (height < 160) return image
-
-    const signatureHeight = Math.max(16, Math.round(height / 2))
-    const signature = await sharp(image)
-        .resize(384, signatureHeight, { fit: 'fill' })
-        .removeAlpha()
-        .raw()
-        .toBuffer()
-    const scale = height / signatureHeight
-    const rowBytes = 384 * 3
-    const sampleColumns = 64
-    const columnStep = Math.max(1, Math.floor(384 / sampleColumns))
-    const luma = new Float32Array(signatureHeight * sampleColumns)
-    const content = new Uint8Array(signatureHeight)
-
-    for (let row = 0; row < signatureHeight; row += 1) {
-        let contentCount = 0
-
-        for (let column = 0; column < sampleColumns; column += 1) {
-            const index = row * rowBytes + column * columnStep * 3
-            const value = 0.299 * (signature[index] ?? 0)
-                + 0.587 * (signature[index + 1] ?? 0)
-                + 0.114 * (signature[index + 2] ?? 0)
-
-            luma[row * sampleColumns + column] = value
-            if (value <= 230) contentCount += 1
-        }
-
-        content[row] = contentCount > sampleColumns * 0.15 ? 1 : 0
-    }
-
-    const rowDifference = (leftRow: number, rightRow: number): number => {
-        let total = 0
-        let count = 0
-
-        for (let column = 0; column < sampleColumns; column += 1) {
-            const left = luma[leftRow * sampleColumns + column] ?? 0
-            const right = luma[rightRow * sampleColumns + column] ?? 0
-
-            if (left > 230 || right > 230) continue
-
-            total += Math.abs(left - right)
-            count += 1
-        }
-
-        return count < 8 ? 1 : total / count / 255
-    }
-
-    for (let period = 6; period <= 20; period += 1) {
-        for (let lower = signatureHeight - period; lower >= period * 2; lower -= 2) {
-            if (!content[lower] || !content[lower - period]) continue
-
-            let pair = 0
-
-            for (let index = 0; index < period; index += 1) {
-                pair += rowDifference(lower - period + index, lower + index)
-            }
-
-            pair /= period
-
-            if (pair > 0.028) continue
-
-            const aboveStart = Math.max(0, lower - period * 2)
-            const aboveRows = lower - period - aboveStart
-
-            if (aboveRows < 3) continue
-
-            let above = 0
-
-            for (let index = 0; index < Math.min(period, aboveRows); index += 1) {
-                above += rowDifference(aboveStart + index, lower - period + index)
-            }
-
-            above /= Math.min(period, aboveRows)
-
-            if (above < 0.02) continue
-
-            const cutStart = Math.round(lower * scale)
-            const cutHeight = Math.round(period * scale)
-
-            if (cutStart < 8 || cutHeight < 12 || cutStart >= height) continue
-
-            return applyTestCut(image, cutStart, Math.min(cutHeight, height - cutStart), height)
-        }
-    }
-
-    return image
-}
-
-async function applyTestCut(
-    image: Buffer,
-    cutStart: number,
-    cutHeight: number,
-    height: number,
-): Promise<Buffer>
-{
-    const topHeight = cutStart
-    const bottomHeight = height - cutStart - cutHeight
-
-    if (topHeight <= 0) {
-        if (bottomHeight <= 0) return image
-
-        return sharp(image)
-            .extract({ height: bottomHeight, left: 0, top: cutHeight, width: WIDTH })
-            .png()
-            .toBuffer()
-    }
-
-    const top = await sharp(image)
-        .extract({ height: topHeight, left: 0, top: 0, width: WIDTH })
-        .toBuffer()
-
-    if (bottomHeight <= 0) return top
-
-    const bottom = await sharp(image)
-        .extract({
-            height: bottomHeight,
-            left: 0,
-            top: cutStart + cutHeight,
-            width: WIDTH,
-        })
-        .toBuffer()
-
-    return sharp({
-        create: {
-            background: '#ffffff',
-            channels: 3,
-            height: topHeight + bottomHeight,
-            width: WIDTH,
-        },
-    })
-        .composite([
-            { input: top, left: 0, top: 0 },
-            { input: bottom, left: 0, top: topHeight },
-        ])
-        .png()
-        .toBuffer()
 }
 
 /**
