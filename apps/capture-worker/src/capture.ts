@@ -1730,30 +1730,47 @@ function findRepeatCut(
 
             if (pairDifference > pairLimit) continue
 
-            const nothingAbove = bestUpper <= 0
-            const aboveStart = Math.max(0, bestUpper - bandRows)
-            const aboveSlice = nothingAbove
-                ? Buffer.alloc(0)
-                : signature.subarray(aboveStart * rowBytes, bestUpper * rowBytes)
-            const aboveIsPage = nothingAbove || isNearWhitePage(aboveSlice)
-            const aboveDifference = nothingAbove
-                ? 1
-                : contentMaskedDifference(
-                    aboveSlice,
-                    upperSlice,
-                    PHOTO_BELT_SIGNATURE_WIDTH,
-                )
-
-            if (cardScale && !aboveIsPage && !upperHasWipe) continue
-
-            if (aboveIsPage && !cardScale) continue
-
-            const aboveLimit = !cardScale && bandPx < PHOTO_BELT_THIN_PX
-                ? Math.max(0.03, pairDifference * 4)
-                : Math.max(PHOTO_BELT_ABOVE_DELTA, pairDifference * 4)
-
-            if (!nothingAbove && !aboveIsPage && aboveDifference < aboveLimit) {
+            if (
+                cardScale
+                && !upperHasWipe
+                && interiorContentVariance(upperSlice, rowBytes) < 0.03
+            ) {
                 continue
+            }
+
+            const nothingAbove = bestUpper <= 0
+            let aboveIsPage = false
+
+            if (nothingAbove) {
+                if (!(cardScale && upperHasWipe)) continue
+            }
+            else {
+                const aboveStart = Math.max(0, bestUpper - bandRows)
+                const aboveSlice = signature.subarray(aboveStart * rowBytes, bestUpper * rowBytes)
+                const aboveRows = Math.floor(aboveSlice.length / rowBytes)
+
+                if (aboveRows < Math.min(8, Math.max(4, Math.round(bandRows * 0.4)))) continue
+
+                aboveIsPage = isNearWhitePage(aboveSlice)
+                const aboveDifference = aboveSlice.length === upperSlice.length
+                    ? contentMaskedDifference(
+                        aboveSlice,
+                        upperSlice,
+                        PHOTO_BELT_SIGNATURE_WIDTH,
+                    )
+                    : 0
+
+                if (cardScale && !aboveIsPage && !upperHasWipe) continue
+
+                if (aboveIsPage && !cardScale) continue
+
+                const aboveLimit = !cardScale && bandPx < PHOTO_BELT_THIN_PX
+                    ? Math.max(0.03, pairDifference * 4)
+                    : Math.max(PHOTO_BELT_ABOVE_DELTA, pairDifference * 4)
+
+                if (!aboveIsPage && (aboveDifference === 0 || aboveDifference < aboveLimit)) {
+                    continue
+                }
             }
 
             const belowStart = lower + bandRows
