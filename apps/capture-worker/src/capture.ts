@@ -1481,7 +1481,7 @@ async function trimOnePhotoBelt(image: Buffer, width: number): Promise<Buffer>
                 const upperSlice = signature.subarray(upper * rowBytes, (upper + bandRows) * rowBytes)
                 const lowerSlice = signature.subarray(lower * rowBytes, (lower + bandRows) * rowBytes)
 
-                if (rowSliceVariance(lowerSlice) < SCENE_TRIM_MIN_VARIANCE) continue
+                if (contentPixelVariance(lowerSlice) < SCENE_TRIM_MIN_VARIANCE) continue
                 if (verticalBandDifference(lowerSlice, rowBytes) <= PHOTO_BELT_THRESHOLD) continue
 
                 const pairDifference = contentMaskedDifference(upperSlice, lowerSlice)
@@ -1602,6 +1602,32 @@ function contentMaskedDifference(left: Buffer, right: Buffer): number
     for (const value of kept) total += value
 
     return total / kept.length / 255
+}
+
+/**
+ * 只看非留白像素的空間變異。平面色塊加上頁面白邊，全幅變異會偏高，
+ * 但去掉近白之後就沒有照片細節。
+ *
+ * @param slice RGB 列。
+ * @returns 介於 0 與 1 的內容變異。
+ */
+function contentPixelVariance(slice: Buffer): number
+{
+    const kept: number[] = []
+
+    for (let index = 0; index < slice.length; index += 3) {
+        const luma = 0.299 * (slice[index] ?? 0)
+            + 0.587 * (slice[index + 1] ?? 0)
+            + 0.114 * (slice[index + 2] ?? 0)
+
+        if (luma > PHOTO_BELT_PAGE_LUMA) continue
+
+        kept.push(slice[index] ?? 0, slice[index + 1] ?? 0, slice[index + 2] ?? 0)
+    }
+
+    if (kept.length < 24) return 0
+
+    return rowSliceVariance(Buffer.from(kept))
 }
 
 /**

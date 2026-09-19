@@ -88,6 +88,17 @@ describe('capture scene heuristics', () => {
         expect(await sampleRgb(trimmed, 1400, 800)).toEqual([248, 245, 239])
     })
 
+    it('does not trim a finished flat photo card sitting on a light page', async () => {
+        const page = await stackPngs([
+            await solidPng('#315ceb', 1080),
+            await flatPhotoCardOnCream(),
+        ])
+        const trimmed = await trimRepeatedTailBand(page, WIDTH)
+
+        expect((await sharp(trimmed).metadata()).height).toBe(2160)
+        expect(await sampleRgb(trimmed, 200, 1500)).toEqual([34, 197, 94])
+    })
+
     it('does not trim a unique photo card that has no repeated belt', async () => {
         const card = await photoCardWithCaptionBelt({ repeatBelt: false })
         const trimmed = await trimRepeatedTailBand(card, WIDTH)
@@ -246,6 +257,31 @@ function beltTexel(row: number, column: number): [number, number, number]
         90 + Math.floor(row / 2) + (stripe ? 24 : 0),
         40 + Math.floor(Math.abs(column - 1400) / 16) % 80,
     ]
+}
+
+async function flatPhotoCardOnCream(): Promise<Buffer>
+{
+    const raw = Buffer.alloc(WIDTH * 1080 * 3)
+
+    for (let row = 0; row < 1080; row += 1) {
+        for (let column = 0; column < WIDTH; column += 1) {
+            const index = (row * WIDTH + column) * 3
+            const inPhoto = column >= 80 && column < 900 && row >= 120 && row < 640
+
+            if (inPhoto) {
+                raw[index] = 34
+                raw[index + 1] = 197
+                raw[index + 2] = 94
+                continue
+            }
+
+            raw[index] = 245
+            raw[index + 1] = 245
+            raw[index + 2] = 247
+        }
+    }
+
+    return sharp(raw, { raw: { channels: 3, height: 1080, width: WIDTH } }).png().toBuffer()
 }
 
 async function uniquePhotoPng(height: number): Promise<Buffer>
