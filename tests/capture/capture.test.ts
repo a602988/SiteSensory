@@ -247,6 +247,61 @@ describe('capture worker', { timeout: 20_000 }, () => {
             'Protect your website and verify account activity.',
         )).toBe(false)
     })
+
+    it('dismisses a cookie consent modal before viewport and full-page capture', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?cookies=1`,
+        })
+        const viewport = await storage.get(result.viewport.objectKey)
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const viewportCenter = await samplePixel(viewport, 960, 540)
+        const fullPageCenter = await samplePixel(fullPage, 960, 540)
+        const laterSection = await samplePixel(fullPage, 960, 1500)
+
+        expect(viewportCenter).toEqual([34, 197, 94])
+        expect(fullPageCenter).toEqual([34, 197, 94])
+        expect(laterSection).toEqual([34, 197, 94])
+        expect(viewportCenter).not.toEqual([17, 24, 39])
+        expect(viewportCenter).not.toEqual([220, 38, 38])
+    })
+
+    it('hides a blocking cookie overlay when no consent control is available', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?cookieOverlay=1`,
+        })
+        const viewport = await storage.get(result.viewport.objectKey)
+        const fullPage = await storage.get(result.fullPage.objectKey)
+
+        expect(await samplePixel(viewport, 960, 540)).toEqual([34, 197, 94])
+        expect(await samplePixel(fullPage, 960, 540)).toEqual([34, 197, 94])
+        expect(await samplePixel(viewport, 960, 540)).not.toEqual([124, 58, 237])
+    })
+
+    it('does not repeat a sticky top nav bar in later stitch segments', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?stickyNav=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const firstHeader = await samplePixel(fullPage, 960, 30)
+        const laterHeader = await samplePixel(fullPage, 960, 1110)
+        const laterCanvas = await samplePixel(fullPage, 960, 1500)
+
+        expect(firstHeader).toEqual([220, 38, 38])
+        expect(laterHeader).not.toEqual([220, 38, 38])
+        expect(laterCanvas).toEqual([34, 197, 94])
+    })
 })
 
 /**
@@ -260,6 +315,80 @@ function createFixtureServer(): Server
         const parameters = new URL(request.url ?? '/', 'http://fixture').searchParams
         const repeatedCanvas = parameters.has('repeatedCanvas')
         const settledBlock = parameters.has('settledBlock')
+        const cookies = parameters.has('cookies')
+        const cookieOverlay = parameters.has('cookieOverlay')
+        const stickyNav = parameters.has('stickyNav')
+
+        if (cookies) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Cookie Consent Fixture</title></head>
+<body style="margin:0;background:#315ceb;overflow:hidden">
+<main id="main" style="min-height:2200px;background:#315ceb"></main>
+<div id="cookie-backdrop" style="position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:9998"></div>
+<div id="cookie-dialog" role="dialog" aria-modal="true" style="position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);width:640px;height:320px;background:#111827;color:#fff;z-index:9999;padding:32px">
+<p>We have the cookies. You have the choice.</p>
+<button id="accept">Accept all</button>
+<button id="decline">Decline all</button>
+<button id="settings">Settings</button>
+</div>
+<script>
+const paint = color => {
+    document.body.style.background = color
+    document.querySelector('#main').style.background = color
+}
+const removeBanner = () => {
+    document.querySelector('#cookie-backdrop').remove()
+    document.querySelector('#cookie-dialog').remove()
+    document.body.style.overflow = 'auto'
+}
+document.querySelector('#accept').addEventListener('click', () => {
+    paint('#dc2626')
+    removeBanner()
+})
+document.querySelector('#decline').addEventListener('click', () => {
+    paint('#22c55e')
+    removeBanner()
+})
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (cookieOverlay) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Cookie Overlay Fixture</title></head>
+<body style="margin:0;background:#22c55e">
+<main style="min-height:2200px;background:#22c55e"></main>
+<div role="dialog" aria-modal="true" style="position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);width:640px;height:280px;background:#7c3aed;color:#fff;z-index:9999;padding:32px">
+<p>This site uses cookies to improve your experience. See our privacy policy.</p>
+</div>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (stickyNav) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Sticky Nav Fixture</title></head>
+<body style="margin:0">
+<div id="canvas" style="position:fixed;inset:0;background:#315ceb;z-index:0"></div>
+<header style="position:sticky;top:0;height:60px;width:100%;background:#dc2626;z-index:2"></header>
+<div style="height:3240px;position:relative;z-index:1"></div>
+<script>addEventListener('scroll',()=>{document.querySelector('#canvas').style.background=scrollY>0?'#22c55e':'#315ceb'})</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
 
         if (settledBlock) {
             const html = `<!doctype html>
@@ -345,4 +474,23 @@ function readPngSize(image: Buffer): { height: number, width: number }
         height: image.readUInt32BE(20),
         width: image.readUInt32BE(16),
     }
+}
+
+/**
+ * 讀取 PNG 指定座標的 RGB 像素，供截圖內容斷言使用。
+ *
+ * @param image PNG 檔案內容。
+ * @param left 水平座標。
+ * @param top 垂直座標。
+ * @returns 該點的 RGB 值。
+ */
+async function samplePixel(image: Buffer, left: number, top: number): Promise<number[]>
+{
+    const pixel = await sharp(image)
+        .extract({ height: 1, left, top, width: 1 })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+
+    return [...pixel]
 }

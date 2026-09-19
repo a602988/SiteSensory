@@ -22,7 +22,12 @@ const SCROLL_STEP_RATIO = 0.8
 const STABLE_BOTTOM_CHECKS = 3
 const FIXED_ELEMENT_ATTRIBUTE = 'data-sitesensory-fixed-element'
 const HIDE_FIXED_ATTRIBUTE = 'data-sitesensory-hide-fixed'
+const OVERLAY_ATTRIBUTE = 'data-sitesensory-hide-overlay'
 const FIXED_CANVAS_COVERAGE_RATIO = 0.8
+const STICKY_CHROME_MAX_HEIGHT_RATIO = 0.35
+const STICKY_CHROME_MIN_WIDTH_RATIO = 0.5
+const STICKY_CHROME_TOP_MAX_PX = 80
+const OVERLAY_SETTLE_MS = 250
 const SIGNATURE_HEIGHT = 18
 const SIGNATURE_WIDTH = 32
 const VIRTUAL_CANVAS_DUPLICATE_THRESHOLD = 0.015
@@ -101,9 +106,14 @@ export async function capturePage(options: CaptureOptions): Promise<CapturedPage
                 html[${HIDE_FIXED_ATTRIBUTE}] [${FIXED_ELEMENT_ATTRIBUTE}] {
                     visibility: hidden !important;
                 }
+                [${OVERLAY_ATTRIBUTE}] {
+                    display: none !important;
+                }
             `,
         })
+        await dismissBlockingOverlays(page)
         await preparePageForCapture(page)
+        await dismissBlockingOverlays(page)
         await page.evaluate(async () => document.fonts.ready)
 
         const evidence = await page.evaluate(() => ({
@@ -431,20 +441,34 @@ function visualDifference(left: Buffer, right: Buffer): number
 }
 
 /**
- * 標記頁首已存在的小型固定介面，避免導覽列、聊天按鈕等元素在每段重複出現。
- * 覆蓋大部分 viewport 的固定畫布與 sticky 元素不在此列，因為它們可能是捲動內容本身。
+ * 標記頁首已存在的小型固定介面，以及已出現在首屏的頂部 sticky 導覽列，
+ * 避免導覽列、聊天按鈕等元素在每段重複出現。覆蓋大部分 viewport 的固定畫布，
+ * 與接近整段 viewport 高的 sticky 捲動場景不在此列。
  *
  * @param page Playwright 頁面。
  * @returns 完成 DOM 標記後結束。
  */
 async function markFixedElements(page: import('playwright').Page): Promise<void>
 {
-    await page.evaluate(({ attribute, canvasCoverageRatio }) => {
+    await page.evaluate(({
+        attribute,
+        canvasCoverageRatio,
+        chromeMaxHeightRatio,
+        chromeMinWidthRatio,
+        chromeTopMaxPx,
+    }) => {
         const elements = [...document.body.querySelectorAll<HTMLElement>('*')]
 
         for (const element of elements) {
-            if (getComputedStyle(element).position !== 'fixed') continue
-            if (element.parentElement && getComputedStyle(element.parentElement).position === 'fixed') continue
+            const style = getComputedStyle(element)
+            const position = style.position
+
+            if (position !== 'fixed' && position !== 'sticky') continue
+            if (element.parentElement) {
+                const parentPosition = getComputedStyle(element.parentElement).position
+
+                if (parentPosition === 'fixed' || parentPosition === 'sticky') continue
+            }
 
             const bounds = element.getBoundingClientRect()
             const coversViewport = bounds.width >= window.innerWidth * canvasCoverageRatio
@@ -452,12 +476,366 @@ async function markFixedElements(page: import('playwright').Page): Promise<void>
 
             if (coversViewport) continue
 
-            element.setAttribute(attribute, '')
+            if (position === 'fixed') {
+                element.setAttribute(attribute, '')
+                continue
+            }
+
+            const top = Number.parseFloat(style.top)
+            const inFirstViewport = bounds.bottom > 0 && bounds.top < window.innerHeight
+            const isTopChrome = Number.isFinite(top)
+                && top <= chromeTopMaxPx
+                && bounds.height > 0
+                && bounds.height < window.innerHeight * chromeMaxHeightRatio
+                && bounds.width >= window.innerWidth * chromeMinWidthRatio
+                && inFirstViewport
+
+            if (isTopChrome) element.setAttribute(attribute, '')
         }
     }, {
         attribute: FIXED_ELEMENT_ATTRIBUTE,
         canvasCoverageRatio: FIXED_CANVAS_COVERAGE_RATIO,
+        chromeMaxHeightRatio: STICKY_CHROME_MAX_HEIGHT_RATIO,
+        chromeMinWidthRatio: STICKY_CHROME_MIN_WIDTH_RATIO,
+        chromeTopMaxPx: STICKY_CHROME_TOP_MAX_PX,
     })
+}
+
+/**
+ * 關閉或隱藏阻擋畫面的隱私／Cookie 同意層，避免首屏與拼接結果留下對話框。
+ * 優先點選拒絕、僅必要或關閉；找不到可點控制時再隱藏剩餘的對話框與背板。
+ *
+ * @param page Playwright 頁面，包含可能承載同意層的 iframe。
+ * @returns 各 frame 處理完成後結束。
+ */
+async function dismissBlockingOverlays(page: import('playwright').Page): Promise<void>
+{
+    for (const frame of page.frames()) {
+        await frame.evaluate(dismissAndHideOverlaysInPage, {
+            overlayAttribute: OVERLAY_ATTRIBUTE,
+            settleMs: OVERLAY_SETTLE_MS,
+        }).catch(() => undefined)
+    }
+}
+
+/**
+ * 在單一文件（主頁或 iframe）內尋找同意層控制並關閉；此函式會被送進瀏覽器執行。
+ *
+ * @param options 隱藏用屬性名稱與點選後的等待時間。
+ * @returns 點選與隱藏流程完成後結束。
+ */
+async function dismissAndHideOverlaysInPage(options: {
+    overlayAttribute: string
+    settleMs: number
+}): Promise<void>
+{
+    if (!document.body) return
+
+    const clicked = clickConsentControl()
+
+    if (clicked) await new Promise<void>(resolve => setTimeout(resolve, options.settleMs))
+
+    const hidden = hideRemainingConsentOverlays(options.overlayAttribute)
+
+    if (clicked || hidden) unlockDocumentScroll()
+
+    function clickConsentControl(): boolean
+    {
+        const controls = collectClickableElements(document)
+            .filter(element => isVisible(element) && !isDisabled(element))
+            .map(element => ({ element, rank: rankConsentControl(element) }))
+            .filter(candidate => candidate.rank > 0)
+            .sort((left, right) => left.rank - right.rank)
+
+        const selected = controls[0]?.element
+
+        if (!selected) return false
+
+        selected.click()
+        return true
+    }
+
+    function hideRemainingConsentOverlays(attribute: string): boolean
+    {
+        const overlays = collectConsentOverlays()
+        let hidden = false
+
+        for (const overlay of overlays) {
+            const root = overlayRoot(overlay)
+
+            hideNode(root, attribute)
+            hidden = true
+
+            const parent = root.parentElement
+
+            if (!parent) continue
+
+            for (const sibling of parent.children) {
+                if (sibling === root || !(sibling instanceof HTMLElement)) continue
+                if (isBackdrop(sibling)) hideNode(sibling, attribute)
+            }
+        }
+
+        return hidden
+    }
+
+    function collectConsentOverlays(): HTMLElement[]
+    {
+        const matches: HTMLElement[] = []
+
+        for (const element of collectElements(document.body)) {
+            if (!isVisible(element)) continue
+            if (!isOverlayCandidate(element)) continue
+            if (!looksLikeConsent(element)) continue
+
+            const bounds = element.getBoundingClientRect()
+
+            if (bounds.width < 80 || bounds.height < 40) continue
+
+            matches.push(element)
+        }
+
+        return matches.filter(element => !matches.some(other => other !== element && other.contains(element)))
+    }
+
+    function collectClickableElements(root: ParentNode): HTMLElement[]
+    {
+        const selector = 'button, [role="button"], input[type="button"], input[type="submit"], a, [aria-label]'
+        const found = [...root.querySelectorAll<HTMLElement>(selector)]
+
+        for (const element of collectElements(root)) {
+            if (element.shadowRoot) found.push(...collectClickableElements(element.shadowRoot))
+        }
+
+        return found
+    }
+
+    function collectElements(root: ParentNode): HTMLElement[]
+    {
+        const elements: HTMLElement[] = []
+
+        for (const element of root.querySelectorAll<HTMLElement>('*')) {
+            elements.push(element)
+            if (element.shadowRoot) elements.push(...collectElements(element.shadowRoot))
+        }
+
+        return elements
+    }
+
+    function rankConsentControl(element: HTMLElement): number
+    {
+        const text = controlText(element)
+
+        if (!text) return 0
+        if (isSettingsControl(text)) return 0
+        if (isAcceptControl(text)) return 0
+        if (isDeclineAllControl(text)) return 1
+        if (isEssentialControl(text)) return 2
+
+        const inConsent = Boolean(closestConsentOverlay(element))
+
+        if (isDeclineControl(text) && inConsent) return 3
+        if (isCloseControl(text, element) && inConsent) return 4
+
+        return 0
+    }
+
+    function closestConsentOverlay(element: HTMLElement): HTMLElement | null
+    {
+        let current: HTMLElement | null = element
+
+        while (current) {
+            if (isOverlayCandidate(current) && looksLikeConsent(current)) return current
+
+            const root: Node = current.getRootNode()
+
+            if (current.parentElement) {
+                current = current.parentElement
+                continue
+            }
+
+            current = root instanceof ShadowRoot && root.host instanceof HTMLElement ? root.host : null
+        }
+
+        return null
+    }
+
+    function looksLikeConsent(element: HTMLElement): boolean
+    {
+        const label = [
+            element.id,
+            element.getAttribute('class') ?? '',
+            element.getAttribute('aria-label') ?? '',
+        ].join(' ')
+        const text = normalizeText(element.innerText ?? '')
+        const labelMatch = /cookie|consent|gdpr|ccpa|onetrust|cookiebot|didomi|usercentrics/i.test(label)
+        const textMatch = /cookie|consent|gdpr|we have the cookies|個人資料|隱私權|クッキー|쿠키/i.test(text)
+
+        if (!labelMatch && !textMatch) return false
+
+        const bounds = element.getBoundingClientRect()
+        const coversViewport = bounds.width >= window.innerWidth * 0.8
+            && bounds.height >= window.innerHeight * 0.8
+
+        return !(coversViewport && text.length > 800)
+    }
+
+    function isOverlayCandidate(element: HTMLElement): boolean
+    {
+        if (element === document.body || element === document.documentElement) return false
+
+        const style = getComputedStyle(element)
+        const role = element.getAttribute('role')
+        const isDialog = role === 'dialog'
+            || element.getAttribute('aria-modal') === 'true'
+            || element instanceof HTMLDialogElement
+
+        return isDialog
+            || style.position === 'fixed'
+            || style.position === 'sticky'
+            || style.position === 'absolute'
+    }
+
+    function overlayRoot(element: HTMLElement): HTMLElement
+    {
+        let current = element
+
+        while (current.parentElement && current.parentElement !== document.body && current.parentElement !== document.documentElement) {
+            const parent = current.parentElement
+            const position = getComputedStyle(parent).position
+
+            if (position !== 'fixed' && position !== 'sticky' && position !== 'absolute') break
+
+            current = parent
+        }
+
+        return current
+    }
+
+    function isBackdrop(element: HTMLElement): boolean
+    {
+        const style = getComputedStyle(element)
+
+        if (style.position !== 'fixed' && style.position !== 'absolute') return false
+
+        const bounds = element.getBoundingClientRect()
+
+        if (bounds.width < window.innerWidth * 0.8 || bounds.height < window.innerHeight * 0.8) return false
+
+        const text = normalizeText(element.innerText ?? '')
+
+        if (text.length > 80) return false
+
+        return isSemiTransparent(style)
+    }
+
+    function isSemiTransparent(style: CSSStyleDeclaration): boolean
+    {
+        if (Number(style.opacity) > 0 && Number(style.opacity) < 1) return true
+
+        const match = style.backgroundColor.match(/rgba?\(\s*[\d.]+\s*,\s*[\d.]+\s*,\s*[\d.]+(?:\s*,\s*([\d.]+))?\s*\)/u)
+
+        if (!match) return false
+
+        const alpha = match[1] === undefined ? 1 : Number(match[1])
+
+        return alpha > 0 && alpha < 1
+    }
+
+    function hideNode(element: HTMLElement, attribute: string): void
+    {
+        element.setAttribute(attribute, '')
+        element.style.setProperty('display', 'none', 'important')
+    }
+
+    function unlockDocumentScroll(): void
+    {
+        for (const node of [document.documentElement, document.body]) {
+            const style = getComputedStyle(node)
+
+            if (style.overflow === 'hidden' || style.overflowY === 'hidden') {
+                node.style.setProperty('overflow', 'auto', 'important')
+                node.style.setProperty('overflow-y', 'auto', 'important')
+            }
+        }
+    }
+
+    function isVisible(element: HTMLElement): boolean
+    {
+        const style = getComputedStyle(element)
+
+        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false
+
+        const bounds = element.getBoundingClientRect()
+
+        return bounds.width > 0 && bounds.height > 0
+    }
+
+    function isDisabled(element: HTMLElement): boolean
+    {
+        return element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true'
+    }
+
+    function controlText(element: HTMLElement): string
+    {
+        return normalizeText([
+            element.innerText,
+            element.getAttribute('aria-label'),
+            element.getAttribute('title'),
+            element.getAttribute('value'),
+        ].filter(Boolean).join(' '))
+    }
+
+    function normalizeText(value: string): string
+    {
+        return value.replace(/\s+/g, ' ').trim().toLocaleLowerCase()
+    }
+
+    function compactText(value: string): string
+    {
+        return value.replace(/\s+/g, '')
+    }
+
+    function isSettingsControl(text: string): boolean
+    {
+        return /settings|customize|customise|preferences|manage cookies|設定|设置|설정|anpassen|paramètres/i.test(text)
+    }
+
+    function isAcceptControl(text: string): boolean
+    {
+        const compact = compactText(text)
+
+        return /accept\s*all|allow\s*all|agree\s*all|akzeptieren|tout\s*accepter|aceptar\s*todo|同意全部|接受全部|모두\s*동의/i.test(text)
+            || /acceptall|allowall|agreeall/i.test(compact)
+            || /^(accept|allow|agree|同意|接受|akzeptieren|aceptar|accepter)$/i.test(text)
+    }
+
+    function isDeclineAllControl(text: string): boolean
+    {
+        const compact = compactText(text)
+
+        return /decline\s*all|reject\s*all|deny\s*all|refuse\s*all|ablehnen|tout\s*refuser|rechazar\s*todo|全部拒絕|拒绝全部|모두\s*거부/i.test(text)
+            || /declineall|rejectall|denyall|refuseall/i.test(compact)
+    }
+
+    function isEssentialControl(text: string): boolean
+    {
+        return /essential\s*only|necessary\s*only|required\s*only|only\s*(?:essential|necessary|required)|use\s*necessary|continue\s*without|accept\s*(?:essential|necessary)|nur\s*notwendige|僅必要|只允許必要/i.test(text)
+    }
+
+    function isDeclineControl(text: string): boolean
+    {
+        return /^(decline|reject|deny|refuse|disagree|ablehnen|refuser|rechazar|拒絕|拒绝|거부)$/i.test(text)
+    }
+
+    function isCloseControl(text: string, element: HTMLElement): boolean
+    {
+        const label = normalizeText(element.getAttribute('aria-label') ?? '')
+
+        if (/close|dismiss|schlie|fermer|cerrar|關閉|关闭|닫기/i.test(label)) return true
+
+        return /^(close|dismiss|×|✕|⨯|✖|x)$/i.test(text)
+    }
 }
 
 /**
