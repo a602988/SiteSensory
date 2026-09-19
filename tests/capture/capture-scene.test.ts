@@ -111,7 +111,67 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
         expect(trimmedHeight).toBeGreaterThan(6100)
         expect(await sampleRgb(trimmed, 1400, 4500)).not.toEqual([248, 245, 239])
         expect(await sampleRgb(trimmed, 200, 5600)).not.toEqual([248, 245, 239])
-    }, 20_000)
+    }, 40_000)
+
+    it('trims a stacked full card whose upper copy still has wipe bars', async () => {
+        const page = await stackedCardWithWipe()
+        const legacy = await legacyNarrowOffsetBeltTrim(page)
+        const trimmed = await trimRepeatedTailBand(page, WIDTH)
+        const legacyHeight = (await sharp(legacy).metadata()).height ?? 0
+        const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
+
+        expect(legacyHeight).toBe(1560)
+        expect(trimmedHeight).toBeLessThan(1100)
+        expect(trimmedHeight).toBeGreaterThan(800)
+        expect(await sampleRgb(trimmed, 1400, 300)).not.toEqual([255, 255, 255])
+        expect(await sampleRgb(trimmed, 1400, 300)).not.toEqual([248, 245, 239])
+    })
+
+    it('trims a mid-page stacked wipe card on a tall stitch that 3×-window scan misses', async () => {
+        const page = await tallStackedCardWithWipe()
+        const legacy = await legacyNarrowOffsetBeltTrim(page)
+        const trimmed = await trimRepeatedTailBand(page, WIDTH)
+        const legacyHeight = (await sharp(legacy).metadata()).height ?? 0
+        const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
+
+        expect(legacyHeight).toBe(6760)
+        expect(trimmedHeight).toBeLessThan(6400)
+        expect(trimmedHeight).toBeGreaterThan(5600)
+        expect(await sampleRgb(trimmed, 1400, 4200)).not.toEqual([255, 255, 255])
+        expect(await sampleRgb(trimmed, 1400, 4200)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 200, 4800)).not.toEqual([248, 245, 239])
+    }, 40_000)
+
+    it('trims a clean card prefix that only matches the previous wiped copy', async () => {
+        const previous = await festivalCardPng({ wipe: true })
+        const next = await stackPngs([
+            await festivalCardPng({ wipe: false }),
+            await nextPhotoCardOnCream(),
+        ])
+        const trimmed = await trimDuplicateScenePrefix(previous, next, WIDTH)
+
+        expect(trimmed).not.toBeNull()
+
+        const trimmedHeight = (await sharp(trimmed!).metadata()).height ?? 0
+
+        expect(trimmedHeight).toBeLessThan(1100)
+        expect(trimmedHeight).toBeGreaterThan(900)
+        expect(await sampleRgb(trimmed!, 200, 200)).not.toEqual([248, 245, 239])
+    })
+
+    it('trims a 16px offset belt that viewport-scale 48px scan misses', async () => {
+        const page = await thinOffsetBeltCard()
+        const legacy = await legacyNarrowOffsetBeltTrim(page)
+        const trimmed = await trimRepeatedTailBand(page, WIDTH)
+        const legacyHeight = (await sharp(legacy).metadata()).height ?? 0
+        const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
+
+        expect(legacyHeight).toBe(1080)
+        expect(trimmedHeight).toBeLessThan(1070)
+        expect(trimmedHeight).toBeGreaterThan(1000)
+        expect(await sampleRgb(trimmed, 1400, 200)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 1400, trimmedHeight - 80)).toEqual([248, 245, 239])
+    })
 
     it('does not trim a unique photo card that has no repeated belt', async () => {
         const card = await photoCardWithCaptionBelt({ repeatBelt: false })
@@ -496,21 +556,24 @@ async function rawWindow(image: Buffer, height: number): Promise<Buffer>
         .toBuffer()
 }
 
-async function photoCardWithCaptionBelt(options: { beltGap?: number, repeatBelt?: boolean } = {}): Promise<Buffer>
+async function photoCardWithCaptionBelt(
+    options: { beltGap?: number, beltHeight?: number, repeatBelt?: boolean } = {},
+): Promise<Buffer>
 {
     const repeatBelt = options.repeatBelt !== false
     const beltGap = options.beltGap ?? 0
+    const beltHeight = options.beltHeight ?? 140
     const raw = Buffer.alloc(WIDTH * 1080 * 3)
     const firstBelt = 500
-    const secondBelt = firstBelt + 140 + beltGap
-    const photoBottom = secondBelt + 140
+    const secondBelt = firstBelt + beltHeight + beltGap
+    const photoBottom = secondBelt + beltHeight
 
     for (let row = 0; row < 1080; row += 1) {
         for (let column = 0; column < WIDTH; column += 1) {
             const index = (row * WIDTH + column) * 3
             const inPhoto = column >= 960 && column < 1860 && row >= 40 && row < photoBottom
-            const inFirstBelt = repeatBelt && inPhoto && row >= firstBelt && row < firstBelt + 140
-            const inSecondBelt = repeatBelt && inPhoto && row >= secondBelt && row < secondBelt + 140
+            const inFirstBelt = repeatBelt && inPhoto && row >= firstBelt && row < firstBelt + beltHeight
+            const inSecondBelt = repeatBelt && inPhoto && row >= secondBelt && row < secondBelt + beltHeight
             const inCta = inSecondBelt && column >= 700 && column < 1120 && row >= secondBelt + 36 && row < secondBelt + 88
 
             if (inCta) {
@@ -546,6 +609,72 @@ async function photoCardWithCaptionBelt(options: { beltGap?: number, repeatBelt?
     }
 
     return sharp(raw, { raw: { channels: 3, height: 1080, width: WIDTH } }).png().toBuffer()
+}
+
+async function festivalCardPng(options: { wipe?: boolean } = {}): Promise<Buffer>
+{
+    const raw = Buffer.alloc(WIDTH * 640 * 3)
+
+    for (let row = 0; row < 640; row += 1) {
+        for (let column = 0; column < WIDTH; column += 1) {
+            const index = (row * WIDTH + column) * 3
+            const inPhoto = column >= 960 && column < 1860 && row >= 20 && row < 560
+            const wipeColumn = options.wipe
+                && inPhoto
+                && row < 200
+                && (column - 1000) % 48 < 16
+                && column >= 1000
+                && column < 1400
+
+            if (wipeColumn) {
+                raw[index] = 255
+                raw[index + 1] = 255
+                raw[index + 2] = 255
+                continue
+            }
+
+            if (inPhoto) {
+                const sample = uniquePhotoTexel(row, column)
+
+                raw[index] = sample[0]
+                raw[index + 1] = sample[1]
+                raw[index + 2] = sample[2]
+                continue
+            }
+
+            raw[index] = 248
+            raw[index + 1] = 245
+            raw[index + 2] = 239
+        }
+    }
+
+    return sharp(raw, { raw: { channels: 3, height: 640, width: WIDTH } }).png().toBuffer()
+}
+
+async function stackedCardWithWipe(): Promise<Buffer>
+{
+    return stackPngs([
+        await solidPng('#f8f5ef', 80),
+        await festivalCardPng({ wipe: true }),
+        await festivalCardPng({ wipe: false }),
+        await solidPng('#f8f5ef', 200),
+    ])
+}
+
+async function tallStackedCardWithWipe(): Promise<Buffer>
+{
+    return stackPngs([
+        await solidPng('#f8f5ef', 4000),
+        await festivalCardPng({ wipe: true }),
+        await festivalCardPng({ wipe: false }),
+        await nextPhotoCardOnCream(),
+        await solidPng('#f8f5ef', 400),
+    ])
+}
+
+async function thinOffsetBeltCard(): Promise<Buffer>
+{
+    return photoCardWithCaptionBelt({ beltGap: 8, beltHeight: 16 })
 }
 
 async function tallStitchCardBelt(): Promise<Buffer>

@@ -166,6 +166,40 @@ describe('capture worker', { timeout: 60_000 }, () => {
         expect(await samplePixel(fullPage, 960, 2100)).not.toEqual([21, 128, 61])
     })
 
+    it('removes a stacked full card whose upper copy still has wipe bars', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?stackedCardWipe=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(height).toBeLessThan(1800)
+        expect(height).toBeGreaterThan(900)
+        expect(await samplePixel(fullPage, 1400, 300)).not.toEqual([255, 255, 255])
+        expect(await samplePixel(fullPage, 1400, 300)).not.toEqual([248, 245, 239])
+    })
+
+    it('removes a 16px offset belt that viewport-scale scan misses', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?thinOffsetBelt=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(height).toBeLessThan(2100)
+        expect(height).toBeGreaterThan(1700)
+        expect(await samplePixel(fullPage, 1400, 1280)).not.toEqual([248, 245, 239])
+        expect(await samplePixel(fullPage, 1400, height - 80)).toEqual([248, 245, 239])
+    })
+
     it('removes a mid-page one-fifth belt from a tall stitched page', async () => {
         const storage = createLocalObjectStorage(storageRoot)
         const result = await capturePage({
@@ -507,6 +541,8 @@ function createFixtureServer(): Server
         const photoBelt = parameters.has('photoBelt')
         const cardBelt = parameters.has('cardBelt')
         const tallCardBelt = parameters.has('tallCardBelt')
+        const stackedCardWipe = parameters.has('stackedCardWipe')
+        const thinOffsetBelt = parameters.has('thinOffsetBelt')
 
         if (cookies) {
             const html = `<!doctype html>
@@ -775,6 +811,49 @@ const sync=()=>paint((scrollY-680)/400<0.85)
 addEventListener('scroll',sync)
 sync()
 </script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (thinOffsetBelt) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Thin Offset Belt Fixture</title></head>
+<body style="margin:0;background:#f8f5ef">
+<section style="height:1080px;background:#315ceb"></section>
+<section style="height:1080px;background:#f8f5ef;position:relative">
+<div style="position:absolute;left:960px;top:40px;width:900px;height:500px;background:radial-gradient(circle at 38% 32%,#d97848 0 110px,transparent 190px),linear-gradient(160deg,#3f6f8a,#1d3a4a)"></div>
+<div style="position:absolute;left:960px;top:540px;width:900px;height:16px;background-image:repeating-linear-gradient(90deg,#22c55e 0 40px,#15803d 40px 80px)"></div>
+<div style="position:absolute;left:960px;top:564px;width:900px;height:16px;background-image:repeating-linear-gradient(90deg,#22c55e 0 40px,#15803d 40px 80px)"></div>
+<div style="position:absolute;left:700px;top:552px;width:280px;height:28px;background:#ff5c38;border-radius:999px"></div>
+</section>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (stackedCardWipe) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Stacked Card Wipe Fixture</title></head>
+<body style="margin:0;background:#f8f5ef">
+<section style="height:200px;background:#f8f5ef"></section>
+<section style="height:1400px;background:#f8f5ef;position:relative">
+<div style="position:absolute;left:960px;top:20px;width:900px;height:540px;background:radial-gradient(circle at 38% 32%,#d97848 0 110px,transparent 190px),linear-gradient(160deg,#3f6f8a,#1d3a4a)"></div>
+<div style="position:absolute;left:1000px;top:20px;width:16px;height:180px;background:#fff"></div>
+<div style="position:absolute;left:1048px;top:20px;width:16px;height:180px;background:#fff"></div>
+<div style="position:absolute;left:1096px;top:20px;width:16px;height:180px;background:#fff"></div>
+<div style="position:absolute;left:1144px;top:20px;width:16px;height:180px;background:#fff"></div>
+<div style="position:absolute;left:700px;top:480px;width:280px;height:44px;background:#ff5c38;border-radius:999px"></div>
+<div style="position:absolute;left:960px;top:660px;width:900px;height:540px;background:radial-gradient(circle at 38% 32%,#d97848 0 110px,transparent 190px),linear-gradient(160deg,#3f6f8a,#1d3a4a)"></div>
+<div style="position:absolute;left:700px;top:1120px;width:280px;height:44px;background:#ff5c38;border-radius:999px"></div>
+</section>
+<section style="height:400px;background:#f8f5ef"></section>
 </body></html>`
 
             response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
