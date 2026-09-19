@@ -87,6 +87,12 @@ describe('capture scene heuristics', () => {
         expect(looksLikeFullColumnWipe(signature, SETTLE_WIDTH, SETTLE_HEIGHT)).toBe(false)
     })
 
+    it('does not treat large dark type with page-color gaps as a wipe', async () => {
+        const signature = await createSettleSignature(await headingOnCreamPng())
+
+        expect(looksLikeVerticalWipe(signature, SETTLE_WIDTH, SETTLE_HEIGHT)).toBe(false)
+    })
+
     it('does not treat a flat brand color or a light page grid as a wipe', async () => {
         const flat = await createSettleSignature(await solidPng('#22c55e', 1080))
         const grid = await createSettleSignature(await lightGridPng())

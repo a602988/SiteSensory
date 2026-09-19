@@ -39,6 +39,8 @@ const PINNED_SCENE_ROWS_RATIO = 0.35
 const WIPE_BAR_MIN_COUNT = 3
 const WIPE_BAR_NEIGHBOR_DELTA = 35
 const WIPE_BAR_MIN_LUMINANCE = 190
+const WIPE_BAR_CONTENT_MIN_LUMINANCE = 45
+const WIPE_BAR_CONTENT_MAX_LUMINANCE = 210
 const WIPE_BAND_RATIO = 0.18
 const WIPE_BAND_MIN_ROWS = 6
 const VIEWPORT_WIPE_HOLD_SAMPLES = 12
@@ -1209,7 +1211,10 @@ function countWipeSpikesInBand(image: Buffer, width: number, rowStart: number, r
         const right = ((columnMean[column + 1] ?? 0) + (columnMean[column + 2] ?? 0)) / 2
         const neighborhood = (left + right) / 2
         const current = columnMean[column] ?? 0
-        const sitsInsideContent = left > 25 && left < 220 && right > 25 && right < 220
+        const sitsInsideContent = left > WIPE_BAR_CONTENT_MIN_LUMINANCE
+            && left < WIPE_BAR_CONTENT_MAX_LUMINANCE
+            && right > WIPE_BAR_CONTENT_MIN_LUMINANCE
+            && right < WIPE_BAR_CONTENT_MAX_LUMINANCE
 
         if (
             sitsInsideContent
