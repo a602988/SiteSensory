@@ -166,6 +166,38 @@ describe('capture worker', { timeout: 60_000 }, () => {
         expect(await samplePixel(fullPage, 960, 2100)).not.toEqual([21, 128, 61])
     })
 
+    it('removes a left-photo wipe stack sitting under another portfolio card', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?portfolioStack=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(height).toBeLessThan(2400)
+        expect(height).toBeGreaterThan(1600)
+        expect(await samplePixel(fullPage, 200, 200)).not.toEqual([248, 245, 239])
+        expect(await samplePixel(fullPage, 200, 1300)).not.toEqual([255, 255, 255])
+        expect(await samplePixel(fullPage, 200, 1300)).not.toEqual([248, 245, 239])
+    })
+
+    it('waits out wipe bars on a dark photo next to the page edge', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?darkEdgeWipe=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+
+        expect(await samplePixel(fullPage, 820, 400)).not.toEqual([255, 255, 255])
+        expect(await samplePixel(fullPage, 200, 400)).not.toEqual([248, 245, 239])
+    })
+
     it('removes a stacked full card whose upper copy still has wipe bars', async () => {
         const storage = createLocalObjectStorage(storageRoot)
         const result = await capturePage({
@@ -543,6 +575,8 @@ function createFixtureServer(): Server
         const tallCardBelt = parameters.has('tallCardBelt')
         const stackedCardWipe = parameters.has('stackedCardWipe')
         const thinOffsetBelt = parameters.has('thinOffsetBelt')
+        const portfolioStack = parameters.has('portfolioStack')
+        const darkEdgeWipe = parameters.has('darkEdgeWipe')
 
         if (cookies) {
             const html = `<!doctype html>
@@ -830,6 +864,67 @@ sync()
 <div style="position:absolute;left:960px;top:564px;width:900px;height:16px;background-image:repeating-linear-gradient(90deg,#22c55e 0 40px,#15803d 40px 80px)"></div>
 <div style="position:absolute;left:700px;top:552px;width:280px;height:28px;background:#ff5c38;border-radius:999px"></div>
 </section>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (portfolioStack) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Portfolio Stack Fixture</title></head>
+<body style="margin:0;background:#f8f5ef">
+<section style="height:1080px;background:#f8f5ef;position:relative">
+<div style="position:absolute;left:80px;top:40px;width:820px;height:520px;background:radial-gradient(circle at 60% 40%,#8a3f6f 0 120px,transparent 200px),linear-gradient(40deg,#4a2d55,#1d3a4a)"></div>
+</section>
+<section style="height:1400px;background:#f8f5ef;position:relative">
+<div style="position:absolute;left:80px;top:20px;width:900px;height:540px;background:radial-gradient(circle at 38% 32%,#d97848 0 110px,transparent 190px),linear-gradient(160deg,#3f6f8a,#1d3a4a)"></div>
+<div style="position:absolute;left:200px;top:20px;width:16px;height:200px;background:#fff"></div>
+<div style="position:absolute;left:248px;top:20px;width:16px;height:200px;background:#fff"></div>
+<div style="position:absolute;left:296px;top:20px;width:16px;height:200px;background:#fff"></div>
+<div style="position:absolute;left:344px;top:20px;width:16px;height:200px;background:#fff"></div>
+<div style="position:absolute;left:1100px;top:40px;width:360px;height:48px;background:#242220"></div>
+<div style="position:absolute;left:1100px;top:470px;width:280px;height:44px;background:#ff5c38;border-radius:999px"></div>
+<div style="position:absolute;left:80px;top:660px;width:900px;height:540px;background:radial-gradient(circle at 38% 32%,#d97848 0 110px,transparent 190px),linear-gradient(160deg,#3f6f8a,#1d3a4a)"></div>
+<div style="position:absolute;left:1100px;top:1110px;width:280px;height:44px;background:#ff5c38;border-radius:999px"></div>
+</section>
+<section style="height:280px;background:#f8f5ef"></section>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (darkEdgeWipe) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Dark Edge Wipe Fixture</title></head>
+<body style="margin:0;background:#f8f5ef">
+<section id="scene" style="height:1080px;background:#f8f5ef;position:relative">
+<div id="photo" style="position:absolute;left:80px;top:80px;width:820px;height:820px;background:
+repeating-conic-gradient(from 30deg at 50% 50%,#3a1a12 0 18deg,#5a2a18 18deg 36deg)"></div>
+<div id="wipes" style="position:absolute;left:80px;top:80px;width:820px;height:820px"></div>
+</section>
+<script>
+const wipes=document.querySelector('#wipes')
+for (const left of [680,720,752,776]) {
+    const bar=document.createElement('div')
+    bar.style.cssText='position:absolute;top:0;bottom:0;width:10px;background:#fff;left:'+left+'px'
+    wipes.appendChild(bar)
+}
+const started=performance.now()
+const tick=now=>{
+    if(now-started<1800){
+        requestAnimationFrame(tick)
+        return
+    }
+    wipes.innerHTML=''
+}
+requestAnimationFrame(tick)
+</script>
 </body></html>`
 
             response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })

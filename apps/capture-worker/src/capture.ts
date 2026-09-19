@@ -39,6 +39,12 @@ const PHOTO_CARD_RATIOS = [0.8, 0.7, 0.55, 0.4]
 const PHOTO_BELT_RATIOS = [0.22, 0.19, 0.16, 0.13, 0.1, 0.06, 0.04, 0.02, 0.015, 0.012]
 const PHOTO_BELT_THICK_RATIO = 0.1
 const PHOTO_BELT_THRESHOLD = 0.012
+const PHOTO_BELT_THIN_THRESHOLD = 0.02
+const PHOTO_BELT_THIN_PX = 36
+const PHOTO_CARD_WIPE_THRESHOLD = 0.04
+const WIPE_NEIGHBOR_MIN_LUMA = 20
+const WIPE_NEIGHBOR_MAX_LUMA = 195
+const WIPE_NEIGHBOR_MIN_CHROMA = 22
 const PHOTO_BELT_ABOVE_DELTA = 0.08
 const PHOTO_BELT_ALIGN_ROWS = 8
 const PHOTO_CARD_ALIGN_ROWS = 20
@@ -1291,6 +1297,35 @@ function countWipeSpikesInBand(image: Buffer, width: number, rowStart: number, r
         columnMean[column] = total / rowCount
     }
 
+    const columnChroma = new Float64Array(width)
+
+    for (let column = 0; column < width; column += 1) {
+        let total = 0
+
+        for (let row = rowStart; row < rowStart + rowCount; row += 1) {
+            const index = (row * width + column) * 3
+            const red = image[index] ?? 0
+            const green = image[index + 1] ?? 0
+            const blue = image[index + 2] ?? 0
+
+            total += Math.max(red, green, blue) - Math.min(red, green, blue)
+        }
+
+        columnChroma[column] = total / rowCount
+    }
+
+    const neighborIsPhoto = (column: number): boolean => {
+        const luma = columnMean[column] ?? 0
+        const chroma = columnChroma[column] ?? 0
+
+        if (luma >= PHOTO_WIPE_LUMA) return false
+        if (luma > WIPE_BAR_CONTENT_MIN_LUMINANCE && luma < WIPE_NEIGHBOR_MAX_LUMA) return true
+
+        return luma >= WIPE_NEIGHBOR_MIN_LUMA
+            && luma <= WIPE_BAR_CONTENT_MIN_LUMINANCE
+            && chroma >= WIPE_NEIGHBOR_MIN_CHROMA
+    }
+
     let spikes = 0
 
     for (let column = 2; column < width - 2; column += 1) {
@@ -1298,10 +1333,12 @@ function countWipeSpikesInBand(image: Buffer, width: number, rowStart: number, r
         const right = ((columnMean[column + 1] ?? 0) + (columnMean[column + 2] ?? 0)) / 2
         const neighborhood = (left + right) / 2
         const current = columnMean[column] ?? 0
-        const sitsInsideContent = left > WIPE_BAR_CONTENT_MIN_LUMINANCE
+        const classicInside = left > WIPE_BAR_CONTENT_MIN_LUMINANCE
             && left < WIPE_BAR_CONTENT_MAX_LUMINANCE
             && right > WIPE_BAR_CONTENT_MIN_LUMINANCE
             && right < WIPE_BAR_CONTENT_MAX_LUMINANCE
+        const photoInside = neighborIsPhoto(column - 2) && neighborIsPhoto(column + 2)
+        const sitsInsideContent = classicInside || photoInside
 
         if (
             sitsInsideContent
@@ -1578,7 +1615,8 @@ type RepeatScanContext = {
 /**
  * 在指紋上找一處相鄰重複帶。cardScale 時視窗可以比實際週期大（上複本
  * 常帶 wipe、下緣還有 CTA／留白），因此 lower 上方只需放得下上複本，
- * 週期可小於視窗。細帶則仍要求上方是另一段高細節照片。
+ * 週期可小於視窗。作品集中段上一張卡不必是近白；上複本有 wipe 時門檻
+ * 放寬。細帶則仍要求上方是另一段高細節照片。
  *
  * @param context 已縮好的長圖指紋。
  * @param ratios viewport 高度比例。
@@ -1648,11 +1686,15 @@ function findRepeatCut(
                 }
             }
 
-            const pairLimit = cardScale ? 0.025 : PHOTO_BELT_THRESHOLD
+            const upperSlice = signature.subarray(bestUpper * rowBytes, (bestUpper + bandRows) * rowBytes)
+            const upperHasWipe = cardScale
+                && looksLikeVerticalWipe(upperSlice, PHOTO_BELT_SIGNATURE_WIDTH, bandRows)
+            const pairLimit = cardScale
+                ? (upperHasWipe ? PHOTO_CARD_WIPE_THRESHOLD : 0.025)
+                : (bandPx < PHOTO_BELT_THIN_PX ? PHOTO_BELT_THIN_THRESHOLD : PHOTO_BELT_THRESHOLD)
 
             if (bestUpper < 1 || bestDifference > pairLimit) continue
 
-            const upperSlice = signature.subarray(bestUpper * rowBytes, (bestUpper + bandRows) * rowBytes)
             const aboveStart = Math.max(0, bestUpper - bandRows)
             const aboveSlice = signature.subarray(aboveStart * rowBytes, bestUpper * rowBytes)
             const aboveIsPage = isNearWhitePage(aboveSlice)
@@ -1662,11 +1704,13 @@ function findRepeatCut(
                 PHOTO_BELT_SIGNATURE_WIDTH,
             )
 
-            if (cardScale && !aboveIsPage) continue
-
             if (aboveIsPage && !cardScale) continue
 
-            if (!aboveIsPage && aboveDifference < Math.max(PHOTO_BELT_ABOVE_DELTA, bestDifference * 4)) {
+            const aboveLimit = !cardScale && bandPx < PHOTO_BELT_THIN_PX
+                ? Math.max(0.03, bestDifference * 4)
+                : Math.max(PHOTO_BELT_ABOVE_DELTA, bestDifference * 4)
+
+            if (!aboveIsPage && aboveDifference < aboveLimit) {
                 continue
             }
 
@@ -1688,8 +1732,6 @@ function findRepeatCut(
                 if (!belowIsPage && belowDifference < PHOTO_BELT_ABOVE_DELTA) continue
             }
 
-            const upperHasWipe = cardScale
-                && looksLikeVerticalWipe(upperSlice, PHOTO_BELT_SIGNATURE_WIDTH, bandRows)
             const periodRows = Math.max(bandRows, lower - bestUpper)
             const candidateStart = Math.round((cardScale || upperHasWipe ? bestUpper : lower) * scale)
             const candidateHeight = Math.round(periodRows * scale)

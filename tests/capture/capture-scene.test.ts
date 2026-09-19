@@ -159,6 +159,35 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
         expect(await sampleRgb(trimmed!, 200, 200)).not.toEqual([248, 245, 239])
     })
 
+    it('trims a left-photo wipe stack that sits under another portfolio card', async () => {
+        const page = await portfolioStackedWipeCard()
+        const legacy = await legacyNarrowOffsetBeltTrim(page)
+        const trimmed = await trimRepeatedTailBand(page, WIDTH)
+        const legacyHeight = (await sharp(legacy).metadata()).height ?? 0
+        const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
+
+        expect(legacyHeight).toBe(2560)
+        expect(trimmedHeight).toBeLessThan(2100)
+        expect(trimmedHeight).toBeGreaterThan(1700)
+        expect(await sampleRgb(trimmed, 200, 200)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 200, 1280)).not.toEqual([255, 255, 255])
+        expect(await sampleRgb(trimmed, 200, 1280)).not.toEqual([248, 245, 239])
+    })
+
+    it('trims an 18px photo-foot belt whose orange CTA top edge is also repeated', async () => {
+        const page = await photoFootBeltWithCta()
+        const legacy = await legacyNarrowOffsetBeltTrim(page)
+        const trimmed = await trimRepeatedTailBand(page, WIDTH)
+        const legacyHeight = (await sharp(legacy).metadata()).height ?? 0
+        const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
+
+        expect(legacyHeight).toBe(5760)
+        expect(trimmedHeight).toBeLessThan(5748)
+        expect(trimmedHeight).toBeGreaterThan(5600)
+        expect(await sampleRgb(trimmed, 1400, 3800)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 1400, 3700)).not.toEqual([255, 92, 56])
+    }, 40_000)
+
     it('trims a 16px offset belt that viewport-scale 48px scan misses', async () => {
         const page = await thinOffsetBeltCard()
         const legacy = await legacyNarrowOffsetBeltTrim(page)
@@ -217,6 +246,19 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
 
         expect(looksLikeVerticalWipe(signature, SETTLE_WIDTH, SETTLE_HEIGHT)).toBe(false)
         expect(looksLikeFullColumnWipe(signature, SETTLE_WIDTH, SETTLE_HEIGHT)).toBe(false)
+    })
+
+    it('detects wipe bars on a bright stage photo that mid-tone 45–175 neighbors miss', async () => {
+        const signature = await createSettleSignature(await brightStageWithWipe())
+
+        expect(countLegacyMidToneWipeSpikes(signature, SETTLE_WIDTH, SETTLE_HEIGHT)).toBeLessThan(3)
+        expect(looksLikeVerticalWipe(signature, SETTLE_WIDTH, SETTLE_HEIGHT)).toBe(true)
+    })
+
+    it('still detects wipe bars on a dark wallpaper next to the page edge', async () => {
+        const signature = await createSettleSignature(await darkWallpaperWithEdgeWipe())
+
+        expect(looksLikeVerticalWipe(signature, SETTLE_WIDTH, SETTLE_HEIGHT)).toBe(true)
     })
 
     it('does not treat large dark type with page-color gaps as a wipe', async () => {
@@ -651,6 +693,206 @@ async function festivalCardPng(options: { wipe?: boolean } = {}): Promise<Buffer
     return sharp(raw, { raw: { channels: 3, height: 640, width: WIDTH } }).png().toBuffer()
 }
 
+async function leftFestivalCardPng(options: { wipe?: boolean } = {}): Promise<Buffer>
+{
+    const raw = Buffer.alloc(WIDTH * 640 * 3)
+
+    for (let row = 0; row < 640; row += 1) {
+        for (let column = 0; column < WIDTH; column += 1) {
+            const index = (row * WIDTH + column) * 3
+            const inPhoto = column >= 80 && column < 980 && row >= 20 && row < 560
+            const inCaption = column >= 1100 && column < 1700 && row >= 40 && row < 110
+            const inCta = column >= 1100 && column < 1480 && row >= 470 && row < 520
+            const wipeColumn = options.wipe
+                && inPhoto
+                && row < 220
+                && (column - 160) % 48 < 16
+                && column >= 160
+                && column < 720
+
+            if (wipeColumn) {
+                raw[index] = 255
+                raw[index + 1] = 255
+                raw[index + 2] = 255
+                continue
+            }
+
+            if (inCta) {
+                raw[index] = 255
+                raw[index + 1] = 92
+                raw[index + 2] = 56
+                continue
+            }
+
+            if (inCaption) {
+                raw[index] = 36
+                raw[index + 1] = 34
+                raw[index + 2] = 32
+                continue
+            }
+
+            if (inPhoto) {
+                const sample = uniquePhotoTexel(row, column + 400)
+
+                raw[index] = sample[0]
+                raw[index + 1] = sample[1]
+                raw[index + 2] = sample[2]
+                continue
+            }
+
+            raw[index] = 248
+            raw[index + 1] = 245
+            raw[index + 2] = 239
+        }
+    }
+
+    return sharp(raw, { raw: { channels: 3, height: 640, width: WIDTH } }).png().toBuffer()
+}
+
+async function portfolioStackedWipeCard(): Promise<Buffer>
+{
+    return stackPngs([
+        await nextPhotoCardOnCream(),
+        await leftFestivalCardPng({ wipe: true }),
+        await leftFestivalCardPng({ wipe: false }),
+        await solidPng('#f8f5ef', 200),
+    ])
+}
+
+async function photoFootBeltWithCta(): Promise<Buffer>
+{
+    const raw = Buffer.alloc(WIDTH * 1080 * 3)
+    const photoLeft = 960
+    const photoRight = 1860
+    const photoTop = 40
+    const photoBottom = 720
+    const beltHeight = 18
+    const firstBelt = photoBottom - beltHeight * 2
+    const secondBelt = photoBottom - beltHeight
+
+    for (let row = 0; row < 1080; row += 1) {
+        for (let column = 0; column < WIDTH; column += 1) {
+            const index = (row * WIDTH + column) * 3
+            const inPhoto = column >= photoLeft && column < photoRight && row >= photoTop && row < photoBottom
+            const inFirstBelt = inPhoto && row >= firstBelt && row < secondBelt
+            const inSecondBelt = inPhoto && row >= secondBelt && row < photoBottom
+            const ctaTop = (inFirstBelt && row < firstBelt + 6) || (inSecondBelt && row < secondBelt + 6)
+
+            if (ctaTop && column >= 1180 && column < 1580) {
+                raw[index] = 255
+                raw[index + 1] = 92
+                raw[index + 2] = 56
+                continue
+            }
+
+            if (inFirstBelt || inSecondBelt) {
+                const beltRow = row - (inSecondBelt ? secondBelt : firstBelt)
+                const sample = beltTexel(beltRow, column)
+
+                raw[index] = sample[0]
+                raw[index + 1] = sample[1]
+                raw[index + 2] = sample[2]
+                continue
+            }
+
+            if (inPhoto) {
+                const sample = uniquePhotoTexel(row, column)
+
+                raw[index] = sample[0]
+                raw[index + 1] = sample[1]
+                raw[index + 2] = sample[2]
+                continue
+            }
+
+            raw[index] = 248
+            raw[index + 1] = 245
+            raw[index + 2] = 239
+        }
+    }
+
+    const card = await sharp(raw, { raw: { channels: 3, height: 1080, width: WIDTH } }).png().toBuffer()
+
+    return stackPngs([
+        await solidPng('#f8f5ef', 3600),
+        card,
+        await nextPhotoCardOnCream(),
+    ])
+}
+
+async function brightStageWithWipe(): Promise<Buffer>
+{
+    const raw = Buffer.alloc(WIDTH * 1080 * 3)
+
+    for (let row = 0; row < 1080; row += 1) {
+        for (let column = 0; column < WIDTH; column += 1) {
+            const index = (row * WIDTH + column) * 3
+            const inPhoto = column >= 80 && column < 980 && row >= 80 && row < 860
+            const wipe = inPhoto
+                && row < 420
+                && column >= 200
+                && (column - 200) % 52 < 24
+                && column < 200 + 5 * 52
+
+            if (wipe) {
+                raw[index] = 255
+                raw[index + 1] = 255
+                raw[index + 2] = 255
+                continue
+            }
+
+            if (inPhoto) {
+                raw[index] = 236
+                raw[index + 1] = 186
+                raw[index + 2] = 52
+                continue
+            }
+
+            raw[index] = 248
+            raw[index + 1] = 245
+            raw[index + 2] = 239
+        }
+    }
+
+    return sharp(raw, { raw: { channels: 3, height: 1080, width: WIDTH } }).png().toBuffer()
+}
+
+async function darkWallpaperWithEdgeWipe(): Promise<Buffer>
+{
+    const raw = Buffer.alloc(WIDTH * 1080 * 3)
+
+    for (let row = 0; row < 1080; row += 1) {
+        for (let column = 0; column < WIDTH; column += 1) {
+            const index = (row * WIDTH + column) * 3
+            const inPhoto = column >= 80 && column < 900 && row >= 80 && row < 900
+            const wipe = inPhoto
+                && column >= 700
+                && (column - 700) % 48 < 20
+                && column < 700 + 4 * 48
+            const diamond = Math.abs((column % 70) - 35) + Math.abs((row % 70) - 35)
+
+            if (wipe) {
+                raw[index] = 255
+                raw[index + 1] = 255
+                raw[index + 2] = 255
+                continue
+            }
+
+            if (inPhoto) {
+                raw[index] = 48 + (diamond < 18 ? 10 : 0)
+                raw[index + 1] = 22 + Math.floor((column % 40) / 6)
+                raw[index + 2] = 14
+                continue
+            }
+
+            raw[index] = 248
+            raw[index + 1] = 245
+            raw[index + 2] = 239
+        }
+    }
+
+    return sharp(raw, { raw: { channels: 3, height: 1080, width: WIDTH } }).png().toBuffer()
+}
+
 async function stackedCardWithWipe(): Promise<Buffer>
 {
     return stackPngs([
@@ -864,6 +1106,38 @@ async function legacyFullSegmentTailTrim(image: Buffer): Promise<Buffer>
     if (variance < 0.02 || difference > 0.015) return image
 
     return image
+}
+
+function countLegacyMidToneWipeSpikes(image: Buffer, width: number, height: number): number
+{
+    const columnMean = new Float64Array(width)
+
+    for (let column = 0; column < width; column += 1) {
+        let total = 0
+
+        for (let row = 0; row < height; row += 1) {
+            const index = (row * width + column) * 3
+
+            total += 0.299 * (image[index] ?? 0)
+                + 0.587 * (image[index + 1] ?? 0)
+                + 0.114 * (image[index + 2] ?? 0)
+        }
+
+        columnMean[column] = total / height
+    }
+
+    let spikes = 0
+
+    for (let column = 2; column < width - 2; column += 1) {
+        const left = ((columnMean[column - 2] ?? 0) + (columnMean[column - 1] ?? 0)) / 2
+        const right = ((columnMean[column + 1] ?? 0) + (columnMean[column + 2] ?? 0)) / 2
+        const current = columnMean[column] ?? 0
+        const sitsInside = left > 45 && left < 175 && right > 45 && right < 175
+
+        if (sitsInside && current > (left + right) / 2 + 40 && current > 200) spikes += 1
+    }
+
+    return spikes
 }
 
 async function sampleRgb(image: Buffer, left: number, top: number): Promise<number[]>
