@@ -551,6 +551,25 @@ describe('capture worker', { timeout: 60_000 }, () => {
         expect(await samplePixel(fullPage, 1400, 1200)).not.toEqual([248, 245, 239])
     })
 
+    it('trims a mid-page virtual-canvas faint-wipe stack under another card', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?midCanvasWipeStack=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(height).toBeLessThan(3600)
+        expect(height).toBeGreaterThan(2800)
+        expect(await samplePixel(fullPage, 200, 200)).not.toEqual([248, 245, 239])
+        expect(await samplePixel(fullPage, 224, 1120)).not.toEqual([255, 255, 255])
+        expect(await samplePixel(fullPage, 200, 1120)).not.toEqual([248, 245, 239])
+        expect(await samplePixel(fullPage, 1400, 2300)).not.toEqual([248, 245, 239])
+    })
+
     it('keeps a pinned virtual-canvas scene only once while the tail color changes', async () => {
         const storage = createLocalObjectStorage(storageRoot)
         const result = await capturePage({
@@ -597,6 +616,7 @@ function createFixtureServer(): Server
         const portfolioStack = parameters.has('portfolioStack')
         const darkEdgeWipe = parameters.has('darkEdgeWipe')
         const canvasWipeStack = parameters.has('canvasWipeStack')
+        const midCanvasWipeStack = parameters.has('midCanvasWipeStack')
 
         if (cookies) {
             const html = `<!doctype html>
@@ -911,6 +931,82 @@ sync()
 <div style="position:absolute;left:1100px;top:1110px;width:280px;height:44px;background:#ff5c38;border-radius:999px"></div>
 </section>
 <section style="height:280px;background:#f8f5ef"></section>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (midCanvasWipeStack) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Mid Canvas Wipe Stack Fixture</title></head>
+<body style="margin:0;background:#f8f5ef">
+<div id="canvas" style="position:fixed;inset:0;background:#f8f5ef;z-index:0">
+<div id="photo" style="position:absolute;left:80px;top:40px;width:820px;height:520px;background:radial-gradient(circle at 60% 40%,#8a3f6f 0 120px,transparent 200px),linear-gradient(40deg,#4a2d55,#1d3a4a)"></div>
+<div id="wipes"></div>
+<div id="caption" style="position:absolute;left:1100px;top:40px;width:360px;height:48px;background:#242220;display:none"></div>
+<div id="cta" style="position:absolute;left:1100px;top:470px;width:280px;height:44px;background:#ff5c38;border-radius:999px;display:none"></div>
+</div>
+<div style="height:5400px"></div>
+<script>
+const photo=document.querySelector('#photo')
+const wipes=document.querySelector('#wipes')
+const caption=document.querySelector('#caption')
+const cta=document.querySelector('#cta')
+const paintWipes=show=>{
+    wipes.innerHTML=''
+    if(!show) return
+    for (const left of [220,320]) {
+        const bar=document.createElement('div')
+        bar.style.cssText='position:absolute;top:40px;height:140px;width:8px;background:#fff;left:'+left+'px'
+        wipes.appendChild(bar)
+    }
+}
+const paint=()=>{
+    const y=scrollY
+    if(y<600){
+        photo.style.left='80px'
+        photo.style.width='820px'
+        photo.style.height='520px'
+        photo.style.background='radial-gradient(circle at 60% 40%,#8a3f6f 0 120px,transparent 200px),linear-gradient(40deg,#4a2d55,#1d3a4a)'
+        caption.style.display='none'
+        cta.style.display='none'
+        paintWipes(false)
+        return
+    }
+    if(y<1500){
+        photo.style.left='80px'
+        photo.style.width='900px'
+        photo.style.height='640px'
+        photo.style.background='radial-gradient(circle at 38% 32%,#d97848 0 110px,transparent 190px),linear-gradient(160deg,#3f6f8a,#1d3a4a)'
+        caption.style.display='block'
+        cta.style.display='block'
+        paintWipes(true)
+        return
+    }
+    if(y<2400){
+        photo.style.left='80px'
+        photo.style.width='900px'
+        photo.style.height='640px'
+        photo.style.background='radial-gradient(circle at 38% 32%,#d97848 0 110px,transparent 190px),linear-gradient(160deg,#3f6f8a,#1d3a4a)'
+        caption.style.display='block'
+        cta.style.display='block'
+        paintWipes(false)
+        return
+    }
+    photo.style.left='960px'
+    photo.style.width='900px'
+    photo.style.height='640px'
+    photo.style.background='radial-gradient(circle at 55% 35%,#d97848 0 90px,transparent 160px),linear-gradient(20deg,#1d3a4a,#4a2d55)'
+    caption.style.display='none'
+    cta.style.display='none'
+    paintWipes(false)
+}
+paint()
+addEventListener('scroll',paint)
+</script>
 </body></html>`
 
             response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })

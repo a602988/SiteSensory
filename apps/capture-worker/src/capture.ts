@@ -39,9 +39,11 @@ const PHOTO_CARD_RATIOS = [1, 0.8, 0.7, 0.6, 0.55, 0.4]
 const PHOTO_BELT_RATIOS = [0.22, 0.19, 0.16, 0.13, 0.1, 0.06, 0.04, 0.02, 0.015, 0.012]
 const PHOTO_BELT_THICK_RATIO = 0.1
 const PHOTO_BELT_THRESHOLD = 0.012
-const PHOTO_BELT_THIN_THRESHOLD = 0.02
+const PHOTO_BELT_THIN_THRESHOLD = 0.028
 const PHOTO_BELT_THIN_PX = 36
 const PHOTO_CARD_WIPE_THRESHOLD = 0.04
+const VIEWPORT_TILE_THRESHOLD = 0.03
+const PINNED_MASKED_SAME_THRESHOLD = 0.022
 const WIPE_NEIGHBOR_MIN_LUMA = 20
 const WIPE_NEIGHBOR_MIN_CHROMA = 22
 const PHOTO_BELT_ABOVE_DELTA = 0.08
@@ -1486,7 +1488,7 @@ export async function trimRepeatedTailBand(image: Buffer, width: number): Promis
 {
     let current = image
 
-    for (let pass = 0; pass < 3; pass += 1) {
+    for (let pass = 0; pass < 4; pass += 1) {
         const next = await trimOnePhotoBelt(current, width)
         const before = (await sharp(current).metadata()).height ?? 0
         const after = (await sharp(next).metadata()).height ?? 0
@@ -1531,6 +1533,10 @@ async function trimOnePhotoBelt(image: Buffer, width: number): Promise<Buffer>
         signature: coarse,
         signatureHeight: coarseHeight,
     }
+    const tileCut = findViewportTileCut(coarseContext)
+
+    if (tileCut) return applyRepeatCut(image, width, height, tileCut)
+
     const cardCut = height > PHOTO_BELT_REFERENCE_HEIGHT
         ? findRepeatCut(coarseContext, PHOTO_CARD_RATIOS, true)
         : null
@@ -1550,14 +1556,17 @@ async function trimOnePhotoBelt(image: Buffer, width: number): Promise<Buffer>
             .removeAlpha()
             .raw()
             .toBuffer()
-    const thinCut = findThinBelt1D({
+    const fineContext = {
         height,
         reference,
         rowBytes,
         scale: height / fineHeight,
         signature: fine,
         signatureHeight: fineHeight,
-    })
+    }
+    const thinCut = findThinBelt1D(fineContext)
+        ?? findThinBelt1D(fineContext, { columnEnd: 32, columnStart: 0 })
+        ?? findThinBelt1D(fineContext, { columnEnd: 64, columnStart: 32 })
 
     return thinCut ? applyRepeatCut(image, width, height, thinCut) : image
 }
@@ -1637,10 +1646,72 @@ type RepeatScanContext = {
 }
 
 /**
+ * 虛擬畫布成品是整張 1080 視窗相疊。先比相鄰 viewport 磚，不依賴滑動
+ * 掃描一定抓到 wipe：wipe 幀與乾淨幀用遮罩差即可認出，即使粗指紋
+ * 條紋偵測沒過。這才能裁掉作品集中段「上一張卡 + wipe 視窗 + 乾淨視窗」。
+ *
+ * @param context 粗指紋。
+ * @returns 要裁掉的那一磚；找不到則為 null。
+ */
+function findViewportTileCut(
+    context: RepeatScanContext,
+): { cutHeight: number, cutStart: number } | null
+{
+    const { height, reference, rowBytes, scale, signature, signatureHeight } = context
+    const tileRows = Math.max(16, Math.round(reference / scale))
+
+    if (signatureHeight < tileRows * 2) return null
+
+    for (let upper = 0; upper + tileRows * 2 <= signatureHeight; upper += tileRows) {
+        const lower = upper + tileRows
+        const upperSlice = signature.subarray(upper * rowBytes, (upper + tileRows) * rowBytes)
+        const lowerSlice = signature.subarray(lower * rowBytes, (lower + tileRows) * rowBytes)
+
+        if (contentPixelVariance(lowerSlice) < 0.05) continue
+        if (interiorContentVariance(lowerSlice, rowBytes) < 0.03) continue
+        if (
+            interiorContentVariance(upperSlice, rowBytes) < 0.03
+            && !looksLikeVerticalWipe(upperSlice, PHOTO_BELT_SIGNATURE_WIDTH, tileRows)
+        ) {
+            continue
+        }
+
+        const pairRows = Math.max(8, Math.round(tileRows * 0.7))
+        const pairOffset = (tileRows - pairRows) * rowBytes
+        const pairDifference = contentMaskedDifference(
+            upperSlice.subarray(pairOffset),
+            lowerSlice.subarray(pairOffset),
+            PHOTO_BELT_SIGNATURE_WIDTH,
+        )
+        const fullDifference = contentMaskedDifference(
+            upperSlice,
+            lowerSlice,
+            PHOTO_BELT_SIGNATURE_WIDTH,
+        )
+        const upperHasWipe = looksLikeVerticalWipe(
+            upperSlice,
+            PHOTO_BELT_SIGNATURE_WIDTH,
+            tileRows,
+        )
+        const tileLimit = upperHasWipe ? PHOTO_CARD_WIPE_THRESHOLD : VIEWPORT_TILE_THRESHOLD
+
+        if (pairDifference > tileLimit && fullDifference > tileLimit) continue
+
+        return {
+            cutHeight: Math.min(Math.round(tileRows * scale), height - Math.round(upper * scale)),
+            cutStart: Math.round(upper * scale),
+        }
+    }
+
+    return null
+}
+
+/**
  * 在指紋上找一處相鄰重複帶。cardScale 時視窗可以比實際週期大（上複本
  * 常帶 wipe、下緣還有 CTA／留白），因此 lower 上方只需放得下上複本，
  * 週期可小於視窗。作品集中段上一張卡不必是近白；上複本有 wipe 時門檻
- * 放寬。細帶則仍要求上方是另一段高細節照片。
+ * 放寬。接近一整個 viewport 的週期，只要配對夠近就裁，不要求一定偵測
+ * 到 wipe。細帶則仍要求上方是另一段高細節照片。
  *
  * @param context 已縮好的長圖指紋。
  * @param ratios viewport 高度比例。
@@ -1722,10 +1793,11 @@ function findRepeatCut(
                 lowerPair,
                 PHOTO_BELT_SIGNATURE_WIDTH,
             )
+            const viewportPeriod = cardScale && ratio >= 0.9
             const upperHasWipe = cardScale
                 && looksLikeVerticalWipe(upperSlice, PHOTO_BELT_SIGNATURE_WIDTH, bandRows)
             const pairLimit = cardScale
-                ? (upperHasWipe ? PHOTO_CARD_WIPE_THRESHOLD : 0.025)
+                ? (upperHasWipe || viewportPeriod ? PHOTO_CARD_WIPE_THRESHOLD : 0.025)
                 : (bandPx < PHOTO_BELT_THIN_PX ? PHOTO_BELT_THIN_THRESHOLD : PHOTO_BELT_THRESHOLD)
 
             if (pairDifference > pairLimit) continue
@@ -1742,7 +1814,7 @@ function findRepeatCut(
             let aboveIsPage = false
 
             if (nothingAbove) {
-                if (!(cardScale && upperHasWipe)) continue
+                if (!(cardScale && (upperHasWipe || viewportPeriod))) continue
             }
             else {
                 const aboveStart = Math.max(0, bestUpper - bandRows)
@@ -1760,7 +1832,7 @@ function findRepeatCut(
                     )
                     : 0
 
-                if (cardScale && !aboveIsPage && !upperHasWipe) continue
+                if (cardScale && !aboveIsPage && !upperHasWipe && !viewportPeriod) continue
 
                 if (aboveIsPage && !cardScale) continue
 
@@ -1799,10 +1871,14 @@ function findRepeatCut(
             const betterDiff = pairDifference < cutDifference - 0.002
             const similarLarger = Math.abs(pairDifference - cutDifference) <= 0.002
                 && candidateHeight > cutHeight
+            const betterViewport = cardScale
+                && candidateHeight >= reference * 0.85
+                && cutHeight < reference * 0.7
+                && pairDifference <= PHOTO_CARD_WIPE_THRESHOLD
 
-            if (worsePage && !betterDiff) continue
+            if (worsePage && !betterDiff && !betterViewport) continue
 
-            if (betterPage || betterDiff || similarLarger || cutStart < 0) {
+            if (betterPage || betterViewport || betterDiff || similarLarger || cutStart < 0) {
                 cutDifference = pairDifference
                 cutFromPage = aboveIsPage
                 cutStart = candidateStart
@@ -1834,18 +1910,23 @@ function findRepeatCut(
  */
 function findThinBelt1D(
     context: RepeatScanContext,
+    columns: { columnEnd: number, columnStart: number } = { columnEnd: 64, columnStart: 0 },
 ): { cutHeight: number, cutStart: number } | null
 {
     const { height, rowBytes, scale, signature, signatureHeight } = context
     const sampleColumns = 64
+    const columnStart = Math.max(0, columns.columnStart)
+    const columnEnd = Math.min(sampleColumns, columns.columnEnd)
+    const usedColumns = columnEnd - columnStart
     const columnStep = Math.max(1, Math.floor(PHOTO_BELT_SIGNATURE_WIDTH / sampleColumns))
     const luma = new Float32Array(signatureHeight * sampleColumns)
     const content = new Uint8Array(signatureHeight)
+    const minPairSamples = usedColumns < 40 ? 4 : 8
 
     for (let row = 0; row < signatureHeight; row += 1) {
         let contentCount = 0
 
-        for (let column = 0; column < sampleColumns; column += 1) {
+        for (let column = columnStart; column < columnEnd; column += 1) {
             const index = row * rowBytes + column * columnStep * 3
             const value = 0.299 * (signature[index] ?? 0)
                 + 0.587 * (signature[index + 1] ?? 0)
@@ -1855,14 +1936,14 @@ function findThinBelt1D(
             if (value <= PHOTO_BELT_PAGE_LUMA) contentCount += 1
         }
 
-        content[row] = contentCount > sampleColumns * 0.15 ? 1 : 0
+        content[row] = contentCount > usedColumns * 0.15 ? 1 : 0
     }
 
     const rowDifference = (leftRow: number, rightRow: number): number => {
         let total = 0
         let count = 0
 
-        for (let column = 0; column < sampleColumns; column += 1) {
+        for (let column = columnStart; column < columnEnd; column += 1) {
             const left = luma[leftRow * sampleColumns + column] ?? 0
             const right = luma[rightRow * sampleColumns + column] ?? 0
 
@@ -1872,7 +1953,7 @@ function findThinBelt1D(
             count += 1
         }
 
-        return count < 8 ? 1 : total / count / 255
+        return count < minPairSamples ? 1 : total / count / 255
     }
 
     const windowDifference = (upper: number, lower: number, rows: number): number => {
@@ -1889,14 +1970,24 @@ function findThinBelt1D(
     let cutHeight = 0
     let cutDifference = 1
 
-    for (let period = 6; period <= 18; period += 1) {
+    for (let period = 5; period <= 22; period += 1) {
         const minimumLower = period * 2
         const maximumLower = signatureHeight - period
 
-        for (let lower = maximumLower; lower >= minimumLower; lower -= 2) {
+        for (let lower = maximumLower; lower >= minimumLower; lower -= 1) {
             if (!content[lower] || !content[lower - period]) continue
 
-            const pairDifference = windowDifference(lower - period, lower, period)
+            let pairDifference = 1
+
+            for (let shift = -1; shift <= 1; shift += 1) {
+                const upper = lower - period + shift
+
+                if (upper < 0 || upper + period > signatureHeight) continue
+
+                const difference = windowDifference(upper, lower, period)
+
+                if (difference < pairDifference) pairDifference = difference
+            }
 
             if (pairDifference > PHOTO_BELT_THIN_THRESHOLD) continue
 
@@ -1919,7 +2010,7 @@ function findThinBelt1D(
                 Math.min(period, aboveRows),
             )
 
-            if (aboveDifference < 0.03) continue
+            if (aboveDifference < 0.02) continue
 
             const belowStart = lower + period
 
@@ -2184,7 +2275,7 @@ export async function isSamePinnedScene(previous: Buffer, next: Buffer, width: n
 
     if (previousHeight < 80 || nextHeight < 80) return false
 
-    const scale = SETTLE_SIGNATURE_WIDTH / width
+    const scale = PHOTO_BELT_SIGNATURE_WIDTH / width
     const previousRows = Math.max(1, Math.round(previousHeight * scale))
     const nextRows = Math.max(1, Math.round(nextHeight * scale))
     const windowRows = Math.max(8, Math.round(Math.min(previousRows, nextRows) * PINNED_SCENE_ROWS_RATIO))
@@ -2192,28 +2283,30 @@ export async function isSamePinnedScene(previous: Buffer, next: Buffer, width: n
     if (windowRows > previousRows || windowRows > nextRows) return false
 
     const previousSignature = await sharp(previous)
-        .resize(SETTLE_SIGNATURE_WIDTH, previousRows, { fit: 'fill' })
+        .resize(PHOTO_BELT_SIGNATURE_WIDTH, previousRows, { fit: 'fill' })
         .removeAlpha()
         .raw()
         .toBuffer()
     const nextSignature = await sharp(next)
-        .resize(SETTLE_SIGNATURE_WIDTH, nextRows, { fit: 'fill' })
+        .resize(PHOTO_BELT_SIGNATURE_WIDTH, nextRows, { fit: 'fill' })
         .removeAlpha()
         .raw()
         .toBuffer()
-    const rowBytes = SETTLE_SIGNATURE_WIDTH * 3
+    const rowBytes = PHOTO_BELT_SIGNATURE_WIDTH * 3
     const previousTop = previousSignature.subarray(0, windowRows * rowBytes)
     const nextTop = nextSignature.subarray(0, windowRows * rowBytes)
 
     if (rowSliceVariance(nextTop) < SCENE_TRIM_MIN_VARIANCE) return false
 
-    const wipeAware = looksLikeVerticalWipe(previousTop, SETTLE_SIGNATURE_WIDTH, windowRows)
-        || looksLikeVerticalWipe(nextTop, SETTLE_SIGNATURE_WIDTH, windowRows)
-    const difference = wipeAware
-        ? contentMaskedDifference(previousTop, nextTop, SETTLE_SIGNATURE_WIDTH)
-        : visualDifference(previousTop, nextTop)
+    const wipeAware = looksLikeVerticalWipe(previousTop, PHOTO_BELT_SIGNATURE_WIDTH, windowRows)
+        || looksLikeVerticalWipe(nextTop, PHOTO_BELT_SIGNATURE_WIDTH, windowRows)
+    const masked = contentMaskedDifference(previousTop, nextTop, PHOTO_BELT_SIGNATURE_WIDTH)
+    const visual = visualDifference(previousTop, nextTop)
 
-    return difference <= PINNED_SCENE_THRESHOLD
+    if (wipeAware) return masked <= PINNED_SCENE_THRESHOLD
+    if (masked <= PINNED_MASKED_SAME_THRESHOLD && visual >= PINNED_SCENE_THRESHOLD) return true
+
+    return visual <= PINNED_SCENE_THRESHOLD
 }
 
 /**

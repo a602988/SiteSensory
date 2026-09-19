@@ -188,6 +188,22 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
         expect(await sampleRgb(trimmed, 200, 4200)).not.toEqual([248, 245, 239])
     }, 20_000)
 
+    it('trims a mid-page 1080 faint-wipe stack that coarse bar detection misses', async () => {
+        const page = await midPageFaintWipeStack()
+        const legacy = await legacyNarrowOffsetBeltTrim(page)
+        const trimmed = await trimRepeatedTailBand(page, WIDTH)
+        const legacyHeight = (await sharp(legacy).metadata()).height ?? 0
+        const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
+
+        expect(legacyHeight).toBe(4320)
+        expect(trimmedHeight).toBeLessThan(3500)
+        expect(trimmedHeight).toBeGreaterThan(3000)
+        expect(await sampleRgb(trimmed, 200, 200)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 220, 1120)).not.toEqual([255, 255, 255])
+        expect(await sampleRgb(trimmed, 200, 1120)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 1400, 2300)).not.toEqual([248, 245, 239])
+    })
+
     it('trims a live-like canvas extract: wipe viewport, clean copy, then a 18px foot belt', async () => {
         const page = await liveLikeCanvasExtract()
         const started = Date.now()
@@ -217,6 +233,17 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
         expect(await sampleRgb(trimmed, 200, 200)).not.toEqual([248, 245, 239])
         expect(await sampleRgb(trimmed, 200, 1280)).not.toEqual([255, 255, 255])
         expect(await sampleRgb(trimmed, 200, 1280)).not.toEqual([248, 245, 239])
+    })
+
+    it('trims a right-photo 16px head/CTA foot belt on a mid-page canvas tile', async () => {
+        const page = await midPageRightPhotoBelt()
+        const trimmed = await trimRepeatedTailBand(page, WIDTH)
+        const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
+
+        expect(trimmedHeight).toBeLessThan(2150)
+        expect(trimmedHeight).toBeGreaterThan(2000)
+        expect(await sampleRgb(trimmed, 1400, 1200)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 1400, trimmedHeight - 40)).toEqual([248, 245, 239])
     })
 
     it('trims an 18px photo-foot belt whose orange CTA top edge is also repeated', async () => {
@@ -332,8 +359,10 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
     it('treats a wipe viewport and its clean copy as the same pinned scene', async () => {
         const wipe = await canvasViewportCard({ wipe: true })
         const clean = await canvasViewportCard({ wipe: false })
+        const faint = await canvasViewportCard({ faintWipe: true })
 
         await expect(isSamePinnedScene(wipe, clean, WIDTH)).resolves.toBe(true)
+        await expect(isSamePinnedScene(faint, clean, WIDTH)).resolves.toBe(true)
         await expect(isSamePinnedScene(wipe, await nextPhotoCardOnCream(), WIDTH)).resolves.toBe(false)
     })
 
@@ -746,7 +775,7 @@ async function festivalCardPng(options: { wipe?: boolean } = {}): Promise<Buffer
     return sharp(raw, { raw: { channels: 3, height: 640, width: WIDTH } }).png().toBuffer()
 }
 
-async function leftFestivalCardPng(options: { wipe?: boolean } = {}): Promise<Buffer>
+async function leftFestivalCardPng(options: { faintWipe?: boolean, wipe?: boolean } = {}): Promise<Buffer>
 {
     const raw = Buffer.alloc(WIDTH * 640 * 3)
 
@@ -756,6 +785,10 @@ async function leftFestivalCardPng(options: { wipe?: boolean } = {}): Promise<Bu
             const inPhoto = column >= 80 && column < 980 && row >= 20 && row < 560
             const inCaption = column >= 1100 && column < 1700 && row >= 40 && row < 110
             const inCta = column >= 1100 && column < 1480 && row >= 470 && row < 520
+            const faintWipe = options.faintWipe === true
+                && inPhoto
+                && row < 140
+                && ((column >= 220 && column < 228) || (column >= 320 && column < 328))
             const wipeColumn = options.wipe
                 && inPhoto
                 && row < 220
@@ -763,7 +796,7 @@ async function leftFestivalCardPng(options: { wipe?: boolean } = {}): Promise<Bu
                 && column >= 160
                 && column < 720
 
-            if (wipeColumn) {
+            if (wipeColumn || faintWipe) {
                 raw[index] = 255
                 raw[index + 1] = 255
                 raw[index + 2] = 255
@@ -802,12 +835,85 @@ async function leftFestivalCardPng(options: { wipe?: boolean } = {}): Promise<Bu
     return sharp(raw, { raw: { channels: 3, height: 640, width: WIDTH } }).png().toBuffer()
 }
 
-async function canvasViewportCard(options: { wipe?: boolean } = {}): Promise<Buffer>
+async function canvasViewportCard(options: { faintWipe?: boolean, wipe?: boolean } = {}): Promise<Buffer>
 {
     return stackPngs([
-        await leftFestivalCardPng({ wipe: options.wipe === true }),
+        await leftFestivalCardPng({
+            faintWipe: options.faintWipe === true,
+            wipe: options.wipe === true,
+        }),
         await solidPng('#f8f5ef', 440),
     ])
+}
+
+async function midPageFaintWipeStack(): Promise<Buffer>
+{
+    return stackPngs([
+        await nextPhotoCardOnCream(),
+        await canvasViewportCard({ faintWipe: true }),
+        await canvasViewportCard({ wipe: false }),
+        await rightFitnessViewport(),
+    ])
+}
+
+async function midPageRightPhotoBelt(): Promise<Buffer>
+{
+    return stackPngs([
+        await nextPhotoCardOnCream(),
+        await rightFitnessViewport({ repeatBelt: true }),
+    ])
+}
+
+async function rightFitnessViewport(options: { repeatBelt?: boolean } = {}): Promise<Buffer>
+{
+    const raw = Buffer.alloc(WIDTH * 1080 * 3)
+    const photoLeft = 960
+    const photoRight = 1860
+    const photoTop = 40
+    const photoBottom = 720
+    const beltHeight = 16
+    const firstBelt = photoBottom - beltHeight * 2
+    const secondBelt = photoBottom - beltHeight
+
+    for (let row = 0; row < 1080; row += 1) {
+        for (let column = 0; column < WIDTH; column += 1) {
+            const index = (row * WIDTH + column) * 3
+            const inPhoto = column >= photoLeft && column < photoRight && row >= photoTop && row < photoBottom
+            const inFirstBelt = options.repeatBelt === true && inPhoto && row >= firstBelt && row < secondBelt
+            const inSecondBelt = options.repeatBelt === true && inPhoto && row >= secondBelt && row < photoBottom
+            const ctaTop = (inFirstBelt && row < firstBelt + 5) || (inSecondBelt && row < secondBelt + 5)
+
+            if (ctaTop && column >= 1180 && column < 1580) {
+                raw[index] = 255
+                raw[index + 1] = 92
+                raw[index + 2] = 56
+                continue
+            }
+
+            if (inFirstBelt || inSecondBelt) {
+                const beltRow = row - (inSecondBelt ? secondBelt : firstBelt)
+                raw[index] = 40 + beltRow * 6
+                raw[index + 1] = 28 + (column % 70)
+                raw[index + 2] = 22 + Math.floor(column / 9) % 40
+                continue
+            }
+
+            if (inPhoto) {
+                const sample = uniquePhotoTexel(row, column)
+
+                raw[index] = sample[0]
+                raw[index + 1] = sample[1]
+                raw[index + 2] = sample[2]
+                continue
+            }
+
+            raw[index] = 248
+            raw[index + 1] = 245
+            raw[index + 2] = 239
+        }
+    }
+
+    return sharp(raw, { raw: { channels: 3, height: 1080, width: WIDTH } }).png().toBuffer()
 }
 
 async function canvasWipeStackViewports(): Promise<Buffer>
