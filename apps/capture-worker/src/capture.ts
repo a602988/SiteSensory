@@ -27,11 +27,20 @@ const FIXED_CANVAS_COVERAGE_RATIO = 0.8
 const STICKY_CHROME_MAX_HEIGHT_RATIO = 0.35
 const STICKY_CHROME_MIN_WIDTH_RATIO = 0.5
 const STICKY_CHROME_TOP_MAX_PX = 80
+const STICKY_SIDE_MAX_WIDTH_RATIO = 0.4
+const STICKY_SIDE_MIN_HEIGHT_RATIO = 0.2
+const STICKY_CHROME_SIDE_MAX_PX = 80
+const SCENE_TRIM_MAX_RATIO = 0.8
+const SCENE_TRIM_MIN_VARIANCE = 0.02
+const SCENE_TRIM_THRESHOLD = 0.015
+const WIPE_BAR_MIN_COUNT = 3
+const WIPE_BAR_NEIGHBOR_DELTA = 35
+const WIPE_BAR_MIN_LUMINANCE = 190
 const OVERLAY_SETTLE_MS = 250
 const SIGNATURE_HEIGHT = 18
 const SIGNATURE_WIDTH = 32
 const VIRTUAL_CANVAS_DUPLICATE_THRESHOLD = 0.015
-const VIEWPORT_SETTLE_TIMEOUT_MS = 12_000
+const VIEWPORT_SETTLE_TIMEOUT_MS = 20_000
 const VIEWPORT_SETTLE_POLL_MS = 200
 const VIEWPORT_SETTLE_STABLE_SAMPLES = 5
 const VIEWPORT_SETTLE_THRESHOLD = 0.004
@@ -135,8 +144,8 @@ export async function capturePage(options: CaptureOptions): Promise<CapturedPage
             throw new Error('目標網站回傳存取驗證頁，未取得可分析的網站內容')
         }
 
-        await waitForVisibleViewportToSettle(page)
-        const viewportBuffer = await screenshotViewport(page, 'disabled')
+        const hero = await settleVisibleViewport(page)
+        const viewportBuffer = hero.image
         const fullPageBuffer = await captureFullPage(page)
         const finalUrl = normalizeUrl(page.url())
         const [viewport, fullPage] = await Promise.all([
@@ -275,6 +284,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
     await markFixedElements(page)
 
     const segments: OverlayOptions[] = []
+    const keptSegments: Buffer[] = []
     const hasVirtualCanvas = await detectsVirtualCanvas(page)
     const capturePositions = createCapturePositions(dimensions.height, dimensions.viewportHeight)
     let documentCoveredUntil = 0
@@ -286,7 +296,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             document.documentElement.toggleAttribute(hideFixedAttribute, scrollTop > 0)
             window.scrollTo(0, scrollTop)
         }, { hideFixedAttribute: HIDE_FIXED_ATTRIBUTE, scrollTop: target })
-        await waitForVisibleViewportToSettle(page)
+        const settled = await settleVisibleViewport(page)
 
         let actualScroll = await page.evaluate(() => Math.round(window.scrollY))
 
@@ -309,8 +319,13 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             throw new Error(`無法擷取頁面 ${target}px 到 ${target + dimensions.viewportHeight}px 的區段`)
         }
 
-        const viewport = await screenshotViewport(page, 'disabled')
-        const segment = await sharp(viewport)
+        if (settled.hasWipeArtifact) {
+            documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
+            continue
+        }
+
+        const viewport = settled.image
+        let segment = await sharp(viewport)
             .extract({
                 height: segmentHeight,
                 left: 0,
@@ -318,6 +333,23 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
                 width: dimensions.width,
             })
             .toBuffer()
+
+        if (!hasVirtualCanvas) {
+            const previous = keptSegments.at(-1)
+
+            if (previous) {
+                segment = Buffer.from(await trimDuplicateScenePrefix(previous, segment, dimensions.width))
+            }
+        }
+
+        const trimmedMeta = await sharp(segment).metadata()
+        const keptHeight = trimmedMeta.height ?? 0
+
+        if (keptHeight <= 0) {
+            documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
+            continue
+        }
+
         const signature = hasVirtualCanvas
             ? await createVisualSignature(segment)
             : null
@@ -331,7 +363,8 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         }
 
         segments.push({ input: segment, left: 0, top: outputHeight })
-        outputHeight += segmentHeight
+        keptSegments.push(segment)
+        outputHeight += keptHeight
         documentCoveredUntil = documentEnd
         previousSignature = signature
     }
@@ -446,9 +479,9 @@ function visualDifference(left: Buffer, right: Buffer): number
 }
 
 /**
- * 標記頁首已存在的小型固定介面，以及已出現在首屏的頂部 sticky 導覽列，
- * 避免導覽列、聊天按鈕等元素在每段重複出現。覆蓋大部分 viewport 的固定畫布，
- * 與接近整段 viewport 高的 sticky 捲動場景不在此列。
+ * 標記頁首已存在的小型固定介面、頂部 sticky 導覽列，以及貼齊左右的
+ * sticky 側欄，避免這些 chrome 在每段重複出現。覆蓋大部分 viewport 的
+ * 固定畫布，與接近整段 viewport 高且接近全寬的 sticky 捲動場景不在此列。
  *
  * @param page Playwright 頁面。
  * @returns 完成 DOM 標記後結束。
@@ -460,7 +493,10 @@ async function markFixedElements(page: import('playwright').Page): Promise<void>
         canvasCoverageRatio,
         chromeMaxHeightRatio,
         chromeMinWidthRatio,
+        chromeSideMaxPx,
         chromeTopMaxPx,
+        sideMaxWidthRatio,
+        sideMinHeightRatio,
     }) => {
         const elements = [...document.body.querySelectorAll<HTMLElement>('*')]
 
@@ -487,6 +523,8 @@ async function markFixedElements(page: import('playwright').Page): Promise<void>
             }
 
             const top = Number.parseFloat(style.top)
+            const left = Number.parseFloat(style.left)
+            const right = Number.parseFloat(style.right)
             const inFirstViewport = bounds.bottom > 0 && bounds.top < window.innerHeight
             const isTopChrome = Number.isFinite(top)
                 && top <= chromeTopMaxPx
@@ -494,16 +532,47 @@ async function markFixedElements(page: import('playwright').Page): Promise<void>
                 && bounds.height < window.innerHeight * chromeMaxHeightRatio
                 && bounds.width >= window.innerWidth * chromeMinWidthRatio
                 && inFirstViewport
+            const isSideChrome = inFirstViewport
+                && bounds.width > 0
+                && bounds.width < window.innerWidth * sideMaxWidthRatio
+                && bounds.height >= window.innerHeight * sideMinHeightRatio
+                && (
+                    Number.isFinite(left) && left <= chromeSideMaxPx
+                    || Number.isFinite(right) && right <= chromeSideMaxPx
+                    || bounds.left <= 8
+                    || bounds.right >= window.innerWidth - 8
+                )
 
-            if (isTopChrome) element.setAttribute(attribute, '')
+            if (isTopChrome || isSideChrome) element.setAttribute(attribute, '')
         }
     }, {
         attribute: FIXED_ELEMENT_ATTRIBUTE,
         canvasCoverageRatio: FIXED_CANVAS_COVERAGE_RATIO,
         chromeMaxHeightRatio: STICKY_CHROME_MAX_HEIGHT_RATIO,
         chromeMinWidthRatio: STICKY_CHROME_MIN_WIDTH_RATIO,
+        chromeSideMaxPx: STICKY_CHROME_SIDE_MAX_PX,
         chromeTopMaxPx: STICKY_CHROME_TOP_MAX_PX,
+        sideMaxWidthRatio: STICKY_SIDE_MAX_WIDTH_RATIO,
+        sideMinHeightRatio: STICKY_SIDE_MIN_HEIGHT_RATIO,
     })
+}
+
+/**
+ * 等到可見區域穩定；若仍像 wipe 殘影，再等一輪後決定要不要寫入。
+ *
+ * @param page 已捲到目標位置的 Playwright 頁面。
+ * @returns 最後一張視窗截圖，以及是否仍偵測到 wipe 條紋。
+ */
+async function settleVisibleViewport(page: import('playwright').Page): Promise<{
+    hasWipeArtifact: boolean
+    image: Buffer
+}>
+{
+    const first = await waitForVisibleViewportToSettle(page)
+
+    if (!first.hasWipeArtifact) return first
+
+    return waitForVisibleViewportToSettle(page)
 }
 
 /**
@@ -851,9 +920,12 @@ async function dismissAndHideOverlaysInPage(options: {
  * 逾時後保存當時畫面。不使用 prefers-reduced-motion。
  *
  * @param page 已捲到目標位置的 Playwright 頁面。
- * @returns 畫面穩定或等待上限用盡後結束。
+ * @returns 最後一張視窗截圖，以及該幀是否仍像 wipe。
  */
-async function waitForVisibleViewportToSettle(page: import('playwright').Page): Promise<void>
+async function waitForVisibleViewportToSettle(page: import('playwright').Page): Promise<{
+    hasWipeArtifact: boolean
+    image: Buffer
+}>
 {
     await page.waitForTimeout(CAPTURE_SETTLE_MS)
     await page.evaluate(() => new Promise<void>(resolve => {
@@ -865,12 +937,15 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
     let previousSignature: Buffer | null = null
     let previousLayout = ''
     let stableSamples = 0
+    let latest = await screenshotViewport(page, 'allow')
+    let latestHasWipe = false
 
     while (Date.now() < deadline) {
         const hasCssMotion = await hasFiniteViewportAnimations(page)
         const layout = await readViewportLayoutState(page)
         const screenshot = await screenshotViewport(page, 'allow')
         const signature = await createSettleSignature(screenshot)
+        const hasWipe = looksLikeVerticalWipe(signature, SETTLE_SIGNATURE_WIDTH, SETTLE_SIGNATURE_HEIGHT)
         const visuallyStable = Boolean(
             previousSignature
             && visualDifference(previousSignature, signature) <= VIEWPORT_SETTLE_THRESHOLD
@@ -883,14 +958,20 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
         )
         const layoutStable = previousLayout !== '' && previousLayout === layout
 
-        stableSamples = !hasCssMotion && visuallyStable && layoutStable ? stableSamples + 1 : 0
+        latest = screenshot
+        latestHasWipe = hasWipe
+        stableSamples = !hasCssMotion && !hasWipe && visuallyStable && layoutStable ? stableSamples + 1 : 0
         previousSignature = signature
         previousLayout = layout
 
-        if (stableSamples >= VIEWPORT_SETTLE_STABLE_SAMPLES) return
+        if (stableSamples >= VIEWPORT_SETTLE_STABLE_SAMPLES) {
+            return { hasWipeArtifact: false, image: screenshot }
+        }
 
         await page.waitForTimeout(VIEWPORT_SETTLE_POLL_MS)
     }
+
+    return { hasWipeArtifact: latestHasWipe, image: latest }
 }
 
 /**
@@ -1024,6 +1105,148 @@ function maxStripDifference(left: Buffer, right: Buffer, width: number, height: 
     }
 
     return maximum
+}
+
+/**
+ * 判斷指紋是否像照片上的垂直 wipe 白條：亮而窄的直欄穿過中等亮度的內容區。
+ * 頁面底的淡格線因鄰近欄也接近白色，不會被算進去。
+ *
+ * @param image 較高解析 RGB 指紋。
+ * @param width 指紋寬度。
+ * @param height 指紋高度。
+ * @returns 偵測到至少三條疑似 wipe 直條時為 true。
+ */
+function looksLikeVerticalWipe(image: Buffer, width: number, height: number): boolean
+{
+    if (image.length !== width * height * 3) return false
+
+    const columnMean = new Float64Array(width)
+
+    for (let column = 0; column < width; column += 1) {
+        let total = 0
+
+        for (let row = 0; row < height; row += 1) {
+            const index = (row * width + column) * 3
+
+            total += 0.299 * (image[index] ?? 0)
+                + 0.587 * (image[index + 1] ?? 0)
+                + 0.114 * (image[index + 2] ?? 0)
+        }
+
+        columnMean[column] = total / height
+    }
+
+    let spikes = 0
+
+    for (let column = 2; column < width - 2; column += 1) {
+        const neighborhood = (
+            (columnMean[column - 2] ?? 0)
+            + (columnMean[column - 1] ?? 0)
+            + (columnMean[column + 1] ?? 0)
+            + (columnMean[column + 2] ?? 0)
+        ) / 4
+        const current = columnMean[column] ?? 0
+        const sitsOnContent = neighborhood > 25 && neighborhood < 220
+
+        if (sitsOnContent && current > neighborhood + WIPE_BAR_NEIGHBOR_DELTA && current > WIPE_BAR_MIN_LUMINANCE) {
+            spikes += 1
+        }
+    }
+
+    return spikes >= WIPE_BAR_MIN_COUNT
+}
+
+/**
+ * 去掉後段開頭與前一段內容重複的捲動場景。sticky 面板停在視窗上方時，
+ * 幾何裁切後仍會再寫入同一張照片。純色底不裁，以免把留白誤刪。
+ *
+ * @param previous 前一個已保留區段。
+ * @param next 目前區段。
+ * @param width 區段寬度。
+ * @returns 去掉重複前綴後的區段；沒有重複則原樣返回。
+ */
+async function trimDuplicateScenePrefix(previous: Buffer, next: Buffer, width: number): Promise<Buffer>
+{
+    const previousMeta = await sharp(previous).metadata()
+    const nextMeta = await sharp(next).metadata()
+    const previousHeight = previousMeta.height ?? 0
+    const nextHeight = nextMeta.height ?? 0
+
+    if (previousHeight < 40 || nextHeight < 40) return next
+
+    const scale = SETTLE_SIGNATURE_WIDTH / width
+    const previousRows = Math.max(1, Math.round(previousHeight * scale))
+    const nextRows = Math.max(1, Math.round(nextHeight * scale))
+    const previousSignature = await sharp(previous)
+        .resize(SETTLE_SIGNATURE_WIDTH, previousRows, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+    const nextSignature = await sharp(next)
+        .resize(SETTLE_SIGNATURE_WIDTH, nextRows, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+    const rowBytes = SETTLE_SIGNATURE_WIDTH * 3
+    const windowRows = Math.min(8, previousRows, nextRows)
+    let matchedRows = 0
+
+    for (let start = 0; start <= nextRows - windowRows; start += 1) {
+        const slice = nextSignature.subarray(start * rowBytes, (start + windowRows) * rowBytes)
+
+        if (rowSliceVariance(slice) < SCENE_TRIM_MIN_VARIANCE) break
+
+        let found = false
+
+        for (let previousStart = 0; previousStart <= previousRows - windowRows; previousStart += 1) {
+            const previousSlice = previousSignature.subarray(previousStart * rowBytes, (previousStart + windowRows) * rowBytes)
+
+            if (visualDifference(slice, previousSlice) <= SCENE_TRIM_THRESHOLD) {
+                found = true
+                break
+            }
+        }
+
+        if (!found) break
+
+        matchedRows = start + windowRows
+    }
+
+    const trimPx = Math.min(Math.round(matchedRows / scale), Math.floor(nextHeight * SCENE_TRIM_MAX_RATIO))
+
+    if (trimPx <= 8 || trimPx >= nextHeight) return next
+
+    return sharp(next)
+        .extract({
+            height: nextHeight - trimPx,
+            left: 0,
+            top: trimPx,
+            width,
+        })
+        .toBuffer()
+}
+
+/**
+ * 計算一段 RGB 列資料的正規化變異數，用來略過純色留白。
+ *
+ * @param slice 連續列的 RGB 資料。
+ * @returns 介於 0 與 1 的平均變異。
+ */
+function rowSliceVariance(slice: Buffer): number
+{
+    if (slice.length === 0) return 0
+
+    let mean = 0
+
+    for (const value of slice) mean += value
+
+    mean /= slice.length
+
+    let total = 0
+
+    for (const value of slice) total += (value - mean) ** 2
+
+    return Math.sqrt(total / slice.length) / 255
 }
 
 /**

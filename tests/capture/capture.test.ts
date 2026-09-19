@@ -29,7 +29,7 @@ let server: Server
 let fixtureUrl: string
 let storageRoot: string
 
-describe('capture worker', { timeout: 30_000 }, () => {
+describe('capture worker', { timeout: 40_000 }, () => {
     beforeAll(async () => {
         browser = await chromium.launch({ headless: true })
         storageRoot = await mkdtemp(join(tmpdir(), 'sitesensory-capture-'))
@@ -348,6 +348,36 @@ describe('capture worker', { timeout: 30_000 }, () => {
         expect(laterHeader).not.toEqual([220, 38, 38])
         expect(laterCanvas).toEqual([34, 197, 94])
     })
+
+    it('does not repeat a sticky side bar in later stitch segments', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?stickySidebar=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+
+        expect(await samplePixel(fullPage, 80, 30)).toEqual([220, 38, 38])
+        expect(await samplePixel(fullPage, 80, 1110)).not.toEqual([220, 38, 38])
+        expect(await samplePixel(fullPage, 960, 1500)).toEqual([34, 197, 94])
+    })
+
+    it('trims a repeated sticky scene band from later stitch segments', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?stickyScene=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+
+        expect(await samplePixel(fullPage, 960, 1200)).toEqual([34, 197, 94])
+        expect(await samplePixel(fullPage, 960, 2000)).not.toEqual([34, 197, 94])
+        expect(await samplePixel(fullPage, 960, 2000)).not.toEqual([21, 128, 61])
+    })
 })
 
 /**
@@ -367,6 +397,8 @@ function createFixtureServer(): Server
         const delayedReveal = parameters.has('delayedReveal')
         const heroReveal = parameters.has('heroReveal')
         const wipeReveal = parameters.has('wipeReveal')
+        const stickySidebar = parameters.has('stickySidebar')
+        const stickyScene = parameters.has('stickyScene')
 
         if (cookies) {
             const html = `<!doctype html>
@@ -495,7 +527,12 @@ addEventListener('scroll',()=>{
     }
     const started=performance.now()
     const tick=now=>{
-        const t=Math.min((now-started)/2800,1)
+        const elapsed=now-started
+        if(elapsed<1800){
+            raf=requestAnimationFrame(tick)
+            return
+        }
+        const t=Math.min((elapsed-1800)/400,1)
         for(const bar of bars) bar.style.transform='scaleX('+(1-t)+')'
         if(t<1) raf=requestAnimationFrame(tick)
         else wipes.innerHTML=''
@@ -503,6 +540,38 @@ addEventListener('scroll',()=>{
     raf=requestAnimationFrame(tick)
 })
 </script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (stickySidebar) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Sticky Sidebar Fixture</title></head>
+<body style="margin:0">
+<div id="canvas" style="position:fixed;inset:0;background:#315ceb;z-index:0"></div>
+<aside style="position:sticky;top:0;left:0;width:240px;height:100vh;background:#dc2626;z-index:2"></aside>
+<div style="height:3240px;position:relative;z-index:1"></div>
+<script>addEventListener('scroll',()=>{document.querySelector('#canvas').style.background=scrollY>0?'#22c55e':'#315ceb'})</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (stickyScene) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Sticky Scene Fixture</title></head>
+<body style="margin:0">
+<section style="height:1080px;background:#315ceb"></section>
+<section style="height:2500px;background:#f8f5ef">
+<div style="position:sticky;top:0;height:400px;background-image:repeating-linear-gradient(90deg,#22c55e 0 40px,#15803d 40px 80px)"></div>
+</section>
 </body></html>`
 
             response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
