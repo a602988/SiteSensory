@@ -16,7 +16,7 @@ const KEY_LENGTH = 64
  */
 export async function hashPassword(password: string): Promise<string>
 {
-    if (password.length < 12) throw new Error('本機密碼至少需要 12 個字元')
+    if (password.length < 8) throw new Error('本機密碼至少需要 8 個字元')
 
     const salt = randomBytes(16)
     const derivedKey = await scrypt(password, salt, KEY_LENGTH) as Buffer

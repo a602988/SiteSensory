@@ -8,11 +8,17 @@ import {
 } from 'vitest'
 
 import {
+    createDatabase,
     createMigrationDatabase,
     migrateToLatest,
     rollbackOne,
     type MigrationDatabase,
 } from '../../packages/database/src/index.js'
+import { createPrivateStore } from '../../apps/api/src/private-store.js'
+import {
+    createIngestionStore,
+    IngestionConflictError,
+} from '../../apps/api/src/ingestion-store.js'
 
 const databaseUrl = process.env.TEST_DATABASE_URL
 const integration = databaseUrl ? describe : describe.skip
@@ -65,6 +71,110 @@ integration('database migration', () => {
         expect(applicationTables.rows).toHaveLength(25)
         expect(tablesWithoutCreatedAt.rows).toEqual([])
         expect(pageTypes.rows[0]?.count).toBe('13')
+
+        const privateDatabase = createDatabase(databaseUrl as string)
+        const privateStore = createPrivateStore(privateDatabase)
+        const ingestionStore = createIngestionStore(privateDatabase)
+        const users = await sql<{ id: string }>`
+            INSERT INTO users (display_name)
+            VALUES ('User A'), ('User B')
+            RETURNING id
+        `.execute(database)
+        const userAId = users.rows[0]?.id as string
+        const userBId = users.rows[1]?.id as string
+        const pageVersion = await sql<{ id: string }>`
+            WITH inserted_site AS (
+                INSERT INTO sites (registrable_domain, name)
+                VALUES ('example.com', 'Example')
+                RETURNING id
+            ), inserted_page AS (
+                INSERT INTO pages (site_id, canonical_url, normalized_url_hash)
+                SELECT id, 'https://example.com/', 'migration-test-page'
+                FROM inserted_site
+                RETURNING id
+            )
+            INSERT INTO page_versions (
+                page_id,
+                version_number,
+                final_url,
+                content_fingerprint,
+                capture_profile_key,
+                captured_at
+            )
+            SELECT id, 1, 'https://example.com/', 'migration-test-version', 'desktop-1920', now()
+            FROM inserted_page
+            RETURNING id
+        `.execute(database)
+        const pageVersionId = pageVersion.rows[0]?.id as string
+        const tag = await privateStore.createTag(userAId, { name: '留白版面' })
+        const savedView = await privateStore.createSavedView(userAId, {
+            height: 0.4,
+            pageVersionId,
+            reason: '內容層級清楚',
+            tagIds: [tag.id],
+            width: 0.5,
+            x: 0.1,
+            y: 0.2,
+        })
+
+        expect(savedView?.tagIds).toEqual([tag.id])
+        expect((await privateStore.listSavedViews(userBId, 1)).items).toEqual([])
+        expect(await privateStore.updateSavedView(userBId, savedView?.id as string, {
+            reason: '不應成功',
+        })).toBeNull()
+        expect(await privateStore.deleteSavedView(userBId, savedView?.id as string)).toBe(false)
+
+        const [firstJob, repeatedUrlJob] = await Promise.all([
+            ingestionStore.createOrReuse(
+                'https://example.com/?utm_source=test',
+                'https://example.com/',
+                'migration-ingestion-a',
+            ),
+            ingestionStore.createOrReuse(
+                'https://example.com/',
+                'https://example.com/',
+                'migration-ingestion-b',
+            ),
+        ])
+
+        expect(repeatedUrlJob.id).toBe(firstJob.id)
+        await expect(ingestionStore.createOrReuse(
+            'https://example.org/',
+            'https://example.org/',
+            'migration-ingestion-a',
+        )).rejects.toBeInstanceOf(IngestionConflictError)
+
+        const claims = await Promise.all([
+            ingestionStore.claim('worker-a', 30),
+            ingestionStore.claim('worker-b', 30),
+        ])
+        const claimed = claims.find(job => job !== null)
+
+        expect(claims.filter(job => job !== null)).toHaveLength(1)
+        expect(claimed?.state).toBe('resolving')
+        expect(await ingestionStore.renew(firstJob.id, 'invalid-token', 30)).toBe(false)
+        await sql`
+            UPDATE ingestion_jobs
+            SET lease_expires_at = now() - interval '1 second'
+            WHERE id = ${firstJob.id}
+        `.execute(database)
+        const reclaimed = await ingestionStore.claim('worker-c', 30)
+
+        expect(reclaimed?.retryCount).toBe(1)
+        expect(reclaimed?.leaseToken).not.toBe(claimed?.leaseToken)
+        expect(await ingestionStore.fail(
+            firstJob.id,
+            reclaimed?.leaseToken as string,
+            'CAPTURE_FAILED',
+            'test failure',
+            true,
+        )).toBe(true)
+        expect(await ingestionStore.get(firstJob.id)).toMatchObject({
+            retryCount: 2,
+            state: 'queued',
+        })
+
+        await privateDatabase.destroy()
 
         const user = await sql<{ id: string }>`
             INSERT INTO users (display_name) VALUES ('Migration test') RETURNING id

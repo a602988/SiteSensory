@@ -19,6 +19,8 @@ export const PAGE_TYPE_KEYS = PAGE_TYPE_SEEDS.map(seed => seed.key) as [
     ...Array<typeof PAGE_TYPE_SEEDS[number]['key']>,
 ]
 
+export type PageTypeKey = typeof PAGE_TYPE_SEEDS[number]['key']
+
 export const TAXONOMY_TERM_SEEDS = [
     { groupKey: 'industry', key: 'technology', name: '科技' },
     { groupKey: 'industry', key: 'ecommerce', name: '電子商務' },

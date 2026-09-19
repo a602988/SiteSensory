@@ -55,7 +55,7 @@ Repository 目前只有 `doc/vision.md`，沒有程式碼、資料庫 schema（�
 
 | 層級 | 選擇 | 原因 |
 | --- | --- | --- |
-| 前端 | Next.js App Router、React、TypeScript | 適合搜尋、詳情與互動式框選頁面；App Router 支援巢狀版面、載入與錯誤狀態。[Next.js App Router](https://nextjs.org/docs/app) |
+| 前端 | Vite、React、TypeScript | 第一版只在本機內部使用，採用較輕的 Vite 開發伺服器即可支援搜尋、詳情與互動式框選；`/api` 與 `/assets` 由 dev server 代理到 localhost API。 |
 | API | Fastify、TypeScript、Zod、OpenAPI | 路由與前端分離，能限制 localhost，並以同一份 schema 驗證 CLI、前端與 API 資料 |
 | 資料存取 | PostgreSQL、SQL migration、Kysely | 保留 SQL、transaction（交易）與 pgvector 查詢的完整控制，不讓 ORM 限制向量索引 |
 | 網站擷取 | Playwright | 能保存完整頁面與指定區域圖片；官方 API 支援 full-page screenshot（完整頁面截圖）。[Playwright Screenshots](https://playwright.dev/docs/next/screenshots) |
@@ -475,7 +475,7 @@ CLI 預設輸出穩定 JSON，錯誤寫到 stderr 並使用非零 exit code（�
 
 ### P3：實作 localhost API 與本機帳號
 
-- 狀態：進行中。Fastify 基礎、統一錯誤格式、request ID、本機密碼雜湊、session 與資料庫帳號建立已完成；端點骨架、OpenAPI 契約及私人資料隔離測試尚待完成。
+- 狀態：已完成（2026-09-17）。公開、私人與內部 API 邊界已建立；本機帳號、OpenAPI、Zod 契約及 PostgreSQL 私人資料隔離測試通過。驗證摘要位於 `artifacts/verification/p3/summary.md`。
 - 角色：工程師。
 - 輸入：P2 契約。
 - 產出：Fastify API、統一錯誤格式、request ID、localhost 綁定、本機 session、收錄、工作、搜尋、收藏與標籤端點骨架。
@@ -487,6 +487,7 @@ CLI 預設輸出穩定 JSON，錯誤寫到 stderr 並使用非零 exit code（�
 
 ### P4：實作網址安全、去重與工作佇列
 
+- 狀態：已完成（2026-09-18）。網址正規化、DNS 與 redirect SSRF 防護、冪等收錄、PostgreSQL 原子領取、lease、過期回收與重試已完成。驗證摘要位於 `artifacts/verification/p4/summary.md`。
 - 角色：工程師。
 - 輸入：P3、網址正規化與工作狀態契約。
 - 產出：網址正規化、SSRF 防護、redirect 驗證、冪等收錄、PostgreSQL 原子領取、lease、重試及 job attempt 紀錄。
@@ -498,13 +499,14 @@ CLI 預設輸出穩定 JSON，錯誤寫到 stderr 並使用非零 exit code（�
 
 ### P5：實作頁面擷取、內頁探索與版本比較
 
+- 狀態：已實作、待改版門檻校正（2026-09-18）。`desktop-1920` 首屏與完整頁面擷取、本機檔案儲存、DOM 摘要、內頁候選及 fixture 版本比較已通過；已從 DBCut 匯入 6 個真實公開網站樣本。驗證摘要位於 `artifacts/verification/p5/summary.md`。
 - 角色：工程師。
 - 輸入：P4、已確認的 viewport 設定、本機 fixture 網站。
 - 產出：Playwright worker、首屏與完整截圖、本機 `ObjectStorage` 資產、DOM 摘要、內頁候選、圖片特徵、版本比較及人工覆核狀態。
 - 完成條件與驗證：fixture 的成功、逾時、redirect、無限滾動、cookie banner（Cookie 提示）與擷取失敗案例可重複；小變化與明顯變化能走不同狀態，門檻仍標記待真實樣本校正。
 - 證據：`artifacts/verification/p5/`。
 - 依賴：P4。
-- 確認節點：開始真實網站校正前確認測試網址可使用。
+- 確認節點：建立正式改版判斷門檻前，需要更多真實網站的重複擷取與人工判讀結果。
 - 回滾點：P4 完成狀態；刪除本階段可重建的測試資產。
 
 ### P6：建立圖片向量介面與相似搜尋
@@ -520,6 +522,7 @@ CLI 預設輸出穩定 JSON，錯誤寫到 stderr 並使用非零 exit code（�
 
 ### P7：建立 Codex CLI 與分析契約
 
+- 狀態：部分完成（2026-09-18）。版本化分析 schema、內部分析提交 API、公共分類寫入、未知標籤隔離與相同結果冪等提交已完成；Codex 已分析 6 個網站的 33 張頁面。工作 claim、context、failure 與 lease 流程仍未實作，因此 P7 尚未完成。驗證摘要位於 `artifacts/verification/p7/summary.md`。
 - 角色：工程師。
 - 輸入：P2、P3、Codex 輸出欄位。
 - 產出：CLI 命令、analysis claim／context／submit／failure API、版本化 JSON schema、提示與分類規則檔、未知標籤隔離及完整稽核資料。
@@ -542,6 +545,7 @@ CLI 預設輸出穩定 JSON，錯誤寫到 stderr 並使用非零 exit code（�
 
 ### P9：完成搜尋、詳情與框選介面
 
+- 狀態：薄切片已完成（2026-09-18）。已可登入本機前端、查詢已發布頁面、以語言與頁面類型篩選、查看首屏與完整頁面圖片、開啟原始網址並拖曳框選。詳情已能顯示同站截圖與相似候選；目前候選以頁面類型、語言及分析摘要排序，圖片向量相似度仍待 P6 完成後替換評分來源。
 - 角色：前端工程師。
 - 輸入：P8 API、前端畫面與框選契約。
 - 產出：首頁、搜尋頁、頁面詳情、篩選、外部連結、框選工具與相似結果；包含載入、錯誤、空資料及過期請求取消。
@@ -553,6 +557,7 @@ CLI 預設輸出穩定 JSON，錯誤寫到 stderr 並使用非零 exit code（�
 
 ### P10：完成收藏、私人標籤與收藏原因
 
+- 狀態：薄切片已完成（2026-09-18）。已可建立私人標籤、在收藏時寫下原因並保存框選座標；標籤版圖與多使用者完整前端驗證仍待後續補齊。
 - 角色：前端工程師。
 - 輸入：P3 私人資料 API、P9 框選工具。
 - 產出：收藏視角、收藏清單、私人標籤管理、標籤版圖、收藏原因及多視角流程。

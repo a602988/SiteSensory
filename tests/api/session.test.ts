@@ -11,6 +11,9 @@ import {
     type AppOptions,
 } from '../../apps/api/src/app.js'
 import { hashPassword } from '../../apps/api/src/password.js'
+import { createMemoryPrivateStore } from './private-store-fixture.js'
+import { createMemoryIngestionStore } from './ingestion-store-fixture.js'
+import { createMemoryPageStore } from './page-store-fixture.js'
 
 let app: Awaited<ReturnType<typeof buildApp>>
 
@@ -26,9 +29,28 @@ describe('local session API', () => {
                     }
                 },
             },
+            ingestionStore: createMemoryIngestionStore(),
+            internalApiKey: 'test-internal-api-key-with-32-characters',
             localAdminName: '本機管理者',
             localPasswordHash: await hashPassword('a-secure-local-password'),
+            pageStore: createMemoryPageStore(),
+            privateStore: createMemoryPrivateStore(),
             sessionKey: Buffer.alloc(32, 1),
+            storage: {
+                async get()
+                {
+                    return Buffer.from('')
+                },
+                async put()
+                {
+                    return {
+                        byteSize: 0,
+                        objectKey: 'test.png',
+                        sha256: '0'.repeat(64),
+                    }
+                },
+            },
+            urlValidator: async () => undefined,
         }
 
         app = await buildApp(options)

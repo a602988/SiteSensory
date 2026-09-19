@@ -6,19 +6,43 @@ import Fastify, {
 } from 'fastify'
 import { z } from 'zod'
 
+import { apiErrorSchema } from '@sitesensory/contracts'
+import type { ObjectStorage } from '@sitesensory/image'
+
 import type { LocalAuthStore } from './auth-store.js'
+import type { IngestionStore } from './ingestion-store.js'
 import { verifyPassword } from './password.js'
+import type { PageStore } from './page-store.js'
+import type { PrivateStore } from './private-store.js'
+import {
+    type LocalSessionData,
+    registerRoutes,
+} from './routes.js'
+import { toJsonSchema } from './schema.js'
 
 const credentialsSchema = z.object({
     password: z.string().min(1).max(1024),
 })
+const sessionSchema = z.object({
+    user: z.object({
+        displayName: z.string(),
+        id: z.uuid(),
+    }),
+})
+const healthSchema = z.object({ status: z.literal('ok') })
 
 export type AppOptions = {
     authStore: LocalAuthStore
+    ingestionStore: IngestionStore
+    internalApiKey: string
     localAdminName: string
     localPasswordHash: string
     logger?: boolean
+    pageStore: PageStore
+    privateStore: PrivateStore
     sessionKey: Buffer
+    storage: ObjectStorage
+    urlValidator: (url: string) => Promise<void>
 }
 
 /**
@@ -30,7 +54,12 @@ export type AppOptions = {
 export async function buildApp(options: AppOptions): Promise<FastifyInstance>
 {
     const app = Fastify({
+        bodyLimit: 50 * 1024 * 1024,
         logger: options.logger ?? false,
+    })
+
+    app.addContentTypeParser('image/png', { parseAs: 'buffer' }, (_request, body, done) => {
+        done(null, body)
     })
 
     await app.register(swagger, {
@@ -52,6 +81,15 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance>
     })
 
     app.setErrorHandler((error, request, reply) => {
+        if (error instanceof z.ZodError) {
+            return reply.status(400).send({
+                code: 'VALIDATION_ERROR',
+                details: error.flatten(),
+                message: '輸入內容格式不正確。',
+                request_id: request.id,
+            })
+        }
+
         const appError = (error instanceof Error
             ? error as Error & { statusCode?: number }
             : new Error('未知的 API 錯誤')) as Error & { statusCode?: number }
@@ -60,7 +98,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance>
             : 500
         const isServerError = statusCode >= 500
 
-        reply.status(statusCode).send({
+        return reply.status(statusCode).send({
             code: isServerError ? 'INTERNAL_ERROR' : 'REQUEST_ERROR',
             details: null,
             message: isServerError ? '伺服器處理失敗，請稍後再試。' : appError.message,
@@ -68,9 +106,20 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance>
         })
     })
 
-    app.get('/api/v1/health', async () => ({ status: 'ok' }))
+    app.get('/api/v1/health', {
+        schema: {
+            response: { 200: toJsonSchema(healthSchema) },
+        },
+    }, async () => ({ status: 'ok' }))
 
-    app.get('/api/v1/session', async (request, reply) => {
+    app.get('/api/v1/session', {
+        schema: {
+            response: {
+                200: toJsonSchema(sessionSchema),
+                401: toJsonSchema(apiErrorSchema),
+            },
+        },
+    }, async (request, reply) => {
         const session = request.session as Session<LocalSessionData>
         const user = session.get('user')
 
@@ -86,7 +135,16 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance>
         return { user }
     })
 
-    app.post('/api/v1/session', async (request, reply) => {
+    app.post('/api/v1/session', {
+        schema: {
+            body: toJsonSchema(credentialsSchema),
+            response: {
+                200: toJsonSchema(sessionSchema),
+                400: toJsonSchema(apiErrorSchema),
+                401: toJsonSchema(apiErrorSchema),
+            },
+        },
+    }, async (request, reply) => {
         const session = request.session as Session<LocalSessionData>
         const credentials = credentialsSchema.safeParse(request.body)
 
@@ -130,12 +188,14 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance>
         return reply.status(204).send()
     })
 
-    return app
-}
+    await registerRoutes(app, {
+        ingestionStore: options.ingestionStore,
+        internalApiKey: options.internalApiKey,
+        pageStore: options.pageStore,
+        privateStore: options.privateStore,
+        storage: options.storage,
+        urlValidator: options.urlValidator,
+    })
 
-type LocalSessionData = {
-    user: {
-        displayName: string
-        id: string
-    }
+    return app
 }
