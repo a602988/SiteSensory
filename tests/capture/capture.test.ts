@@ -763,9 +763,9 @@ sync()
 <body style="margin:0;background:#f8f5ef">
 <section style="height:1080px;background:#315ceb"></section>
 <section style="height:1080px;background:#f8f5ef;position:relative">
-<div style="position:absolute;left:960px;top:40px;width:900px;height:500px;background-image:repeating-linear-gradient(135deg,#3f6f8a 0 14px,#2d5568 14px 28px)"></div>
-<div style="position:absolute;left:960px;top:540px;width:900px;height:140px;background-image:repeating-linear-gradient(90deg,#22c55e 0 40px,#15803d 40px 80px)"></div>
-<div style="position:absolute;left:960px;top:680px;width:900px;height:140px;background-image:repeating-linear-gradient(90deg,#22c55e 0 40px,#15803d 40px 80px)"></div>
+<div style="position:absolute;left:960px;top:40px;width:900px;height:500px;background:radial-gradient(circle at 38% 32%,#d97848 0 110px,transparent 190px),linear-gradient(160deg,#3f6f8a,#1d3a4a)"></div>
+<div style="position:absolute;left:960px;top:540px;width:900px;height:140px;background-image:repeating-linear-gradient(90deg,#22c55e 0 40px,#15803d 40px 80px),repeating-linear-gradient(180deg,transparent 0 16px,rgba(0,0,0,0.28) 16px 32px)"></div>
+<div style="position:absolute;left:960px;top:680px;width:900px;height:140px;background-image:repeating-linear-gradient(90deg,#22c55e 0 40px,#15803d 40px 80px),repeating-linear-gradient(180deg,transparent 0 16px,rgba(0,0,0,0.28) 16px 32px)"></div>
 <div style="position:absolute;left:1000px;top:690px;width:220px;height:40px;background:#ff5c38;border-radius:999px"></div>
 </section>
 </body></html>`

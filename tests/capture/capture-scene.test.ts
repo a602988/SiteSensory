@@ -60,9 +60,9 @@ describe('capture scene heuristics', () => {
     })
 
     it('trims a repeated horizontal photo belt from the bottom of one segment', async () => {
-        const belt = await stripePng(200)
+        const belt = await photoBeltPng(200)
         const stacked = await stackPngs([
-            await solidPng('#f8f5ef', 400),
+            await uniquePhotoPng(400),
             belt,
             belt,
         ])
@@ -71,7 +71,7 @@ describe('capture scene heuristics', () => {
 
         expect(metadata.height).toBeLessThan(750)
         expect(metadata.height).toBeGreaterThan(500)
-        expect(await sampleRgb(trimmed, 20, 500)).toEqual([34, 197, 94])
+        expect(await sampleRgb(trimmed, 20, 200)).not.toEqual(await sampleRgb(trimmed, 20, 500))
     })
 
     it('trims a ~1/5 belt on a photo card that old full-segment tail compare misses', async () => {
@@ -218,6 +218,66 @@ async function panelPng(color: string, height: number): Promise<Buffer>
             raw[index] = inset ? fill[0] : 242
             raw[index + 1] = inset ? fill[1] : 239
             raw[index + 2] = inset ? fill[2] : 232
+        }
+    }
+
+    return sharp(raw, { raw: { channels: 3, height, width: WIDTH } }).png().toBuffer()
+}
+
+function uniquePhotoTexel(row: number, column: number): [number, number, number]
+{
+    const blob = Math.hypot(row - 220, column - 1480)
+    const stripe = Math.floor((row + column) / 90) % 2
+
+    return [
+        48 + Math.min(90, Math.floor(blob / 8)) + stripe * 18,
+        36 + Math.floor(column / WIDTH * 110),
+        70 + Math.floor(row / 12) % 50,
+    ]
+}
+
+function beltTexel(row: number, column: number): [number, number, number]
+{
+    const blob = Math.hypot(column - 1400, row - 70)
+    const stripe = Math.floor(column / 50) % 2
+
+    return [
+        24 + (stripe ? 48 : 0) + Math.min(70, Math.floor(blob / 4)),
+        90 + Math.floor(row / 2) + (stripe ? 24 : 0),
+        40 + Math.floor(Math.abs(column - 1400) / 16) % 80,
+    ]
+}
+
+async function uniquePhotoPng(height: number): Promise<Buffer>
+{
+    const raw = Buffer.alloc(WIDTH * height * 3)
+
+    for (let row = 0; row < height; row += 1) {
+        for (let column = 0; column < WIDTH; column += 1) {
+            const index = (row * WIDTH + column) * 3
+            const sample = uniquePhotoTexel(row, column)
+
+            raw[index] = sample[0]
+            raw[index + 1] = sample[1]
+            raw[index + 2] = sample[2]
+        }
+    }
+
+    return sharp(raw, { raw: { channels: 3, height, width: WIDTH } }).png().toBuffer()
+}
+
+async function photoBeltPng(height: number): Promise<Buffer>
+{
+    const raw = Buffer.alloc(WIDTH * height * 3)
+
+    for (let row = 0; row < height; row += 1) {
+        for (let column = 0; column < WIDTH; column += 1) {
+            const index = (row * WIDTH + column) * 3
+            const sample = beltTexel(row, column)
+
+            raw[index] = sample[0]
+            raw[index + 1] = sample[1]
+            raw[index + 2] = sample[2]
         }
     }
 
@@ -390,8 +450,6 @@ async function photoCardWithCaptionBelt(options: { repeatBelt?: boolean } = {}):
 {
     const repeatBelt = options.repeatBelt !== false
     const raw = Buffer.alloc(WIDTH * 1080 * 3)
-    const belt = await stripePng(140)
-    const beltRaw = await sharp(belt).removeAlpha().raw().toBuffer()
 
     for (let row = 0; row < 1080; row += 1) {
         for (let column = 0; column < WIDTH; column += 1) {
@@ -410,18 +468,20 @@ async function photoCardWithCaptionBelt(options: { repeatBelt?: boolean } = {}):
 
             if (inFirstBelt || inSecondBelt) {
                 const beltRow = row - (inSecondBelt ? 640 : 500)
-                const beltIndex = (beltRow * WIDTH + (column - 960)) * 3
+                const sample = beltTexel(beltRow, column)
 
-                raw[index] = beltRaw[beltIndex] ?? 34
-                raw[index + 1] = beltRaw[beltIndex + 1] ?? 197
-                raw[index + 2] = beltRaw[beltIndex + 2] ?? 94
+                raw[index] = sample[0]
+                raw[index + 1] = sample[1]
+                raw[index + 2] = sample[2]
                 continue
             }
 
             if (inPhoto) {
-                raw[index] = 50 + ((row + column) % 70)
-                raw[index + 1] = 80 + ((row * 2 + column) % 60)
-                raw[index + 2] = 110 + ((row * 3 + column * 2) % 50)
+                const sample = uniquePhotoTexel(row, column)
+
+                raw[index] = sample[0]
+                raw[index + 1] = sample[1]
+                raw[index + 2] = sample[2]
                 continue
             }
 

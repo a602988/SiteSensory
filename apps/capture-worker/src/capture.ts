@@ -36,9 +36,11 @@ const SCENE_TRIM_SCRAP_RATIO = 0.35
 const SCENE_TRIM_MIN_VARIANCE = 0.02
 const SCENE_TRIM_THRESHOLD = 0.015
 const PHOTO_BELT_RATIOS = [0.22, 0.19, 0.16, 0.13, 0.1]
-const PHOTO_BELT_THRESHOLD = 0.04
+const PHOTO_BELT_THRESHOLD = 0.02
+const PHOTO_BELT_ABOVE_DELTA = 0.08
 const PHOTO_BELT_PAGE_LUMA = 230
 const PHOTO_BELT_REFERENCE_HEIGHT = 1080
+const PHOTO_BELT_SIGNATURE_WIDTH = 384
 const NUDGE_RATIOS = [0.12, 0.22, 0.34]
 const NUDGE_PEEK_MS = 350
 const VIEWPORT_LOCKED_WIPE_SAMPLES = 8
@@ -1447,14 +1449,14 @@ async function trimOnePhotoBelt(image: Buffer, width: number): Promise<Buffer>
     if (height < 160) return image
 
     const reference = Math.min(PHOTO_BELT_REFERENCE_HEIGHT, height)
-    const signatureHeight = Math.max(16, Math.round(height * SETTLE_SIGNATURE_WIDTH / width))
+    const signatureHeight = Math.max(16, Math.round(height * PHOTO_BELT_SIGNATURE_WIDTH / width))
     const signature = await sharp(image)
-        .resize(SETTLE_SIGNATURE_WIDTH, signatureHeight, { fit: 'fill' })
+        .resize(PHOTO_BELT_SIGNATURE_WIDTH, signatureHeight, { fit: 'fill' })
         .removeAlpha()
         .raw()
         .toBuffer()
     const scale = height / signatureHeight
-    const rowBytes = SETTLE_SIGNATURE_WIDTH * 3
+    const rowBytes = PHOTO_BELT_SIGNATURE_WIDTH * 3
     let cutStart = -1
     let cutHeight = 0
 
@@ -1480,14 +1482,18 @@ async function trimOnePhotoBelt(image: Buffer, width: number): Promise<Buffer>
                 const lowerSlice = signature.subarray(lower * rowBytes, (lower + bandRows) * rowBytes)
 
                 if (rowSliceVariance(lowerSlice) < SCENE_TRIM_MIN_VARIANCE) continue
-                if (contentMaskedDifference(upperSlice, lowerSlice) > PHOTO_BELT_THRESHOLD) continue
+
+                const pairDifference = contentMaskedDifference(upperSlice, lowerSlice)
+
+                if (pairDifference > PHOTO_BELT_THRESHOLD) continue
 
                 const aboveSlice = signature.subarray((upper - bandRows) * rowBytes, upper * rowBytes)
 
-                if (
-                    rowSliceVariance(aboveSlice) >= SCENE_TRIM_MIN_VARIANCE
-                    && contentMaskedDifference(aboveSlice, upperSlice) <= PHOTO_BELT_THRESHOLD
-                ) {
+                if (rowSliceVariance(aboveSlice) < SCENE_TRIM_MIN_VARIANCE) continue
+
+                const aboveDifference = contentMaskedDifference(aboveSlice, upperSlice)
+
+                if (aboveDifference < Math.max(PHOTO_BELT_ABOVE_DELTA, pairDifference * 4)) {
                     continue
                 }
 
@@ -1539,7 +1545,8 @@ async function trimOnePhotoBelt(image: Buffer, width: number): Promise<Buffer>
 }
 
 /**
- * 計算兩段 RGB 的差異，略過雙方都接近頁面留白的像素。
+ * 計算兩段 RGB 的差異，略過雙方都接近頁面留白的像素，
+ * 並丟掉最差的 15% 像素，以免單一 CTA 把近乎複製品抬高。
  *
  * @param left 第一段。
  * @param right 第二段。
@@ -1549,8 +1556,7 @@ function contentMaskedDifference(left: Buffer, right: Buffer): number
 {
     if (left.length !== right.length || left.length < 3) return 1
 
-    let total = 0
-    let count = 0
+    const differences: number[] = []
 
     for (let index = 0; index < left.length; index += 3) {
         const leftLuma = 0.299 * (left[index] ?? 0)
@@ -1562,15 +1568,25 @@ function contentMaskedDifference(left: Buffer, right: Buffer): number
 
         if (leftLuma > PHOTO_BELT_PAGE_LUMA && rightLuma > PHOTO_BELT_PAGE_LUMA) continue
 
-        total += Math.abs((left[index] ?? 0) - (right[index] ?? 0))
-        total += Math.abs((left[index + 1] ?? 0) - (right[index + 1] ?? 0))
-        total += Math.abs((left[index + 2] ?? 0) - (right[index + 2] ?? 0))
-        count += 1
+        const pixel = (
+            Math.abs((left[index] ?? 0) - (right[index] ?? 0))
+            + Math.abs((left[index + 1] ?? 0) - (right[index + 1] ?? 0))
+            + Math.abs((left[index + 2] ?? 0) - (right[index + 2] ?? 0))
+        ) / 3
+
+        differences.push(pixel)
     }
 
-    if (count < left.length / 3 * 0.08) return 1
+    if (differences.length < left.length / 3 * 0.08) return 1
 
-    return total / count / 3 / 255
+    differences.sort((leftValue, rightValue) => leftValue - rightValue)
+
+    const kept = differences.slice(0, Math.max(1, Math.floor(differences.length * 0.85)))
+    let total = 0
+
+    for (const value of kept) total += value
+
+    return total / kept.length / 255
 }
 
 /**
