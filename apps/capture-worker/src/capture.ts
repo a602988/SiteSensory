@@ -1704,6 +1704,8 @@ function findRepeatCut(
                 PHOTO_BELT_SIGNATURE_WIDTH,
             )
 
+            if (cardScale && !aboveIsPage && !upperHasWipe) continue
+
             if (aboveIsPage && !cardScale) continue
 
             const aboveLimit = !cardScale && bandPx < PHOTO_BELT_THIN_PX
