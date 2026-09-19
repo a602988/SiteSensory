@@ -166,6 +166,22 @@ describe('capture worker', { timeout: 60_000 }, () => {
         expect(await samplePixel(fullPage, 960, 2100)).not.toEqual([21, 128, 61])
     })
 
+    it('removes a one-fifth repeat under a photo card caption', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?cardBelt=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(height).toBeLessThan(2160)
+        expect(await samplePixel(fullPage, 1400, 1280)).not.toEqual([248, 245, 239])
+        expect(await samplePixel(fullPage, 1400, height - 80)).toEqual([248, 245, 239])
+    })
+
     it('waits for the hero reveal after returning to the top', async () => {
         const storage = createLocalObjectStorage(storageRoot)
         const result = await capturePage({
@@ -464,6 +480,7 @@ function createFixtureServer(): Server
         const pinnedCanvas = parameters.has('pinnedCanvas')
         const lockedWipe = parameters.has('lockedWipe')
         const photoBelt = parameters.has('photoBelt')
+        const cardBelt = parameters.has('cardBelt')
 
         if (cookies) {
             const html = `<!doctype html>
@@ -732,6 +749,25 @@ const sync=()=>paint((scrollY-680)/400<0.85)
 addEventListener('scroll',sync)
 sync()
 </script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (cardBelt) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Card Belt Fixture</title></head>
+<body style="margin:0;background:#f8f5ef">
+<section style="height:1080px;background:#315ceb"></section>
+<section style="height:1080px;background:#f8f5ef;position:relative">
+<div style="position:absolute;left:960px;top:40px;width:900px;height:500px;background-image:repeating-linear-gradient(135deg,#3f6f8a 0 14px,#2d5568 14px 28px)"></div>
+<div style="position:absolute;left:960px;top:540px;width:900px;height:140px;background-image:repeating-linear-gradient(90deg,#22c55e 0 40px,#15803d 40px 80px)"></div>
+<div style="position:absolute;left:960px;top:680px;width:900px;height:140px;background-image:repeating-linear-gradient(90deg,#22c55e 0 40px,#15803d 40px 80px)"></div>
+<div style="position:absolute;left:1000px;top:690px;width:220px;height:40px;background:#ff5c38;border-radius:999px"></div>
+</section>
 </body></html>`
 
             response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })

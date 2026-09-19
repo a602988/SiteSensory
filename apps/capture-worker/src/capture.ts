@@ -35,7 +35,10 @@ const SCENE_TRIM_CONTINUE_RATIO = 0.75
 const SCENE_TRIM_SCRAP_RATIO = 0.35
 const SCENE_TRIM_MIN_VARIANCE = 0.02
 const SCENE_TRIM_THRESHOLD = 0.015
-const SCENE_TAIL_BAND_RATIO = 0.22
+const PHOTO_BELT_RATIOS = [0.22, 0.19, 0.16, 0.13, 0.1]
+const PHOTO_BELT_THRESHOLD = 0.04
+const PHOTO_BELT_PAGE_LUMA = 230
+const PHOTO_BELT_REFERENCE_HEIGHT = 1080
 const NUDGE_RATIOS = [0.12, 0.22, 0.34]
 const NUDGE_PEEK_MS = 350
 const VIEWPORT_LOCKED_WIPE_SAMPLES = 8
@@ -433,7 +436,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         throw new Error('完整頁面合成後的尺寸與穩定頁面尺寸不一致')
     }
 
-    return fullPage
+    return trimRepeatedTailBand(fullPage, dimensions.width)
 }
 
 /**
@@ -1413,52 +1416,161 @@ function isVerticallyUniformScene(signature: Buffer, rows: number): boolean
 
 export async function trimRepeatedTailBand(image: Buffer, width: number): Promise<Buffer>
 {
+    let current = image
+
+    for (let pass = 0; pass < 6; pass += 1) {
+        const next = await trimOnePhotoBelt(current, width)
+        const before = (await sharp(current).metadata()).height ?? 0
+        const after = (await sharp(next).metadata()).height ?? 0
+
+        if (after >= before) return current
+
+        current = next
+    }
+
+    return current
+}
+
+/**
+ * 在一張圖裡找最靠近下方的一條照片腰帶並裁掉。帶寬以 viewport 尺度
+ * 計算，並略過近白頁面欄，以免標題／留白把照片卡上的重複帶稀釋掉。
+ *
+ * @param image PNG。
+ * @param width 寬度。
+ * @returns 裁掉一條腰帶後的圖；找不到則原樣返回。
+ */
+async function trimOnePhotoBelt(image: Buffer, width: number): Promise<Buffer>
+{
     const metadata = await sharp(image).metadata()
     const height = metadata.height ?? 0
-    const band = Math.max(40, Math.round(height * SCENE_TAIL_BAND_RATIO))
 
-    if (height < band * 2 + 40) return image
+    if (height < 160) return image
 
-    const tail = await sharp(image)
-        .extract({ height: band, left: 0, top: height - band, width })
-        .toBuffer()
-    const above = await sharp(image)
-        .extract({ height: band, left: 0, top: height - band * 2, width })
-        .toBuffer()
-    const rows = Math.max(8, Math.round(band * SETTLE_SIGNATURE_WIDTH / width))
-    const tailSignature = await sharp(tail)
-        .resize(SETTLE_SIGNATURE_WIDTH, rows, { fit: 'fill' })
+    const reference = Math.min(PHOTO_BELT_REFERENCE_HEIGHT, height)
+    const signatureHeight = Math.max(16, Math.round(height * SETTLE_SIGNATURE_WIDTH / width))
+    const signature = await sharp(image)
+        .resize(SETTLE_SIGNATURE_WIDTH, signatureHeight, { fit: 'fill' })
         .removeAlpha()
         .raw()
         .toBuffer()
-    const aboveSignature = await sharp(above)
-        .resize(SETTLE_SIGNATURE_WIDTH, rows, { fit: 'fill' })
-        .removeAlpha()
-        .raw()
-        .toBuffer()
+    const scale = height / signatureHeight
+    const rowBytes = SETTLE_SIGNATURE_WIDTH * 3
+    let cutStart = -1
+    let cutHeight = 0
 
-    if (rowSliceVariance(tailSignature) < SCENE_TRIM_MIN_VARIANCE) return image
-    if (visualDifference(tailSignature, aboveSignature) > SCENE_TRIM_THRESHOLD) return image
+    for (const ratio of PHOTO_BELT_RATIOS) {
+        const bandPx = Math.max(48, Math.round(reference * ratio))
+        const bandRows = Math.max(4, Math.round(bandPx / scale))
 
+        if (bandRows * 3 > signatureHeight) continue
+
+        const minimumLower = bandRows * 2 + 1
+        const maximumLower = signatureHeight - bandRows - 1
+        const step = Math.max(1, Math.round(bandRows / 4))
+
+        for (let lower = maximumLower; lower >= minimumLower; lower -= step) {
+            let matched = false
+
+            for (const offset of [0, -1, 1]) {
+                const upper = lower - bandRows + offset
+
+                if (upper < bandRows) continue
+
+                const upperSlice = signature.subarray(upper * rowBytes, (upper + bandRows) * rowBytes)
+                const lowerSlice = signature.subarray(lower * rowBytes, (lower + bandRows) * rowBytes)
+
+                if (rowSliceVariance(lowerSlice) < SCENE_TRIM_MIN_VARIANCE) continue
+                if (contentMaskedDifference(upperSlice, lowerSlice) > PHOTO_BELT_THRESHOLD) continue
+
+                const aboveSlice = signature.subarray((upper - bandRows) * rowBytes, upper * rowBytes)
+
+                if (
+                    rowSliceVariance(aboveSlice) >= SCENE_TRIM_MIN_VARIANCE
+                    && contentMaskedDifference(aboveSlice, upperSlice) <= PHOTO_BELT_THRESHOLD
+                ) {
+                    continue
+                }
+
+                cutStart = Math.round(lower * scale)
+                cutHeight = Math.round(bandRows * scale)
+                matched = true
+                break
+            }
+
+            if (matched) break
+        }
+
+        if (cutStart >= 0) break
+    }
+
+    if (cutStart < 24 || cutHeight < 32 || cutStart + cutHeight > height) return image
+
+    const topHeight = cutStart
+    const bottomHeight = height - cutStart - cutHeight
     const top = await sharp(image)
-        .extract({ height: band, left: 0, top: 0, width })
-        .toBuffer()
-    const topSignature = await sharp(top)
-        .resize(SETTLE_SIGNATURE_WIDTH, rows, { fit: 'fill' })
-        .removeAlpha()
-        .raw()
+        .extract({ height: topHeight, left: 0, top: 0, width })
         .toBuffer()
 
-    if (visualDifference(topSignature, tailSignature) <= SCENE_TRIM_THRESHOLD) return image
+    if (bottomHeight <= 0) return top
 
-    return sharp(image)
+    const bottom = await sharp(image)
         .extract({
-            height: height - band,
+            height: bottomHeight,
             left: 0,
-            top: 0,
+            top: cutStart + cutHeight,
             width,
         })
         .toBuffer()
+
+    return sharp({
+        create: {
+            background: '#ffffff',
+            channels: 3,
+            height: topHeight + bottomHeight,
+            width,
+        },
+    })
+        .composite([
+            { input: top, left: 0, top: 0 },
+            { input: bottom, left: 0, top: topHeight },
+        ])
+        .png()
+        .toBuffer()
+}
+
+/**
+ * 計算兩段 RGB 的差異，略過雙方都接近頁面留白的像素。
+ *
+ * @param left 第一段。
+ * @param right 第二段。
+ * @returns 介於 0 與 1 的內容差異；內容太少時為 1。
+ */
+function contentMaskedDifference(left: Buffer, right: Buffer): number
+{
+    if (left.length !== right.length || left.length < 3) return 1
+
+    let total = 0
+    let count = 0
+
+    for (let index = 0; index < left.length; index += 3) {
+        const leftLuma = 0.299 * (left[index] ?? 0)
+            + 0.587 * (left[index + 1] ?? 0)
+            + 0.114 * (left[index + 2] ?? 0)
+        const rightLuma = 0.299 * (right[index] ?? 0)
+            + 0.587 * (right[index + 1] ?? 0)
+            + 0.114 * (right[index + 2] ?? 0)
+
+        if (leftLuma > PHOTO_BELT_PAGE_LUMA && rightLuma > PHOTO_BELT_PAGE_LUMA) continue
+
+        total += Math.abs((left[index] ?? 0) - (right[index] ?? 0))
+        total += Math.abs((left[index + 1] ?? 0) - (right[index + 1] ?? 0))
+        total += Math.abs((left[index + 2] ?? 0) - (right[index + 2] ?? 0))
+        count += 1
+    }
+
+    if (count < left.length / 3 * 0.08) return 1
+
+    return total / count / 3 / 255
 }
 
 /**

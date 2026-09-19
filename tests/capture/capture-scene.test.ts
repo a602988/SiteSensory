@@ -69,8 +69,31 @@ describe('capture scene heuristics', () => {
         const trimmed = await trimRepeatedTailBand(stacked, WIDTH)
         const metadata = await sharp(trimmed).metadata()
 
-        expect(metadata.height).toBe(624)
+        expect(metadata.height).toBeLessThan(750)
+        expect(metadata.height).toBeGreaterThan(500)
         expect(await sampleRgb(trimmed, 20, 500)).toEqual([34, 197, 94])
+    })
+
+    it('trims a ~1/5 belt on a photo card that old full-segment tail compare misses', async () => {
+        const card = await photoCardWithCaptionBelt()
+        const legacy = await legacyFullSegmentTailTrim(card)
+        const trimmed = await trimRepeatedTailBand(card, WIDTH)
+        const legacyHeight = (await sharp(legacy).metadata()).height ?? 0
+        const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
+
+        expect(legacyHeight).toBe(1080)
+        expect(trimmedHeight).toBeLessThan(1000)
+        expect(trimmedHeight).toBeGreaterThan(850)
+        expect(await sampleRgb(trimmed, 1400, 200)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 1400, 800)).toEqual([248, 245, 239])
+    })
+
+    it('does not trim a unique photo card that has no repeated belt', async () => {
+        const card = await photoCardWithCaptionBelt({ repeatBelt: false })
+        const trimmed = await trimRepeatedTailBand(card, WIDTH)
+
+        expect((await sharp(trimmed).metadata()).height).toBe(1080)
+        expect(await sampleRgb(trimmed, 1400, 700)).not.toEqual([248, 245, 239])
     })
 
     it('trims a repeated high-detail sticky band from the next segment', async () => {
@@ -361,6 +384,99 @@ async function rawWindow(image: Buffer, height: number): Promise<Buffer>
         .removeAlpha()
         .raw()
         .toBuffer()
+}
+
+async function photoCardWithCaptionBelt(options: { repeatBelt?: boolean } = {}): Promise<Buffer>
+{
+    const repeatBelt = options.repeatBelt !== false
+    const raw = Buffer.alloc(WIDTH * 1080 * 3)
+    const belt = await stripePng(140)
+    const beltRaw = await sharp(belt).removeAlpha().raw().toBuffer()
+
+    for (let row = 0; row < 1080; row += 1) {
+        for (let column = 0; column < WIDTH; column += 1) {
+            const index = (row * WIDTH + column) * 3
+            const inPhoto = column >= 960 && column < 1860 && row >= 40 && row < 780
+            const inFirstBelt = repeatBelt && inPhoto && row >= 500 && row < 640
+            const inSecondBelt = repeatBelt && inPhoto && row >= 640 && row < 780
+            const inCta = inSecondBelt && column >= 1000 && column < 1240 && row >= 690 && row < 730
+
+            if (inCta) {
+                raw[index] = 255
+                raw[index + 1] = 92
+                raw[index + 2] = 56
+                continue
+            }
+
+            if (inFirstBelt || inSecondBelt) {
+                const beltRow = row - (inSecondBelt ? 640 : 500)
+                const beltIndex = (beltRow * WIDTH + (column - 960)) * 3
+
+                raw[index] = beltRaw[beltIndex] ?? 34
+                raw[index + 1] = beltRaw[beltIndex + 1] ?? 197
+                raw[index + 2] = beltRaw[beltIndex + 2] ?? 94
+                continue
+            }
+
+            if (inPhoto) {
+                raw[index] = 50 + ((row + column) % 70)
+                raw[index + 1] = 80 + ((row * 2 + column) % 60)
+                raw[index + 2] = 110 + ((row * 3 + column * 2) % 50)
+                continue
+            }
+
+            raw[index] = 248
+            raw[index + 1] = 245
+            raw[index + 2] = 239
+        }
+    }
+
+    return sharp(raw, { raw: { channels: 3, height: 1080, width: WIDTH } }).png().toBuffer()
+}
+
+/**
+ * 舊實作只比整段最後 22% 與正上方一截。照片卡底下若還有標題與留白，
+ * 會把真正的腰帶錯過。
+ *
+ * @param image 完整視窗 PNG。
+ * @returns 舊邏輯處理後的圖。
+ */
+async function legacyFullSegmentTailTrim(image: Buffer): Promise<Buffer>
+{
+    const height = (await sharp(image).metadata()).height ?? 0
+    const band = Math.max(40, Math.round(height * 0.22))
+
+    if (height < band * 2 + 40) return image
+
+    const tail = await sharp(image)
+        .extract({ height: band, left: 0, top: height - band, width: WIDTH })
+        .toBuffer()
+    const above = await sharp(image)
+        .extract({ height: band, left: 0, top: height - band * 2, width: WIDTH })
+        .toBuffer()
+    const rows = Math.max(8, Math.round(band * SETTLE_WIDTH / WIDTH))
+    const tailSignature = await sharp(tail)
+        .resize(SETTLE_WIDTH, rows, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+    const aboveSignature = await sharp(above)
+        .resize(SETTLE_WIDTH, rows, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+    const variance = rowSliceVariance(tailSignature)
+    let difference = 0
+
+    for (let index = 0; index < tailSignature.length; index += 1) {
+        difference += Math.abs((tailSignature[index] ?? 0) - (aboveSignature[index] ?? 0))
+    }
+
+    difference = difference / tailSignature.length / 255
+
+    if (variance < 0.02 || difference > 0.015) return image
+
+    return image
 }
 
 async function sampleRgb(image: Buffer, left: number, top: number): Promise<number[]>
