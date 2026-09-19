@@ -584,9 +584,9 @@ describe('capture worker', { timeout: 60_000 }, () => {
 
         expect(height).toBeLessThan(3600)
         expect(height).toBeGreaterThan(1900)
-        expect(await samplePixel(fullPage, 200, 200)).not.toEqual([248, 245, 239])
         expect(await samplePixel(fullPage, 1400, 200)).not.toEqual([248, 245, 239])
-        expect(await samplePixel(fullPage, 180, 1200)).not.toEqual([255, 255, 255])
+        expect(await samplePixel(fullPage, 200, 200)).toEqual([248, 245, 239])
+        expect(await samplePixel(fullPage, 112, 1200)).not.toEqual([255, 255, 255])
         expect(await samplePixel(fullPage, 200, 1200)).not.toEqual([248, 245, 239])
     })
 

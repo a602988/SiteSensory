@@ -251,7 +251,7 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
         expect(await legacyStrictWipeGateKeeps(page, 3822)).toBe(true)
         expect(elapsed).toBeLessThan(12_000)
         expect(trimmedHeight).toBeLessThan(6000)
-        expect(trimmedHeight).toBeGreaterThan(4800)
+        expect(trimmedHeight).toBeGreaterThan(5800)
         expect(await sampleRgb(page, 112, 3900)).toEqual([255, 255, 255])
         expect(await sampleRgb(page, 1400, 3600)).not.toEqual([248, 245, 239])
         expect(await sampleRgb(page, 1400, 3600)).not.toEqual([255, 255, 255])
@@ -259,6 +259,7 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
         expect(await sampleRgb(trimmed, 1400, 3600)).not.toEqual([255, 255, 255])
         expect(await sampleRgb(trimmed, 112, 3900)).not.toEqual([255, 255, 255])
         expect(await sampleRgb(trimmed, 200, 3900)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 200, 4300)).not.toEqual([248, 245, 239])
         expect(await sampleRgb(trimmed, 200, trimmedHeight - 40)).toEqual([248, 245, 239])
     }, 20_000)
 
@@ -519,13 +520,14 @@ async function panelPng(color: string, height: number): Promise<Buffer>
 
 function carnivalStageTexel(row: number, column: number): [number, number, number]
 {
-    const light = 168 + ((row * 11 + column * 5) % 52)
-    const band = Math.floor((row + column) / 70) % 3
+    const blob = Math.hypot(row - 260, column - 480)
+    const light = 172 + Math.min(48, Math.floor(blob / 9)) + ((row * 3 + column * 5) % 19)
+    const tint = Math.floor(blob / 55) % 3
 
-    if (band === 0) return [Math.min(235, light + 36), light - 28, 72]
-    if (band === 1) return [86, Math.min(236, light + 18), Math.min(240, light + 28)]
+    if (tint === 0) return [Math.min(236, light + 28), Math.max(96, light - 36), 78]
+    if (tint === 1) return [92, Math.min(236, light + 16), Math.min(238, light + 22)]
 
-    return [Math.min(232, light + 8), Math.min(226, light), 206]
+    return [Math.min(230, light + 10), Math.min(224, light), 198]
 }
 
 function uniquePhotoTexel(row: number, column: number): [number, number, number]

@@ -1665,15 +1665,20 @@ export async function trimRepeatedTailBand(
 ): Promise<Buffer>
 {
     let current = image
+    let removedViewportTile = false
 
     for (let pass = 0; pass < 3; pass += 1) {
-        const next = await trimOnePhotoBelt(current, width, options)
+        const next = await trimOnePhotoBelt(current, width, {
+            ...options,
+            skipCardAndThick: removedViewportTile,
+        })
         const before = (await sharp(current).metadata()).height ?? 0
         const after = (await sharp(next).metadata()).height ?? 0
 
         if (after >= before) return current
 
         current = next
+        if (before - after >= 800) removedViewportTile = true
     }
 
     return current
@@ -1691,7 +1696,7 @@ export async function trimRepeatedTailBand(
 async function trimOnePhotoBelt(
     image: Buffer,
     width: number,
-    options: { viewportTiles?: boolean } = {},
+    options: { skipCardAndThick?: boolean, viewportTiles?: boolean } = {},
 ): Promise<Buffer>
 {
     const metadata = await sharp(image).metadata()
@@ -1715,26 +1720,28 @@ async function trimOnePhotoBelt(
         signature: coarse,
         signatureHeight: coarseHeight,
     }
-    const tileCut = options.viewportTiles === true
+    const tileCut = options.viewportTiles === true && options.skipCardAndThick !== true
         ? findViewportTileCut(coarseContext)
         : null
 
     if (tileCut) return applyRepeatCut(image, width, height, tileCut)
 
-    const cardCut = height > PHOTO_BELT_REFERENCE_HEIGHT
-        ? findRepeatCut(
+    if (options.skipCardAndThick !== true) {
+        const cardCut = height > PHOTO_BELT_REFERENCE_HEIGHT
+            ? findRepeatCut(
+                coarseContext,
+                PHOTO_CARD_RATIOS.filter(ratio => options.viewportTiles === true || ratio < 0.95),
+                true,
+            )
+            : null
+        const thickCut = cardCut ?? findRepeatCut(
             coarseContext,
-            PHOTO_CARD_RATIOS.filter(ratio => options.viewportTiles === true || ratio < 0.95),
-            true,
+            PHOTO_BELT_RATIOS.filter(ratio => ratio >= PHOTO_BELT_THICK_RATIO),
+            false,
         )
-        : null
-    const thickCut = cardCut ?? findRepeatCut(
-        coarseContext,
-        PHOTO_BELT_RATIOS.filter(ratio => ratio >= PHOTO_BELT_THICK_RATIO),
-        false,
-    )
 
-    if (thickCut) return applyRepeatCut(image, width, height, thickCut)
+        if (thickCut) return applyRepeatCut(image, width, height, thickCut)
+    }
 
     const fineHeight = Math.max(coarseHeight, Math.round(height / PHOTO_BELT_FINE_PX))
     const fine = fineHeight === coarseHeight
@@ -1847,11 +1854,12 @@ function findViewportTileCut(
     context: RepeatScanContext,
 ): { cutHeight: number, cutStart: number } | null
 {
-    return scanViewportTiles(context, 'aligned') ?? scanViewportTiles(context, 'slide')
+    return scanViewportTiles(context, 'slide') ?? scanViewportTiles(context, 'aligned')
 }
 
 /**
- * 掃描相鄰 1080 視窗。aligned 只踩 0／1080／2160；slide 以約 20px
+ * 掃描相鄰 1080 視窗。先滑動再對齊：對齊磚若先踩到 4320 這種「wipe
+ * 卡下半＋乾淨上半」，會整段留下 y3822 的百葉窗。slide 以約 20px
  * 步進，才能對上已被切過、不再對齊 viewport 的成品。
  *
  * @param context 粗指紋。
@@ -1875,6 +1883,7 @@ function scanViewportTiles(
     let cutHeight = 0
     let cutDifference = 1
     let cutHadWipe = false
+    let cutTopOccupancy = 0
 
     for (let upper = 0; upper + tileRows * 2 <= signatureHeight; upper += step) {
         const lower = upper + tileRows
@@ -1937,15 +1946,26 @@ function scanViewportTiles(
             PHOTO_BELT_SIGNATURE_WIDTH,
             topRows,
         ) || countBlendedWipeColumns(topSlice, PHOTO_BELT_SIGNATURE_WIDTH) >= WIPE_BAR_MIN_COUNT
-            || residualWipeCount >= WIPE_BAR_MIN_COUNT
+            || countResidualWipeColumns(
+                topSlice,
+                lowerSlice.subarray(0, topRows * rowBytes),
+                PHOTO_BELT_SIGNATURE_WIDTH,
+            ) >= WIPE_BAR_MIN_COUNT
         const bestDifference = Math.min(pairDifference, fullDifference)
 
         // 頂部必須也是同一張照片，否則滑動會切到錯位 100px 的奶油自比，
         // 或「上一張卡 + wipe」混窗。濃密百葉窗縮到 384 後，白條常被
-        // 平均成 165–200，舊頂部遮罩會餓死或把白條當真差異；上半本身
-        // 有 wipe（含淡化欄）就改看下 62%。
+        // 平均成 165–200；只有頂部 38% 自己有 wipe／殘差才改看下 62%，
+        // 不可把整磚殘差套到混窗頂部（上一張右圖卡會被一起裁掉）。
         if (bestDifference > VIEWPORT_TILE_THRESHOLD) continue
         if (topDifference > VIEWPORT_TILE_THRESHOLD && !topHasWipe) continue
+        if (topHasWipe && topLayoutMismatch(
+            topSlice,
+            lowerSlice.subarray(0, topRows * rowBytes),
+            PHOTO_BELT_SIGNATURE_WIDTH,
+        )) {
+            continue
+        }
         if (!upperHasWipe && bestDifference > 0.012) continue
 
         const candidateStart = Math.round(upper * scale)
@@ -1954,26 +1974,31 @@ function scanViewportTiles(
             height - candidateStart,
         )
 
-        if (mode === 'aligned') {
-            return {
-                cutHeight: candidateHeight,
-                cutStart: candidateStart,
-            }
-        }
-
+        const topOccupancy = Math.max(
+            regionPhotoOccupancy(topSlice, PHOTO_BELT_SIGNATURE_WIDTH, 0, Math.floor(PHOTO_BELT_SIGNATURE_WIDTH / 2)),
+            regionPhotoOccupancy(
+                topSlice,
+                PHOTO_BELT_SIGNATURE_WIDTH,
+                Math.floor(PHOTO_BELT_SIGNATURE_WIDTH / 2),
+                PHOTO_BELT_SIGNATURE_WIDTH,
+            ),
+        )
         const preferWipe = upperHasWipe && !cutHadWipe
         const betterDiff = bestDifference < cutDifference - 0.002
+        const betterOccupancy = upperHasWipe
+            && topOccupancy > cutTopOccupancy + 0.06
+            && (cutStart < 0 || candidateStart <= cutStart + 80)
         const similarEarlier = Math.abs(bestDifference - cutDifference) <= 0.002
+            && Math.abs(topOccupancy - cutTopOccupancy) <= 0.06
             && (cutStart < 0 || candidateStart < cutStart)
 
-        if (preferWipe || betterDiff || similarEarlier || cutStart < 0) {
+        if (preferWipe || betterDiff || betterOccupancy || similarEarlier || cutStart < 0) {
             cutDifference = bestDifference
             cutHadWipe = cutHadWipe || upperHasWipe
+            cutTopOccupancy = topOccupancy
             cutStart = candidateStart
             cutHeight = candidateHeight
         }
-
-        if (cutDifference < 0.004 && cutHadWipe) break
     }
 
     if (cutStart < 0 || cutHeight < PHOTO_BELT_MIN_CUT) return null
@@ -2018,6 +2043,23 @@ function sceneBandDifference(
 }
 
 /**
+ * 頂部左右哪一側是照片必須一致。否則「上一張右圖卡 + wipe」混窗
+ * 會因左半幅 festival 殘差對上而被提早裁進前一張卡。
+ *
+ * @param upperTop 上磚頂部。
+ * @param lowerTop 下磚頂部。
+ * @param width 指紋寬度。
+ * @returns 左右照片布局不一致時為 true。
+ */
+function topLayoutMismatch(upperTop: Buffer, lowerTop: Buffer, width: number): boolean
+{
+    const half = Math.floor(width / 2)
+
+    return regionHasPhoto(upperTop, width, 0, half) !== regionHasPhoto(lowerTop, width, 0, half)
+        || regionHasPhoto(upperTop, width, half, width) !== regionHasPhoto(lowerTop, width, half, width)
+}
+
+/**
  * 半幅必須真的是照片細節。作品卡奶油側只剩 CTA／標題時，半幅差會
  * 接近 0，任何兩張卡都會被當成同一磚。
  *
@@ -2052,6 +2094,47 @@ function regionHasPhoto(slice: Buffer, width: number, columnStart: number, colum
     if (kept.length < 24 || kept.length / 3 < totalPixels * 0.25) return false
 
     return contentPixelVariance(Buffer.from(kept)) >= 0.03
+}
+
+/**
+ * 半幅非頁面像素比例。wipe 磚頂部應幾乎整側都是照片；若滑進上一張
+ * 卡的奶油腳，佔比會掉一截，應改拿後面那扇對齊的窗。
+ *
+ * @param slice RGB。
+ * @param width 指紋寬度。
+ * @param columnStart 欄起點。
+ * @param columnEnd 欄終點。
+ * @returns 0 到 1。
+ */
+function regionPhotoOccupancy(
+    slice: Buffer,
+    width: number,
+    columnStart: number,
+    columnEnd: number,
+): number
+{
+    if (width <= 0 || columnEnd <= columnStart || slice.length < width * 3) return 0
+
+    const rows = Math.floor(slice.length / (width * 3))
+    const totalPixels = rows * (columnEnd - columnStart)
+
+    if (totalPixels <= 0) return 0
+
+    const wipeColumns = listBlendedWipeColumns(slice, width)
+    let content = 0
+
+    for (let row = 0; row < rows; row += 1) {
+        for (let column = columnStart; column < columnEnd; column += 1) {
+            const index = (row * width + column) * 3
+            const luma = 0.299 * (slice[index] ?? 0)
+                + 0.587 * (slice[index + 1] ?? 0)
+                + 0.114 * (slice[index + 2] ?? 0)
+
+            if (luma <= PHOTO_BELT_PAGE_LUMA || wipeColumns[column] === true) content += 1
+        }
+    }
+
+    return content / totalPixels
 }
 
 /**
