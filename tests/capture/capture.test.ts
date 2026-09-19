@@ -194,8 +194,8 @@ describe('capture worker', { timeout: 60_000 }, () => {
         const fullPage = await storage.get(result.fullPage.objectKey)
         const height = readPngSize(fullPage).height
 
-        expect(height).toBeLessThan(2100)
-        expect(height).toBeGreaterThan(1700)
+        expect(height).toBeLessThan(2150)
+        expect(height).toBeGreaterThan(2000)
         expect(await samplePixel(fullPage, 1400, 1280)).not.toEqual([248, 245, 239])
         expect(await samplePixel(fullPage, 1400, height - 80)).toEqual([248, 245, 239])
     })

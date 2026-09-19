@@ -375,7 +375,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             }
         }
 
-        if (segment) {
+        if (segment && !hasVirtualCanvas) {
             segment = await trimRepeatedTailBand(segment, dimensions.width)
         }
 
@@ -445,7 +445,9 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         throw new Error('完整頁面合成後的尺寸與穩定頁面尺寸不一致')
     }
 
-    return trimRepeatedTailBand(fullPage, dimensions.width)
+    return hasVirtualCanvas
+        ? fullPage
+        : trimRepeatedTailBand(fullPage, dimensions.width)
 }
 
 /**
@@ -1478,7 +1480,9 @@ async function trimOnePhotoBelt(image: Buffer, width: number): Promise<Buffer>
         signature: coarse,
         signatureHeight: coarseHeight,
     }
-    const cardCut = findRepeatCut(coarseContext, PHOTO_CARD_RATIOS, true)
+    const cardCut = height > PHOTO_BELT_REFERENCE_HEIGHT
+        ? findRepeatCut(coarseContext, PHOTO_CARD_RATIOS, true)
+        : null
     const thickCut = cardCut ?? findRepeatCut(
         coarseContext,
         PHOTO_BELT_RATIOS.filter(ratio => ratio >= PHOTO_BELT_THICK_RATIO),
@@ -1612,6 +1616,8 @@ function findRepeatCut(
 
             if (contentPixelVariance(lowerSlice) < (cardScale ? 0.05 : SCENE_TRIM_MIN_VARIANCE)) continue
 
+            if (cardScale && interiorContentVariance(lowerSlice, rowBytes) < 0.03) continue
+
             if (
                 (cardScale || bandRows >= 16)
                 && verticalBandDifference(lowerSlice, rowBytes) <= (cardScale ? 0.04 : PHOTO_BELT_THRESHOLD)
@@ -1655,6 +1661,8 @@ function findRepeatCut(
                 upperSlice,
                 PHOTO_BELT_SIGNATURE_WIDTH,
             )
+
+            if (cardScale && !aboveIsPage) continue
 
             if (aboveIsPage && !cardScale) continue
 
@@ -1774,6 +1782,26 @@ function contentMaskedDifference(left: Buffer, right: Buffer, width = 0): number
     for (const value of kept) total += value
 
     return total / kept.length / 255
+}
+
+/**
+ * 只看視窗中段的內容變異。平面色塊加上上下邊緣時全幅變異會偏高，
+ * 中段仍是單一顏色就不當照片卡。
+ *
+ * @param slice 帶的 RGB。
+ * @param rowBytes 一列位元組數。
+ * @returns 介於 0 與 1 的中段內容變異。
+ */
+function interiorContentVariance(slice: Buffer, rowBytes: number): number
+{
+    const rows = Math.floor(slice.length / rowBytes)
+
+    if (rows < 8 || rowBytes < 3) return 0
+
+    const top = Math.round(rows * 0.25)
+    const bottom = Math.max(top + 4, Math.round(rows * 0.75))
+
+    return contentPixelVariance(slice.subarray(top * rowBytes, bottom * rowBytes))
 }
 
 /**
