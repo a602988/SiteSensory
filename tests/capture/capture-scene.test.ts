@@ -162,7 +162,7 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
     it('trims a virtual-canvas wipe viewport stacked on its clean copy', async () => {
         const page = await canvasWipeStackViewports()
         const legacy = await legacyNarrowOffsetBeltTrim(page)
-        const trimmed = await trimRepeatedTailBand(page, WIDTH)
+        const trimmed = await trimRepeatedTailBand(page, WIDTH, { viewportTiles: true })
         const legacyHeight = (await sharp(legacy).metadata()).height ?? 0
         const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
 
@@ -177,7 +177,7 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
     it('trims a 12k canvas-style wipe stack in a few seconds', async () => {
         const page = await tallCanvasWipeStack()
         const started = Date.now()
-        const trimmed = await trimRepeatedTailBand(page, WIDTH)
+        const trimmed = await trimRepeatedTailBand(page, WIDTH, { viewportTiles: true })
         const elapsed = Date.now() - started
         const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
 
@@ -191,7 +191,7 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
     it('trims a mid-page 1080 faint-wipe stack that coarse bar detection misses', async () => {
         const page = await midPageFaintWipeStack()
         const legacy = await legacyNarrowOffsetBeltTrim(page)
-        const trimmed = await trimRepeatedTailBand(page, WIDTH)
+        const trimmed = await trimRepeatedTailBand(page, WIDTH, { viewportTiles: true })
         const legacyHeight = (await sharp(legacy).metadata()).height ?? 0
         const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
 
@@ -207,7 +207,7 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
     it('trims a live-like canvas extract: wipe viewport, clean copy, then a 18px foot belt', async () => {
         const page = await liveLikeCanvasExtract()
         const started = Date.now()
-        const trimmed = await trimRepeatedTailBand(page, WIDTH)
+        const trimmed = await trimRepeatedTailBand(page, WIDTH, { viewportTiles: true })
         const elapsed = Date.now() - started
         const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
 
@@ -237,7 +237,7 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
 
     it('trims a right-photo 16px head/CTA foot belt on a mid-page canvas tile', async () => {
         const page = await midPageRightPhotoBelt()
-        const trimmed = await trimRepeatedTailBand(page, WIDTH)
+        const trimmed = await trimRepeatedTailBand(page, WIDTH, { viewportTiles: true })
         const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
 
         expect(trimmedHeight).toBeLessThan(2150)
@@ -259,6 +259,18 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
         expect(await sampleRgb(trimmed, 1400, 3800)).not.toEqual([248, 245, 239])
         expect(await sampleRgb(trimmed, 1400, 3700)).not.toEqual([255, 92, 56])
     }, 40_000)
+
+    it('trims a 16px offset belt sitting under a full blue viewport', async () => {
+        const page = await stackPngs([
+            await solidPng('#315ceb', 1080),
+            await thinOffsetBeltCard(),
+        ])
+        const trimmed = await trimRepeatedTailBand(page, WIDTH)
+        const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
+
+        expect(trimmedHeight).toBeLessThan(2150)
+        expect(trimmedHeight).toBeGreaterThan(2000)
+    })
 
     it('trims a 16px offset belt that viewport-scale 48px scan misses', async () => {
         const page = await thinOffsetBeltCard()

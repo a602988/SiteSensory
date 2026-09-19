@@ -42,7 +42,7 @@ const PHOTO_BELT_THRESHOLD = 0.012
 const PHOTO_BELT_THIN_THRESHOLD = 0.028
 const PHOTO_BELT_THIN_PX = 36
 const PHOTO_CARD_WIPE_THRESHOLD = 0.04
-const VIEWPORT_TILE_THRESHOLD = 0.03
+const VIEWPORT_TILE_THRESHOLD = 0.055
 const PINNED_MASKED_SAME_THRESHOLD = 0.022
 const WIPE_NEIGHBOR_MIN_LUMA = 20
 const WIPE_NEIGHBOR_MIN_CHROMA = 22
@@ -409,6 +409,12 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             && previousSignature
             && visualDifference(previousSignature, signature) <= VIRTUAL_CANVAS_DUPLICATE_THRESHOLD
         ) {
+            const lastIndex = segments.length - 1
+            const lastTop = Number(segments[lastIndex]?.top ?? 0)
+
+            segments[lastIndex] = { input: segment, left: 0, top: lastTop }
+            keptSegments[lastIndex] = segment
+            previousSignature = signature
             continue
         }
 
@@ -417,18 +423,12 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             && previousKept
             && await isSamePinnedScene(previousKept, segment, dimensions.width)
         ) {
-            if (
-                await viewportLooksLikeWipe(previousKept, dimensions.width)
-                && !await viewportLooksLikeWipe(segment, dimensions.width)
-            ) {
-                const lastIndex = segments.length - 1
-                const lastTop = Number(segments[lastIndex]?.top ?? 0)
+            const lastIndex = segments.length - 1
+            const lastTop = Number(segments[lastIndex]?.top ?? 0)
 
-                segments[lastIndex] = { input: segment, left: 0, top: lastTop }
-                keptSegments[lastIndex] = segment
-                previousSignature = signature
-            }
-
+            segments[lastIndex] = { input: segment, left: 0, top: lastTop }
+            keptSegments[lastIndex] = segment
+            previousSignature = signature
             continue
         }
 
@@ -464,7 +464,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         throw new Error('完整頁面合成後的尺寸與穩定頁面尺寸不一致')
     }
 
-    return trimRepeatedTailBand(fullPage, dimensions.width)
+    return trimRepeatedTailBand(fullPage, dimensions.width, { viewportTiles: hasVirtualCanvas })
 }
 
 /**
@@ -1484,12 +1484,16 @@ function isVerticallyUniformScene(signature: Buffer, rows: number): boolean
     return visualDifference(top, bottom) <= SCENE_TRIM_THRESHOLD * 2
 }
 
-export async function trimRepeatedTailBand(image: Buffer, width: number): Promise<Buffer>
+export async function trimRepeatedTailBand(
+    image: Buffer,
+    width: number,
+    options: { viewportTiles?: boolean } = {},
+): Promise<Buffer>
 {
     let current = image
 
-    for (let pass = 0; pass < 4; pass += 1) {
-        const next = await trimOnePhotoBelt(current, width)
+    for (let pass = 0; pass < 3; pass += 1) {
+        const next = await trimOnePhotoBelt(current, width, options)
         const before = (await sharp(current).metadata()).height ?? 0
         const after = (await sharp(next).metadata()).height ?? 0
 
@@ -1510,7 +1514,11 @@ export async function trimRepeatedTailBand(image: Buffer, width: number): Promis
  * @param width 寬度。
  * @returns 裁掉一處重複後的圖；找不到則原樣返回。
  */
-async function trimOnePhotoBelt(image: Buffer, width: number): Promise<Buffer>
+async function trimOnePhotoBelt(
+    image: Buffer,
+    width: number,
+    options: { viewportTiles?: boolean } = {},
+): Promise<Buffer>
 {
     const metadata = await sharp(image).metadata()
     const height = metadata.height ?? 0
@@ -1533,12 +1541,18 @@ async function trimOnePhotoBelt(image: Buffer, width: number): Promise<Buffer>
         signature: coarse,
         signatureHeight: coarseHeight,
     }
-    const tileCut = findViewportTileCut(coarseContext)
+    const tileCut = options.viewportTiles === true
+        ? findViewportTileCut(coarseContext)
+        : null
 
     if (tileCut) return applyRepeatCut(image, width, height, tileCut)
 
     const cardCut = height > PHOTO_BELT_REFERENCE_HEIGHT
-        ? findRepeatCut(coarseContext, PHOTO_CARD_RATIOS, true)
+        ? findRepeatCut(
+            coarseContext,
+            PHOTO_CARD_RATIOS.filter(ratio => ratio < 0.95),
+            true,
+        )
         : null
     const thickCut = cardCut ?? findRepeatCut(
         coarseContext,
@@ -1793,7 +1807,7 @@ function findRepeatCut(
                 lowerPair,
                 PHOTO_BELT_SIGNATURE_WIDTH,
             )
-            const viewportPeriod = cardScale && ratio >= 0.9
+            const viewportPeriod = false
             const upperHasWipe = cardScale
                 && looksLikeVerticalWipe(upperSlice, PHOTO_BELT_SIGNATURE_WIDTH, bandRows)
             const pairLimit = cardScale
@@ -1970,24 +1984,14 @@ function findThinBelt1D(
     let cutHeight = 0
     let cutDifference = 1
 
-    for (let period = 5; period <= 22; period += 1) {
+    for (let period = 6; period <= 20; period += 1) {
         const minimumLower = period * 2
         const maximumLower = signatureHeight - period
 
-        for (let lower = maximumLower; lower >= minimumLower; lower -= 1) {
+        for (let lower = maximumLower; lower >= minimumLower; lower -= 2) {
             if (!content[lower] || !content[lower - period]) continue
 
-            let pairDifference = 1
-
-            for (let shift = -1; shift <= 1; shift += 1) {
-                const upper = lower - period + shift
-
-                if (upper < 0 || upper + period > signatureHeight) continue
-
-                const difference = windowDifference(upper, lower, period)
-
-                if (difference < pairDifference) pairDifference = difference
-            }
+            const pairDifference = windowDifference(lower - period, lower, period)
 
             if (pairDifference > PHOTO_BELT_THIN_THRESHOLD) continue
 
@@ -2030,6 +2034,9 @@ function findThinBelt1D(
             }
 
             const candidateStart = Math.round(lower * scale)
+
+            if (candidateStart < 8) continue
+
             const candidateHeight = Math.round(period * scale)
             const betterDiff = pairDifference < cutDifference - 0.002
             const similarLarger = Math.abs(pairDifference - cutDifference) <= 0.002
@@ -2323,14 +2330,14 @@ async function viewportLooksLikeWipe(image: Buffer, width: number): Promise<bool
 
     if (height < 80) return false
 
-    const rows = Math.max(8, Math.round(height * SETTLE_SIGNATURE_WIDTH / width))
+    const rows = Math.max(8, Math.round(height * PHOTO_BELT_SIGNATURE_WIDTH / width))
     const signature = await sharp(image)
-        .resize(SETTLE_SIGNATURE_WIDTH, rows, { fit: 'fill' })
+        .resize(PHOTO_BELT_SIGNATURE_WIDTH, rows, { fit: 'fill' })
         .removeAlpha()
         .raw()
         .toBuffer()
 
-    return looksLikeVerticalWipe(signature, SETTLE_SIGNATURE_WIDTH, rows)
+    return looksLikeVerticalWipe(signature, PHOTO_BELT_SIGNATURE_WIDTH, rows)
 }
 
 /**
