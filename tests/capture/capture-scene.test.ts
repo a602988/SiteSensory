@@ -239,6 +239,29 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
         expect(await sampleRgb(trimmed, 200, trimmedHeight - 40)).toEqual([248, 245, 239])
     }, 20_000)
 
+    it('trims a dense venetian wipe stack whose strict 0.012 no-wipe gate used to keep the wipe', async () => {
+        const page = await liveVenetianOffsetStack()
+        const sourceHeight = (await sharp(page).metadata()).height ?? 0
+        const started = Date.now()
+        const trimmed = await trimRepeatedTailBand(page, WIDTH, { viewportTiles: true })
+        const elapsed = Date.now() - started
+        const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
+
+        expect(sourceHeight).toBe(7062)
+        expect(await legacyStrictWipeGateKeeps(page, 3822)).toBe(true)
+        expect(elapsed).toBeLessThan(12_000)
+        expect(trimmedHeight).toBeLessThan(6000)
+        expect(trimmedHeight).toBeGreaterThan(4800)
+        expect(await sampleRgb(page, 112, 3900)).toEqual([255, 255, 255])
+        expect(await sampleRgb(page, 1400, 3600)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(page, 1400, 3600)).not.toEqual([255, 255, 255])
+        expect(await sampleRgb(trimmed, 1400, 3600)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 1400, 3600)).not.toEqual([255, 255, 255])
+        expect(await sampleRgb(trimmed, 112, 3900)).not.toEqual([255, 255, 255])
+        expect(await sampleRgb(trimmed, 200, 3900)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 200, trimmedHeight - 40)).toEqual([248, 245, 239])
+    }, 20_000)
+
     it('trims a dark right-photo foot belt that strict above-luma skip would keep', async () => {
         const page = await darkRightPhotoFootBeltPage()
         const sourceHeight = (await sharp(page).metadata()).height ?? 0
@@ -249,6 +272,20 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
         expect(trimmedHeight).toBeLessThan(2150)
         expect(trimmedHeight).toBeGreaterThan(2000)
         expect(await sampleRgb(trimmed, 1400, 1200)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 200, trimmedHeight - 8)).toEqual([248, 245, 239])
+    })
+
+    it('trims a left wallpaper 16px foot belt on a mid-page card', async () => {
+        const page = await stackPngs([
+            await solidPng('#f8f5ef', 1080),
+            await leftWallpaperFootBelt(),
+        ])
+        const trimmed = await trimRepeatedTailBand(page, WIDTH)
+        const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
+
+        expect(trimmedHeight).toBeLessThan(2150)
+        expect(trimmedHeight).toBeGreaterThan(2000)
+        expect(await sampleRgb(trimmed, 200, 1200)).not.toEqual([248, 245, 239])
         expect(await sampleRgb(trimmed, 200, trimmedHeight - 8)).toEqual([248, 245, 239])
     })
 
@@ -404,9 +441,12 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
         const wipe = await canvasViewportCard({ wipe: true })
         const clean = await canvasViewportCard({ wipe: false })
         const faint = await canvasViewportCard({ faintWipe: true })
+        const venetian = await venetianFestivalViewport({ wipe: true })
+        const venetianClean = await venetianFestivalViewport({ wipe: false })
 
         await expect(isSamePinnedScene(wipe, clean, WIDTH)).resolves.toBe(true)
         await expect(isSamePinnedScene(faint, clean, WIDTH)).resolves.toBe(true)
+        await expect(isSamePinnedScene(venetian, venetianClean, WIDTH)).resolves.toBe(true)
         await expect(isSamePinnedScene(wipe, await nextPhotoCardOnCream(), WIDTH)).resolves.toBe(false)
     })
 
@@ -475,6 +515,17 @@ async function panelPng(color: string, height: number): Promise<Buffer>
     }
 
     return sharp(raw, { raw: { channels: 3, height, width: WIDTH } }).png().toBuffer()
+}
+
+function carnivalStageTexel(row: number, column: number): [number, number, number]
+{
+    const light = 168 + ((row * 11 + column * 5) % 52)
+    const band = Math.floor((row + column) / 70) % 3
+
+    if (band === 0) return [Math.min(235, light + 36), light - 28, 72]
+    if (band === 1) return [86, Math.min(236, light + 18), Math.min(240, light + 28)]
+
+    return [Math.min(232, light + 8), Math.min(226, light), 206]
 }
 
 function uniquePhotoTexel(row: number, column: number): [number, number, number]
@@ -1000,6 +1051,17 @@ async function liveOffsetWipeStack(): Promise<Buffer>
     ])
 }
 
+async function liveVenetianOffsetStack(): Promise<Buffer>
+{
+    return stackPngs([
+        await solidPng('#f8f5ef', 2742),
+        await rightFashionViewport(),
+        await venetianFestivalViewport({ wipe: true }),
+        await venetianFestivalViewport({ wipe: false }),
+        await leftWallpaperFootBelt(),
+    ])
+}
+
 async function darkRightPhotoFootBeltPage(): Promise<Buffer>
 {
     return stackPngs([
@@ -1052,6 +1114,140 @@ async function liveFestivalViewport(options: { wipe?: boolean } = {}): Promise<B
                 raw[index] = sample[0]
                 raw[index + 1] = sample[1]
                 raw[index + 2] = sample[2]
+                continue
+            }
+
+            raw[index] = 248
+            raw[index + 1] = 245
+            raw[index + 2] = 239
+        }
+    }
+
+    return sharp(raw, { raw: { channels: 3, height: 1080, width: WIDTH } }).png().toBuffer()
+}
+
+async function rightFashionViewport(): Promise<Buffer>
+{
+    const raw = Buffer.alloc(WIDTH * 1080 * 3)
+
+    for (let row = 0; row < 1080; row += 1) {
+        for (let column = 0; column < WIDTH; column += 1) {
+            const index = (row * WIDTH + column) * 3
+            const inPhoto = column >= 960 && column < 1860 && row >= 40 && row < 980
+            const inCaption = column >= 80 && column < 520 && row >= 40 && row < 100
+
+            if (inCaption) {
+                raw[index] = 36
+                raw[index + 1] = 34
+                raw[index + 2] = 32
+                continue
+            }
+
+            if (inPhoto) {
+                const fold = Math.abs(((column - 1400) % 70) - 35)
+
+                raw[index] = 236 - fold
+                raw[index + 1] = 232 - Math.floor(fold / 2)
+                raw[index + 2] = 228 - Math.floor(row / 90)
+                continue
+            }
+
+            raw[index] = 248
+            raw[index + 1] = 245
+            raw[index + 2] = 239
+        }
+    }
+
+    return sharp(raw, { raw: { channels: 3, height: 1080, width: WIDTH } }).png().toBuffer()
+}
+
+async function venetianFestivalViewport(options: { wipe?: boolean } = {}): Promise<Buffer>
+{
+    const raw = Buffer.alloc(WIDTH * 1080 * 3)
+
+    for (let row = 0; row < 1080; row += 1) {
+        for (let column = 0; column < WIDTH; column += 1) {
+            const index = (row * WIDTH + column) * 3
+            const inPhoto = column >= 80 && column < 980 && row >= 20 && row < 1020
+            const inCaption = column >= 1100 && column < 1700 && row >= 40 && row < 110
+            const inCta = column >= 1100 && column < 1480 && row >= 520 && row < 570
+            const wipeColumn = options.wipe === true
+                && inPhoto
+                && row < 940
+                && (column - 100) % 12 < 3
+                && column >= 100
+                && column < 940
+
+            if (wipeColumn) {
+                raw[index] = 255
+                raw[index + 1] = 255
+                raw[index + 2] = 255
+                continue
+            }
+
+            if (inCta) {
+                raw[index] = 255
+                raw[index + 1] = 92
+                raw[index + 2] = 56
+                continue
+            }
+
+            if (inCaption) {
+                raw[index] = 36
+                raw[index + 1] = 34
+                raw[index + 2] = 32
+                continue
+            }
+
+            if (inPhoto) {
+                const sample = carnivalStageTexel(row, column)
+
+                raw[index] = sample[0]
+                raw[index + 1] = sample[1]
+                raw[index + 2] = sample[2]
+                continue
+            }
+
+            raw[index] = 248
+            raw[index + 1] = 245
+            raw[index + 2] = 239
+        }
+    }
+
+    return sharp(raw, { raw: { channels: 3, height: 1080, width: WIDTH } }).png().toBuffer()
+}
+
+async function leftWallpaperFootBelt(): Promise<Buffer>
+{
+    const raw = Buffer.alloc(WIDTH * 1080 * 3)
+    const photoRight = 960
+    const photoBottom = 1040
+    const beltHeight = 16
+    const firstBelt = photoBottom - beltHeight * 2
+    const secondBelt = photoBottom - beltHeight
+
+    for (let row = 0; row < 1080; row += 1) {
+        for (let column = 0; column < WIDTH; column += 1) {
+            const index = (row * WIDTH + column) * 3
+            const inPhoto = column >= 80 && column < photoRight && row >= 40 && row < photoBottom
+            const inFirstBelt = inPhoto && row >= firstBelt && row < secondBelt
+            const inSecondBelt = inPhoto && row >= secondBelt && row < photoBottom
+
+            if (inFirstBelt || inSecondBelt) {
+                const beltRow = row - (inSecondBelt ? secondBelt : firstBelt)
+
+                raw[index] = 42 + beltRow * 4
+                raw[index + 1] = 28 + Math.floor(column / 8) % 30
+                raw[index + 2] = 22 + (column % 18)
+                continue
+            }
+
+            if (inPhoto) {
+                const diamond = Math.abs((column % 70) - 35) + Math.abs((row % 70) - 35)
+
+                raw[index] = 48 + (diamond < 18 ? 10 : 0)
+                raw[index + 1] = 22 + Math.floor((column % 40) / 6)
+                raw[index + 2] = 14
                 continue
             }
 
@@ -1536,6 +1732,77 @@ async function legacyFullSegmentTailTrim(image: Buffer): Promise<Buffer>
     if (variance < 0.02 || difference > 0.015) return image
 
     return image
+}
+
+/**
+ * v11 滑動門檻：settle 式 wipe 偵測（200／+40）在 384 指紋上看不
+ * 到淡化百葉窗，且 45–175 遮罩後的整磚差仍 > 0.012，整段拒絕。
+ *
+ * @param image 長圖 PNG。
+ * @param wipeStart wipe 視窗的 y。
+ * @returns 舊門檻會留下 wipe 磚時為 true。
+ */
+async function legacyStrictWipeGateKeeps(image: Buffer, wipeStart: number): Promise<boolean>
+{
+    const wipe = await sharp(image)
+        .extract({ height: 1080, left: 0, top: wipeStart, width: WIDTH })
+        .toBuffer()
+    const clean = await sharp(image)
+        .extract({ height: 1080, left: 0, top: wipeStart + 1080, width: WIDTH })
+        .toBuffer()
+    const rows = Math.max(16, Math.round(1080 * 384 / WIDTH))
+    const wipeSignature = await sharp(wipe)
+        .resize(384, rows, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+    const cleanSignature = await sharp(clean)
+        .resize(384, rows, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+    const differences: number[] = []
+
+    for (let index = 0; index < wipeSignature.length; index += 3) {
+        const leftLuma = 0.299 * (wipeSignature[index] ?? 0)
+            + 0.587 * (wipeSignature[index + 1] ?? 0)
+            + 0.114 * (wipeSignature[index + 2] ?? 0)
+        const rightLuma = 0.299 * (cleanSignature[index] ?? 0)
+            + 0.587 * (cleanSignature[index + 1] ?? 0)
+            + 0.114 * (cleanSignature[index + 2] ?? 0)
+
+        if (leftLuma > 230 || rightLuma > 230) continue
+
+        const wipeVsPhoto = (
+            leftLuma > 200
+            && rightLuma > 45
+            && rightLuma < 175
+        ) || (
+            rightLuma > 200
+            && leftLuma > 45
+            && leftLuma < 175
+        )
+
+        if (wipeVsPhoto) continue
+
+        differences.push((
+            Math.abs((wipeSignature[index] ?? 0) - (cleanSignature[index] ?? 0))
+            + Math.abs((wipeSignature[index + 1] ?? 0) - (cleanSignature[index + 1] ?? 0))
+            + Math.abs((wipeSignature[index + 2] ?? 0) - (cleanSignature[index + 2] ?? 0))
+        ) / 3)
+    }
+
+    if (differences.length < 8) return true
+
+    differences.sort((leftValue, rightValue) => leftValue - rightValue)
+    const kept = differences.slice(0, Math.max(1, Math.floor(differences.length * 0.85)))
+    let total = 0
+
+    for (const value of kept) total += value
+
+    const difference = total / kept.length / 255
+
+    return !looksLikeVerticalWipe(wipeSignature, 384, rows) && difference > 0.012
 }
 
 function countLegacyMidToneWipeSpikes(image: Buffer, width: number, height: number): number

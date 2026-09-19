@@ -571,6 +571,25 @@ describe('capture worker', { timeout: 60_000 }, () => {
         expect(await samplePixel(fullPage, 1400, 2300)).not.toEqual([248, 245, 239])
     })
 
+    it('trims a dense venetian canvas wipe stacked on its clean copy', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?venetianCanvasWipe=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(height).toBeLessThan(3600)
+        expect(height).toBeGreaterThan(1900)
+        expect(await samplePixel(fullPage, 200, 200)).not.toEqual([248, 245, 239])
+        expect(await samplePixel(fullPage, 1400, 200)).not.toEqual([248, 245, 239])
+        expect(await samplePixel(fullPage, 180, 1200)).not.toEqual([255, 255, 255])
+        expect(await samplePixel(fullPage, 200, 1200)).not.toEqual([248, 245, 239])
+    })
+
     it('keeps a pinned virtual-canvas scene only once while the tail color changes', async () => {
         const storage = createLocalObjectStorage(storageRoot)
         const result = await capturePage({
@@ -618,6 +637,7 @@ function createFixtureServer(): Server
         const darkEdgeWipe = parameters.has('darkEdgeWipe')
         const canvasWipeStack = parameters.has('canvasWipeStack')
         const midCanvasWipeStack = parameters.has('midCanvasWipeStack')
+        const venetianCanvasWipe = parameters.has('venetianCanvasWipe')
 
         if (cookies) {
             const html = `<!doctype html>
@@ -932,6 +952,75 @@ sync()
 <div style="position:absolute;left:1100px;top:1110px;width:280px;height:44px;background:#ff5c38;border-radius:999px"></div>
 </section>
 <section style="height:280px;background:#f8f5ef"></section>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (venetianCanvasWipe) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Venetian Canvas Wipe Fixture</title></head>
+<body style="margin:0;background:#f8f5ef">
+<div id="canvas" style="position:fixed;inset:0;background:#f8f5ef;z-index:0">
+<div id="photo" style="position:absolute;left:960px;top:40px;width:900px;height:900px;background:repeating-linear-gradient(90deg,#ece8e4 0 35px,#f7f4f0 35px 70px)"></div>
+<div id="wipes"></div>
+<div id="caption" style="position:absolute;left:1100px;top:40px;width:360px;height:48px;background:#242220;display:none"></div>
+<div id="cta" style="position:absolute;left:1100px;top:520px;width:280px;height:44px;background:#ff5c38;border-radius:999px;display:none"></div>
+</div>
+<div style="height:5400px"></div>
+<script>
+const photo=document.querySelector('#photo')
+const wipes=document.querySelector('#wipes')
+const caption=document.querySelector('#caption')
+const cta=document.querySelector('#cta')
+const paintWipes=show=>{
+    wipes.innerHTML=''
+    if(!show) return
+    for (let left=100; left<=936; left+=12) {
+        const bar=document.createElement('div')
+        bar.style.cssText='position:absolute;top:40px;height:900px;width:3px;background:#fff;left:'+left+'px'
+        wipes.appendChild(bar)
+    }
+}
+const paint=()=>{
+    const y=scrollY
+    if(y<720){
+        photo.style.left='960px'
+        photo.style.width='900px'
+        photo.style.height='900px'
+        photo.style.background='repeating-linear-gradient(90deg,#ece8e4 0 35px,#f7f4f0 35px 70px)'
+        caption.style.display='none'
+        cta.style.display='none'
+        caption.style.left='80px'
+        paintWipes(false)
+        return
+    }
+    if(y<1600){
+        photo.style.left='80px'
+        photo.style.width='900px'
+        photo.style.height='900px'
+        photo.style.background='radial-gradient(circle at 38% 32%,#f4d27a 0 140px,transparent 220px),linear-gradient(160deg,#f2c36a,#6ed7ea,#f6f1e8)'
+        caption.style.display='block'
+        caption.style.left='1100px'
+        cta.style.display='block'
+        paintWipes(true)
+        return
+    }
+    photo.style.left='80px'
+    photo.style.width='900px'
+    photo.style.height='900px'
+    photo.style.background='radial-gradient(circle at 38% 32%,#f4d27a 0 140px,transparent 220px),linear-gradient(160deg,#f2c36a,#6ed7ea,#f6f1e8)'
+    caption.style.display='block'
+    caption.style.left='1100px'
+    cta.style.display='block'
+    paintWipes(false)
+}
+paint()
+addEventListener('scroll',paint)
+</script>
 </body></html>`
 
             response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })

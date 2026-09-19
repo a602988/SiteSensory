@@ -65,6 +65,8 @@ const WIPE_BAR_NEIGHBOR_DELTA = 40
 const WIPE_BAR_MIN_LUMINANCE = 200
 const WIPE_BAR_CONTENT_MIN_LUMINANCE = 45
 const WIPE_BAR_CONTENT_MAX_LUMINANCE = 175
+const BLENDED_WIPE_MIN_LUMINANCE = 168
+const BLENDED_WIPE_NEIGHBOR_DELTA = 24
 const WIPE_BAND_RATIO = 0.18
 const WIPE_BAND_MIN_ROWS = 6
 const VIEWPORT_WIPE_HOLD_SAMPLES = 12
@@ -1369,6 +1371,178 @@ function countWipeSpikesInBand(image: Buffer, width: number, rowStart: number, r
 }
 
 /**
+ * 簽名尺度上的淡化百葉窗欄數。12–16px 白條縮到 384 寬後，欄均
+ * 常落在 165–200，settle 用的 200／+40 尖峰會漏掉。
+ *
+ * @param image RGB。
+ * @param width 指紋寬度。
+ * @returns 亮於左右鄰欄的淡化直條數。
+ */
+function countBlendedWipeColumns(image: Buffer, width: number): number
+{
+    return listBlendedWipeColumns(image, width).reduce((total, flag) => total + (flag ? 1 : 0), 0)
+}
+
+/**
+ * 標出縮圖後仍比左右照片亮一截的直欄。奶油頁面左右一樣亮，不會
+ * 被標；用來在比對時略過 wipe 欄，而不是只靠單像素 200 luma。
+ *
+ * @param image RGB。
+ * @param width 指紋寬度。
+ * @returns 每欄是否像淡化 wipe。
+ */
+function listBlendedWipeColumns(image: Buffer, width: number): boolean[]
+{
+    const flags = new Array<boolean>(Math.max(0, width)).fill(false)
+
+    if (width < 5 || image.length < width * 3 || image.length % (width * 3) !== 0) return flags
+
+    const height = Math.floor(image.length / (width * 3))
+
+    if (height < 2) return flags
+
+    const columnMean = new Float64Array(width)
+    const columnChroma = new Float64Array(width)
+
+    for (let column = 0; column < width; column += 1) {
+        let lumaTotal = 0
+        let chromaTotal = 0
+
+        for (let row = 0; row < height; row += 1) {
+            const index = (row * width + column) * 3
+            const red = image[index] ?? 0
+            const green = image[index + 1] ?? 0
+            const blue = image[index + 2] ?? 0
+
+            lumaTotal += 0.299 * red + 0.587 * green + 0.114 * blue
+            chromaTotal += Math.max(red, green, blue) - Math.min(red, green, blue)
+        }
+
+        columnMean[column] = lumaTotal / height
+        columnChroma[column] = chromaTotal / height
+    }
+
+    for (let column = 2; column < width - 2; column += 1) {
+        const left = ((columnMean[column - 2] ?? 0) + (columnMean[column - 1] ?? 0)) / 2
+        const right = ((columnMean[column + 1] ?? 0) + (columnMean[column + 2] ?? 0)) / 2
+        const neighborhood = (left + right) / 2
+        const current = columnMean[column] ?? 0
+        const neighborContent = (
+            left < PHOTO_BELT_PAGE_LUMA - 10
+            && right < PHOTO_BELT_PAGE_LUMA - 10
+        ) || (
+            (columnChroma[column - 2] ?? 0) >= 16
+            && (columnChroma[column + 2] ?? 0) >= 16
+        )
+
+        if (
+            neighborContent
+            && current > neighborhood + BLENDED_WIPE_NEIGHBOR_DELTA
+            && current > BLENDED_WIPE_MIN_LUMINANCE
+        ) {
+            flags[column] = true
+        }
+    }
+
+    return flags
+}
+
+/**
+ * 合併淡化欄與「兩幀相減後的週期直條殘差」。密百葉窗縮到
+ * 0.6px 時單幀尖峰會消失，但 wipe 對乾淨複本的差仍集中在直欄。
+ *
+ * @param left 上帶。
+ * @param right 下帶。
+ * @param width 指紋寬度。
+ * @returns 要略過的欄；不夠三條則為 undefined。
+ */
+function mergePairWipeColumns(
+    left: Buffer,
+    right: Buffer,
+    width: number,
+): boolean[] | undefined
+{
+    const leftWipes = listBlendedWipeColumns(left, width)
+    const rightWipes = listBlendedWipeColumns(right, width)
+    const residual = listResidualWipeColumns(left, right, width)
+    const merged = leftWipes.map((flag, column) => (
+        flag || rightWipes[column] === true || residual[column] === true
+    ))
+    const count = merged.reduce((total, flag) => total + (flag ? 1 : 0), 0)
+
+    return count >= WIPE_BAR_MIN_COUNT ? merged : undefined
+}
+
+/**
+ * 兩幀各欄平均差。中位數低、少數欄特別高，就是同一張照片上的
+ * 直條殘差，不是兩張不同的卡。
+ *
+ * @param left 上帶。
+ * @param right 下帶。
+ * @param width 指紋寬度。
+ * @returns 殘差尖峰欄。
+ */
+function listResidualWipeColumns(left: Buffer, right: Buffer, width: number): boolean[]
+{
+    const flags = new Array<boolean>(Math.max(0, width)).fill(false)
+
+    if (width < 8 || left.length !== right.length || left.length < width * 3) return flags
+    if (left.length % (width * 3) !== 0) return flags
+
+    const height = Math.floor(left.length / (width * 3))
+    const totals = new Float64Array(width)
+    const counts = new Float64Array(width)
+
+    for (let row = 0; row < height; row += 1) {
+        for (let column = 0; column < width; column += 1) {
+            const index = (row * width + column) * 3
+            const leftLuma = 0.299 * (left[index] ?? 0)
+                + 0.587 * (left[index + 1] ?? 0)
+                + 0.114 * (left[index + 2] ?? 0)
+            const rightLuma = 0.299 * (right[index] ?? 0)
+                + 0.587 * (right[index + 1] ?? 0)
+                + 0.114 * (right[index + 2] ?? 0)
+
+            if (leftLuma > PHOTO_BELT_PAGE_LUMA && rightLuma > PHOTO_BELT_PAGE_LUMA) continue
+
+            totals[column] += (
+                Math.abs((left[index] ?? 0) - (right[index] ?? 0))
+                + Math.abs((left[index + 1] ?? 0) - (right[index + 1] ?? 0))
+                + Math.abs((left[index + 2] ?? 0) - (right[index + 2] ?? 0))
+            ) / 3 / 255
+            counts[column] += 1
+        }
+    }
+
+    const values: number[] = []
+
+    for (let column = 0; column < width; column += 1) {
+        totals[column] = (counts[column] ?? 0) > 0 ? (totals[column] ?? 0) / (counts[column] ?? 1) : 0
+        if ((counts[column] ?? 0) > height * 0.2) values.push(totals[column] ?? 0)
+    }
+
+    if (values.length < 8) return flags
+
+    values.sort((leftValue, rightValue) => leftValue - rightValue)
+    const median = values[Math.floor(values.length / 2)] ?? 0
+    const spike = Math.max(0.045, median * 2.2)
+
+    for (let column = 2; column < width - 2; column += 1) {
+        const current = totals[column] ?? 0
+        const neighborhood = ((totals[column - 2] ?? 0) + (totals[column + 2] ?? 0)) / 2
+
+        if (current > spike && current > neighborhood + 0.02) flags[column] = true
+    }
+
+    return flags
+}
+
+function countResidualWipeColumns(left: Buffer, right: Buffer, width: number): number
+{
+    return listResidualWipeColumns(left, right, width).reduce((total, flag) => total + (flag ? 1 : 0), 0)
+}
+
+/**
  * 去掉後段開頭與前一段內容重複的捲動場景。sticky 面板停在視窗上方時，
  * 幾何裁切後仍會再寫入同一張照片。純色底不裁，以免把留白誤刪。後段幾乎
  * 整段都還是同一幕時視為預留高度的延續，不裁，以免滿 viewport 的 sticky
@@ -1719,36 +1893,59 @@ function scanViewportTiles(
         if (cheapPair > VIEWPORT_TILE_THRESHOLD + 0.05) continue
 
         const upperInterior = interiorContentVariance(upperSlice, rowBytes)
+        const residualWipeCount = countResidualWipeColumns(
+            upperSlice,
+            lowerSlice,
+            PHOTO_BELT_SIGNATURE_WIDTH,
+        )
         const upperHasWipe = looksLikeVerticalWipe(
             upperSlice,
             PHOTO_BELT_SIGNATURE_WIDTH,
             tileRows,
-        )
+        ) || countBlendedWipeColumns(upperSlice, PHOTO_BELT_SIGNATURE_WIDTH) >= WIPE_BAR_MIN_COUNT
+            || residualWipeCount >= WIPE_BAR_MIN_COUNT
 
         if (upperInterior < 0.025 && !upperHasWipe) continue
 
+        const skipColumns = mergePairWipeColumns(
+            upperSlice,
+            lowerSlice,
+            PHOTO_BELT_SIGNATURE_WIDTH,
+        )
         const pairDifference = sceneBandDifference(
             upperSlice.subarray(pairOffset),
             lowerSlice.subarray(pairOffset),
             PHOTO_BELT_SIGNATURE_WIDTH,
+            skipColumns,
         )
         const fullDifference = sceneBandDifference(
             upperSlice,
             lowerSlice,
             PHOTO_BELT_SIGNATURE_WIDTH,
+            skipColumns,
         )
         const topRows = Math.max(8, Math.round(tileRows * 0.38))
+        const topSlice = upperSlice.subarray(0, topRows * rowBytes)
         const topDifference = sceneBandDifference(
-            upperSlice.subarray(0, topRows * rowBytes),
+            topSlice,
             lowerSlice.subarray(0, topRows * rowBytes),
             PHOTO_BELT_SIGNATURE_WIDTH,
+            skipColumns,
         )
+        const topHasWipe = looksLikeVerticalWipe(
+            topSlice,
+            PHOTO_BELT_SIGNATURE_WIDTH,
+            topRows,
+        ) || countBlendedWipeColumns(topSlice, PHOTO_BELT_SIGNATURE_WIDTH) >= WIPE_BAR_MIN_COUNT
+            || residualWipeCount >= WIPE_BAR_MIN_COUNT
         const bestDifference = Math.min(pairDifference, fullDifference)
 
-        // 頂部必須也是同一張照片。滑動 1080 若只看下 62%，錯位 100px
-        // 的奶油卡會自比成功；混窗（上一張卡 + wipe）頂部對不上乾淨複本。
+        // 頂部必須也是同一張照片，否則滑動會切到錯位 100px 的奶油自比，
+        // 或「上一張卡 + wipe」混窗。濃密百葉窗縮到 384 後，白條常被
+        // 平均成 165–200，舊頂部遮罩會餓死或把白條當真差異；上半本身
+        // 有 wipe（含淡化欄）就改看下 62%。
         if (bestDifference > VIEWPORT_TILE_THRESHOLD) continue
-        if (topDifference > VIEWPORT_TILE_THRESHOLD) continue
+        if (topDifference > VIEWPORT_TILE_THRESHOLD && !topHasWipe) continue
         if (!upperHasWipe && bestDifference > 0.012) continue
 
         const candidateStart = Math.round(upper * scale)
@@ -1796,12 +1993,17 @@ function scanViewportTiles(
  * @param width 指紋寬度。
  * @returns 介於 0 與 1 的最小內容差。
  */
-function sceneBandDifference(left: Buffer, right: Buffer, width: number): number
+function sceneBandDifference(
+    left: Buffer,
+    right: Buffer,
+    width: number,
+    skipColumns?: boolean[],
+): number
 {
-    const full = contentMaskedDifference(left, right, width)
+    const full = contentMaskedDifference(left, right, width, 0, 0, skipColumns)
     const half = Math.floor(width / 2)
-    const leftHalf = contentMaskedDifference(left, right, width, 0, half)
-    const rightHalf = contentMaskedDifference(left, right, width, half, width)
+    const leftHalf = contentMaskedDifference(left, right, width, 0, half, skipColumns)
+    const rightHalf = contentMaskedDifference(left, right, width, half, width, skipColumns)
     let best = full
 
     if (regionHasPhoto(left, width, 0, half) && regionHasPhoto(right, width, 0, half) && leftHalf < best) {
@@ -2228,6 +2430,25 @@ function findThinBelt1D(
 }
 
 /**
+ * 白條對照片：中等亮度、亮舞台、近頁面亮部或暗高彩都可以。只認
+ * 45–175 時，嘉年華那種 175–230 亮照片上的百葉窗會被算成真差異。
+ *
+ * @param leftLuma 左側亮度。
+ * @param rightLuma 右側亮度。
+ * @returns 一側是 wipe 白、另一側是照片時為 true。
+ */
+function isWipeVersusPhoto(leftLuma: number, rightLuma: number): boolean
+{
+    const photoSide = (luma: number): boolean => (
+        luma >= WIPE_NEIGHBOR_MIN_LUMA
+        && luma < PHOTO_BELT_PAGE_LUMA
+    )
+
+    return (leftLuma > PHOTO_WIPE_LUMA && photoSide(rightLuma))
+        || (rightLuma > PHOTO_WIPE_LUMA && photoSide(leftLuma))
+}
+
+/**
  * 對齊用的便宜內容差。每隔幾個像素取樣、不排序，只用來找最佳
  * offset；通過後再用完整 `contentMaskedDifference` 把門檻。
  *
@@ -2242,6 +2463,7 @@ function sampledContentDifference(left: Buffer, right: Buffer, width: number): n
 
     let total = 0
     let count = 0
+    let wipeSkipped = 0
 
     for (let index = 0; index < left.length; index += 12) {
         const leftLuma = 0.299 * (left[index] ?? 0)
@@ -2253,17 +2475,10 @@ function sampledContentDifference(left: Buffer, right: Buffer, width: number): n
 
         if (leftLuma > PHOTO_BELT_PAGE_LUMA || rightLuma > PHOTO_BELT_PAGE_LUMA) continue
 
-        const wipeVsPhoto = (
-            leftLuma > PHOTO_WIPE_LUMA
-            && rightLuma > WIPE_BAR_CONTENT_MIN_LUMINANCE
-            && rightLuma < WIPE_BAR_CONTENT_MAX_LUMINANCE
-        ) || (
-            rightLuma > PHOTO_WIPE_LUMA
-            && leftLuma > WIPE_BAR_CONTENT_MIN_LUMINANCE
-            && leftLuma < WIPE_BAR_CONTENT_MAX_LUMINANCE
-        )
-
-        if (wipeVsPhoto) continue
+        if (isWipeVersusPhoto(leftLuma, rightLuma)) {
+            wipeSkipped += 1
+            continue
+        }
 
         total += (
             Math.abs((left[index] ?? 0) - (right[index] ?? 0))
@@ -2273,7 +2488,9 @@ function sampledContentDifference(left: Buffer, right: Buffer, width: number): n
         count += 1
     }
 
-    return count < 12 ? 1 : total / count / 255
+    if (count < 12) return wipeSkipped >= 8 ? 0.04 : 1
+
+    return total / count / 255
 }
 
 /**
@@ -2285,6 +2502,7 @@ function sampledContentDifference(left: Buffer, right: Buffer, width: number): n
  * @param width 指紋寬度；大於 0 時略過 wipe 欄。
  * @param columnStart 只比這欄之後（含）。
  * @param columnEnd 只比這欄之前。
+ * @param skipColumns 簽名尺度上已標成淡化 wipe 的欄。
  * @returns 介於 0 與 1 的內容差異；內容太少時為 1。
  */
 function contentMaskedDifference(
@@ -2293,6 +2511,7 @@ function contentMaskedDifference(
     width = 0,
     columnStart = 0,
     columnEnd = 0,
+    skipColumns?: boolean[],
 ): number
 {
     if (left.length !== right.length || left.length < 3) return 1
@@ -2301,13 +2520,23 @@ function contentMaskedDifference(
 
     const lastColumn = columnEnd > 0 ? columnEnd : width > 0 ? width : 0
     const differences: number[] = []
+    let examined = 0
+    let wipeSkipped = 0
 
     for (let index = 0; index < left.length; index += 3) {
         if (width > 0) {
             const column = (index / 3) % width
 
             if (column < columnStart || column >= lastColumn) continue
+
+            if (skipColumns?.[column] === true) {
+                examined += 1
+                wipeSkipped += 1
+                continue
+            }
         }
+
+        examined += 1
         const leftLuma = 0.299 * (left[index] ?? 0)
             + 0.587 * (left[index + 1] ?? 0)
             + 0.114 * (left[index + 2] ?? 0)
@@ -2317,17 +2546,10 @@ function contentMaskedDifference(
 
         if (leftLuma > PHOTO_BELT_PAGE_LUMA || rightLuma > PHOTO_BELT_PAGE_LUMA) continue
 
-        const wipeVsPhoto = (
-            leftLuma > PHOTO_WIPE_LUMA
-            && rightLuma > WIPE_BAR_CONTENT_MIN_LUMINANCE
-            && rightLuma < WIPE_BAR_CONTENT_MAX_LUMINANCE
-        ) || (
-            rightLuma > PHOTO_WIPE_LUMA
-            && leftLuma > WIPE_BAR_CONTENT_MIN_LUMINANCE
-            && leftLuma < WIPE_BAR_CONTENT_MAX_LUMINANCE
-        )
-
-        if (wipeVsPhoto) continue
+        if (isWipeVersusPhoto(leftLuma, rightLuma)) {
+            wipeSkipped += 1
+            continue
+        }
 
         const pixel = (
             Math.abs((left[index] ?? 0) - (right[index] ?? 0))
@@ -2338,10 +2560,19 @@ function contentMaskedDifference(
         differences.push(pixel)
     }
 
-    const examinedColumns = lastColumn > columnStart ? lastColumn - columnStart : width
-    const columnFactor = width > 0 ? examinedColumns / width : 1
+    const minSamples = Math.max(8, Math.floor(examined * 0.08))
 
-    if (differences.length < left.length / 3 * 0.08 * columnFactor) return 1
+    if (differences.length < minSamples) {
+        if (wipeSkipped >= examined * 0.2 && differences.length >= 8) {
+            // 百葉窗吃掉上半樣本；剩下的照片點仍可用。
+        }
+        else if (wipeSkipped >= examined * 0.25) {
+            return 0.02
+        }
+        else {
+            return 1
+        }
+    }
 
     differences.sort((leftValue, rightValue) => leftValue - rightValue)
 
@@ -2489,6 +2720,9 @@ export async function isSamePinnedScene(previous: Buffer, next: Buffer, width: n
 
     const wipeAware = looksLikeVerticalWipe(previousTop, PHOTO_BELT_SIGNATURE_WIDTH, windowRows)
         || looksLikeVerticalWipe(nextTop, PHOTO_BELT_SIGNATURE_WIDTH, windowRows)
+        || countBlendedWipeColumns(previousTop, PHOTO_BELT_SIGNATURE_WIDTH) >= WIPE_BAR_MIN_COUNT
+        || countBlendedWipeColumns(nextTop, PHOTO_BELT_SIGNATURE_WIDTH) >= WIPE_BAR_MIN_COUNT
+        || countResidualWipeColumns(previousTop, nextTop, PHOTO_BELT_SIGNATURE_WIDTH) >= WIPE_BAR_MIN_COUNT
     const masked = contentMaskedDifference(previousTop, nextTop, PHOTO_BELT_SIGNATURE_WIDTH)
     const visual = visualDifference(previousTop, nextTop)
 
