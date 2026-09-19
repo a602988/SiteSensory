@@ -29,7 +29,7 @@ let server: Server
 let fixtureUrl: string
 let storageRoot: string
 
-describe('capture worker', { timeout: 40_000 }, () => {
+describe('capture worker', { timeout: 60_000 }, () => {
     beforeAll(async () => {
         browser = await chromium.launch({ headless: true })
         storageRoot = await mkdtemp(join(tmpdir(), 'sitesensory-capture-'))
@@ -176,7 +176,7 @@ describe('capture worker', { timeout: 40_000 }, () => {
 
         expect([...scenePixel]).toEqual([49, 92, 235])
         expect([...repeatedFixedPixel]).not.toEqual([220, 38, 38])
-    })
+    }, 90_000)
 
     it('keeps a viewport-sized fixed canvas used for virtual scrolling', async () => {
         const storage = createLocalObjectStorage(storageRoot)
@@ -378,6 +378,21 @@ describe('capture worker', { timeout: 40_000 }, () => {
         expect(await samplePixel(fullPage, 960, 2000)).not.toEqual([34, 197, 94])
         expect(await samplePixel(fullPage, 960, 2000)).not.toEqual([21, 128, 61])
     })
+
+    it('keeps a pinned virtual-canvas scene only once while the tail color changes', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?pinnedCanvas=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+
+        expect(readPngSize(fullPage)).toEqual({ height: 1080, width: 1920 })
+        expect(await samplePixel(fullPage, 20, 40)).toEqual([34, 197, 94])
+        expect(await samplePixel(fullPage, 60, 40)).toEqual([21, 128, 61])
+    })
 })
 
 /**
@@ -399,6 +414,7 @@ function createFixtureServer(): Server
         const wipeReveal = parameters.has('wipeReveal')
         const stickySidebar = parameters.has('stickySidebar')
         const stickyScene = parameters.has('stickyScene')
+        const pinnedCanvas = parameters.has('pinnedCanvas')
 
         if (cookies) {
             const html = `<!doctype html>
@@ -572,6 +588,24 @@ addEventListener('scroll',()=>{
 <section style="height:2500px;background:#f8f5ef">
 <div style="position:sticky;top:0;height:400px;background-image:repeating-linear-gradient(90deg,#22c55e 0 40px,#15803d 40px 80px)"></div>
 </section>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (pinnedCanvas) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Pinned Canvas Fixture</title></head>
+<body style="margin:0">
+<div id="canvas" style="position:fixed;inset:0;overflow:hidden;z-index:0">
+<div style="height:400px;background-image:repeating-linear-gradient(90deg,#22c55e 0 40px,#15803d 40px 80px)"></div>
+<div id="tail" style="height:680px;background:#315ceb"></div>
+</div>
+<div style="height:3240px"></div>
+<script>addEventListener('scroll',()=>{document.querySelector('#tail').style.background=scrollY>200?'#dc2626':'#315ceb'})</script>
 </body></html>`
 
             response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })

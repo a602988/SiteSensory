@@ -33,9 +33,12 @@ const STICKY_CHROME_SIDE_MAX_PX = 80
 const SCENE_TRIM_MAX_RATIO = 0.8
 const SCENE_TRIM_MIN_VARIANCE = 0.02
 const SCENE_TRIM_THRESHOLD = 0.015
+const PINNED_SCENE_THRESHOLD = 0.04
+const PINNED_SCENE_ROWS_RATIO = 0.35
 const WIPE_BAR_MIN_COUNT = 3
 const WIPE_BAR_NEIGHBOR_DELTA = 35
 const WIPE_BAR_MIN_LUMINANCE = 190
+const VIEWPORT_WIPE_HOLD_SAMPLES = 12
 const OVERLAY_SETTLE_MS = 250
 const SIGNATURE_HEIGHT = 18
 const SIGNATURE_WIDTH = 32
@@ -319,7 +322,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             throw new Error(`無法擷取頁面 ${target}px 到 ${target + dimensions.viewportHeight}px 的區段`)
         }
 
-        if (settled.hasWipeArtifact) {
+        if (hasVirtualCanvas && settled.hasWipeArtifact) {
             documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
             continue
         }
@@ -353,11 +356,20 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         const signature = hasVirtualCanvas
             ? await createVisualSignature(segment)
             : null
+        const previousKept = keptSegments.at(-1)
 
         if (
             signature
             && previousSignature
             && visualDifference(previousSignature, signature) <= VIRTUAL_CANVAS_DUPLICATE_THRESHOLD
+        ) {
+            continue
+        }
+
+        if (
+            hasVirtualCanvas
+            && previousKept
+            && await isSamePinnedScene(previousKept, segment, dimensions.width)
         ) {
             continue
         }
@@ -917,7 +929,8 @@ async function dismissAndHideOverlaysInPage(options: {
  * requestAnimationFrame 與可見圖片等待，再以較高解析畫面指紋確認沒有
  * 細條 wipe／遮罩仍在移動，並比對大型可見元素的 opacity、transform、
  * clip-path。CSS／WAAPI 有限次動畫仍要等完；無限循環動畫不列入。
- * 逾時後保存當時畫面。不使用 prefers-reduced-motion。
+ * 直條若連續穩定超過設計停留門檻，視為版面線條而非 wipe。逾時後保存
+ * 當時畫面。不使用 prefers-reduced-motion。
  *
  * @param page 已捲到目標位置的 Playwright 頁面。
  * @returns 最後一張視窗截圖，以及該幀是否仍像 wipe。
@@ -937,7 +950,8 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
     let previousSignature: Buffer | null = null
     let previousLayout = ''
     let stableSamples = 0
-    let latest = await screenshotViewport(page, 'allow')
+    let wipeHoldSamples = 0
+    let latest: Buffer | null = null
     let latestHasWipe = false
 
     while (Date.now() < deadline) {
@@ -957,19 +971,24 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
             ) <= VIEWPORT_SETTLE_STRIP_THRESHOLD,
         )
         const layoutStable = previousLayout !== '' && previousLayout === layout
+        const motionStopped = !hasCssMotion && visuallyStable && layoutStable
 
         latest = screenshot
         latestHasWipe = hasWipe
-        stableSamples = !hasCssMotion && !hasWipe && visuallyStable && layoutStable ? stableSamples + 1 : 0
+        wipeHoldSamples = hasWipe && motionStopped ? wipeHoldSamples + 1 : 0
+        const wipeLooksLikeDesign = wipeHoldSamples >= VIEWPORT_WIPE_HOLD_SAMPLES
+        stableSamples = motionStopped && (!hasWipe || wipeLooksLikeDesign) ? stableSamples + 1 : 0
         previousSignature = signature
         previousLayout = layout
 
         if (stableSamples >= VIEWPORT_SETTLE_STABLE_SAMPLES) {
-            return { hasWipeArtifact: false, image: screenshot }
+            return { hasWipeArtifact: hasWipe && !wipeLooksLikeDesign, image: screenshot }
         }
 
         await page.waitForTimeout(VIEWPORT_SETTLE_POLL_MS)
     }
+
+    if (!latest) latest = await screenshotViewport(page, 'allow')
 
     return { hasWipeArtifact: latestHasWipe, image: latest }
 }
@@ -1116,7 +1135,7 @@ function maxStripDifference(left: Buffer, right: Buffer, width: number, height: 
  * @param height 指紋高度。
  * @returns 偵測到至少三條疑似 wipe 直條時為 true。
  */
-function looksLikeVerticalWipe(image: Buffer, width: number, height: number): boolean
+export function looksLikeVerticalWipe(image: Buffer, width: number, height: number): boolean
 {
     if (image.length !== width * height * 3) return false
 
@@ -1165,7 +1184,7 @@ function looksLikeVerticalWipe(image: Buffer, width: number, height: number): bo
  * @param width 區段寬度。
  * @returns 去掉重複前綴後的區段；沒有重複則原樣返回。
  */
-async function trimDuplicateScenePrefix(previous: Buffer, next: Buffer, width: number): Promise<Buffer>
+export async function trimDuplicateScenePrefix(previous: Buffer, next: Buffer, width: number): Promise<Buffer>
 {
     const previousMeta = await sharp(previous).metadata()
     const nextMeta = await sharp(next).metadata()
@@ -1227,26 +1246,84 @@ async function trimDuplicateScenePrefix(previous: Buffer, next: Buffer, width: n
 }
 
 /**
- * 計算一段 RGB 列資料的正規化變異數，用來略過純色留白。
+ * 判斷兩個虛擬畫布視窗是否仍停在同一張釘住的場景。只比頂部高細節區：
+ * 內容往上推的長畫布，後段頂部會對到前段中下部，不會被當成同一幕。
+ *
+ * @param previous 前一個已保留的完整視窗。
+ * @param next 目前完整視窗。
+ * @param width 區段寬度。
+ * @returns 頂部高變異內容仍是同一幕時為 true。
+ */
+export async function isSamePinnedScene(previous: Buffer, next: Buffer, width: number): Promise<boolean>
+{
+    const previousMeta = await sharp(previous).metadata()
+    const nextMeta = await sharp(next).metadata()
+    const previousHeight = previousMeta.height ?? 0
+    const nextHeight = nextMeta.height ?? 0
+
+    if (previousHeight < 80 || nextHeight < 80) return false
+
+    const scale = SETTLE_SIGNATURE_WIDTH / width
+    const previousRows = Math.max(1, Math.round(previousHeight * scale))
+    const nextRows = Math.max(1, Math.round(nextHeight * scale))
+    const windowRows = Math.max(8, Math.round(Math.min(previousRows, nextRows) * PINNED_SCENE_ROWS_RATIO))
+
+    if (windowRows > previousRows || windowRows > nextRows) return false
+
+    const previousSignature = await sharp(previous)
+        .resize(SETTLE_SIGNATURE_WIDTH, previousRows, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+    const nextSignature = await sharp(next)
+        .resize(SETTLE_SIGNATURE_WIDTH, nextRows, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+    const rowBytes = SETTLE_SIGNATURE_WIDTH * 3
+    const previousTop = previousSignature.subarray(0, windowRows * rowBytes)
+    const nextTop = nextSignature.subarray(0, windowRows * rowBytes)
+
+    if (rowSliceVariance(nextTop) < SCENE_TRIM_MIN_VARIANCE) return false
+
+    return visualDifference(previousTop, nextTop) <= PINNED_SCENE_THRESHOLD
+}
+
+/**
+ * 計算一段 RGB 列資料的空間變異。必須以像素為單位，不能把單一飽和色的
+ * R／G／B 通道差當成細節，否則純色區塊會被誤判成可裁的場景帶。
  *
  * @param slice 連續列的 RGB 資料。
- * @returns 介於 0 與 1 的平均變異。
+ * @returns 介於 0 與 1 的平均空間變異。
  */
-function rowSliceVariance(slice: Buffer): number
+export function rowSliceVariance(slice: Buffer): number
 {
-    if (slice.length === 0) return 0
+    if (slice.length < 3) return 0
 
-    let mean = 0
+    const pixels = Math.floor(slice.length / 3)
+    let meanRed = 0
+    let meanGreen = 0
+    let meanBlue = 0
 
-    for (const value of slice) mean += value
+    for (let index = 0; index < pixels * 3; index += 3) {
+        meanRed += slice[index] ?? 0
+        meanGreen += slice[index + 1] ?? 0
+        meanBlue += slice[index + 2] ?? 0
+    }
 
-    mean /= slice.length
+    meanRed /= pixels
+    meanGreen /= pixels
+    meanBlue /= pixels
 
     let total = 0
 
-    for (const value of slice) total += (value - mean) ** 2
+    for (let index = 0; index < pixels * 3; index += 3) {
+        total += ((slice[index] ?? 0) - meanRed) ** 2
+        total += ((slice[index + 1] ?? 0) - meanGreen) ** 2
+        total += ((slice[index + 2] ?? 0) - meanBlue) ** 2
+    }
 
-    return Math.sqrt(total / slice.length) / 255
+    return Math.sqrt(total / (pixels * 3)) / 255
 }
 
 /**
