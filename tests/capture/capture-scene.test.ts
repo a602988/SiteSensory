@@ -159,6 +159,51 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
         expect(await sampleRgb(trimmed!, 200, 200)).not.toEqual([248, 245, 239])
     })
 
+    it('trims a virtual-canvas wipe viewport stacked on its clean copy', async () => {
+        const page = await canvasWipeStackViewports()
+        const legacy = await legacyNarrowOffsetBeltTrim(page)
+        const trimmed = await trimRepeatedTailBand(page, WIDTH)
+        const legacyHeight = (await sharp(legacy).metadata()).height ?? 0
+        const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
+
+        expect(legacyHeight).toBe(3240)
+        expect(trimmedHeight).toBeLessThan(2400)
+        expect(trimmedHeight).toBeGreaterThan(1900)
+        expect(await sampleRgb(trimmed, 200, 200)).not.toEqual([255, 255, 255])
+        expect(await sampleRgb(trimmed, 200, 200)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 200, 1200)).not.toEqual([248, 245, 239])
+    })
+
+    it('trims a 12k canvas-style wipe stack in a few seconds', async () => {
+        const page = await tallCanvasWipeStack()
+        const started = Date.now()
+        const trimmed = await trimRepeatedTailBand(page, WIDTH)
+        const elapsed = Date.now() - started
+        const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
+
+        expect(elapsed).toBeLessThan(12_000)
+        expect(trimmedHeight).toBeLessThan(10_800)
+        expect(trimmedHeight).toBeGreaterThan(9000)
+        expect(await sampleRgb(trimmed, 200, 4200)).not.toEqual([255, 255, 255])
+        expect(await sampleRgb(trimmed, 200, 4200)).not.toEqual([248, 245, 239])
+    }, 20_000)
+
+    it('trims a live-like canvas extract: wipe viewport, clean copy, then a 18px foot belt', async () => {
+        const page = await liveLikeCanvasExtract()
+        const started = Date.now()
+        const trimmed = await trimRepeatedTailBand(page, WIDTH)
+        const elapsed = Date.now() - started
+        const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
+
+        expect(elapsed).toBeLessThan(8_000)
+        expect(trimmedHeight).toBeLessThan(2300)
+        expect(trimmedHeight).toBeGreaterThan(1900)
+        expect(await sampleRgb(trimmed, 200, 200)).not.toEqual([255, 255, 255])
+        expect(await sampleRgb(trimmed, 200, 200)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 1400, 1200)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 1400, trimmedHeight - 80)).toEqual([248, 245, 239])
+    })
+
     it('trims a left-photo wipe stack that sits under another portfolio card', async () => {
         const page = await portfolioStackedWipeCard()
         const legacy = await legacyNarrowOffsetBeltTrim(page)
@@ -282,6 +327,14 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
 
         await expect(isSamePinnedScene(first, second, WIDTH)).resolves.toBe(true)
         await expect(isSamePinnedScene(first, await solidPng('#22c55e', 1080), WIDTH)).resolves.toBe(false)
+    })
+
+    it('treats a wipe viewport and its clean copy as the same pinned scene', async () => {
+        const wipe = await canvasViewportCard({ wipe: true })
+        const clean = await canvasViewportCard({ wipe: false })
+
+        await expect(isSamePinnedScene(wipe, clean, WIDTH)).resolves.toBe(true)
+        await expect(isSamePinnedScene(wipe, await nextPhotoCardOnCream(), WIDTH)).resolves.toBe(false)
     })
 
     it('does not collapse a panned canvas whose top has moved to new content', async () => {
@@ -747,6 +800,43 @@ async function leftFestivalCardPng(options: { wipe?: boolean } = {}): Promise<Bu
     }
 
     return sharp(raw, { raw: { channels: 3, height: 640, width: WIDTH } }).png().toBuffer()
+}
+
+async function canvasViewportCard(options: { wipe?: boolean } = {}): Promise<Buffer>
+{
+    return stackPngs([
+        await leftFestivalCardPng({ wipe: options.wipe === true }),
+        await solidPng('#f8f5ef', 440),
+    ])
+}
+
+async function canvasWipeStackViewports(): Promise<Buffer>
+{
+    return stackPngs([
+        await canvasViewportCard({ wipe: true }),
+        await canvasViewportCard({ wipe: false }),
+        await nextPhotoCardOnCream(),
+    ])
+}
+
+async function tallCanvasWipeStack(): Promise<Buffer>
+{
+    return stackPngs([
+        await solidPng('#f8f5ef', 4000),
+        await canvasViewportCard({ wipe: true }),
+        await canvasViewportCard({ wipe: false }),
+        await nextPhotoCardOnCream(),
+        await solidPng('#f8f5ef', 4000),
+    ])
+}
+
+async function liveLikeCanvasExtract(): Promise<Buffer>
+{
+    return stackPngs([
+        await canvasViewportCard({ wipe: true }),
+        await canvasViewportCard({ wipe: false }),
+        await thinOffsetBeltCard(),
+    ])
 }
 
 async function portfolioStackedWipeCard(): Promise<Buffer>
