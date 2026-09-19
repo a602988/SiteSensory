@@ -43,7 +43,6 @@ const PHOTO_BELT_THIN_THRESHOLD = 0.02
 const PHOTO_BELT_THIN_PX = 36
 const PHOTO_CARD_WIPE_THRESHOLD = 0.04
 const WIPE_NEIGHBOR_MIN_LUMA = 20
-const WIPE_NEIGHBOR_MAX_LUMA = 195
 const WIPE_NEIGHBOR_MIN_CHROMA = 22
 const PHOTO_BELT_ABOVE_DELTA = 0.08
 const PHOTO_BELT_ALIGN_ROWS = 8
@@ -1314,17 +1313,7 @@ function countWipeSpikesInBand(image: Buffer, width: number, rowStart: number, r
         columnChroma[column] = total / rowCount
     }
 
-    const neighborIsPhoto = (column: number): boolean => {
-        const luma = columnMean[column] ?? 0
-        const chroma = columnChroma[column] ?? 0
-
-        if (luma >= PHOTO_WIPE_LUMA) return false
-        if (luma > WIPE_BAR_CONTENT_MIN_LUMINANCE && luma < WIPE_NEIGHBOR_MAX_LUMA) return true
-
-        return luma >= WIPE_NEIGHBOR_MIN_LUMA
-            && luma <= WIPE_BAR_CONTENT_MIN_LUMINANCE
-            && chroma >= WIPE_NEIGHBOR_MIN_CHROMA
-    }
+    const neighborChroma = (column: number): number => columnChroma[column] ?? 0
 
     let spikes = 0
 
@@ -1333,12 +1322,27 @@ function countWipeSpikesInBand(image: Buffer, width: number, rowStart: number, r
         const right = ((columnMean[column + 1] ?? 0) + (columnMean[column + 2] ?? 0)) / 2
         const neighborhood = (left + right) / 2
         const current = columnMean[column] ?? 0
+        const leftFar = columnMean[column - 2] ?? 0
+        const rightFar = columnMean[column + 2] ?? 0
+        const leftChroma = neighborChroma(column - 2)
+        const rightChroma = neighborChroma(column + 2)
         const classicInside = left > WIPE_BAR_CONTENT_MIN_LUMINANCE
             && left < WIPE_BAR_CONTENT_MAX_LUMINANCE
             && right > WIPE_BAR_CONTENT_MIN_LUMINANCE
             && right < WIPE_BAR_CONTENT_MAX_LUMINANCE
-        const photoInside = neighborIsPhoto(column - 2) && neighborIsPhoto(column + 2)
-        const sitsInsideContent = classicInside || photoInside
+        const brightPhotoInside = leftFar > WIPE_BAR_CONTENT_MAX_LUMINANCE
+            && leftFar < PHOTO_WIPE_LUMA
+            && rightFar > WIPE_BAR_CONTENT_MAX_LUMINANCE
+            && rightFar < PHOTO_WIPE_LUMA
+            && leftChroma >= WIPE_NEIGHBOR_MIN_CHROMA
+            && rightChroma >= WIPE_NEIGHBOR_MIN_CHROMA
+        const darkPhotoInside = leftFar >= WIPE_NEIGHBOR_MIN_LUMA
+            && leftFar <= WIPE_BAR_CONTENT_MIN_LUMINANCE
+            && rightFar >= WIPE_NEIGHBOR_MIN_LUMA
+            && rightFar <= WIPE_BAR_CONTENT_MIN_LUMINANCE
+            && leftChroma >= WIPE_NEIGHBOR_MIN_CHROMA
+            && rightChroma >= WIPE_NEIGHBOR_MIN_CHROMA
+        const sitsInsideContent = classicInside || brightPhotoInside || darkPhotoInside
 
         if (
             sitsInsideContent
