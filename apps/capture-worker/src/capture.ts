@@ -31,6 +31,7 @@ const STICKY_SIDE_MAX_WIDTH_RATIO = 0.4
 const STICKY_SIDE_MIN_HEIGHT_RATIO = 0.2
 const STICKY_CHROME_SIDE_MAX_PX = 80
 const SCENE_TRIM_MAX_RATIO = 0.8
+const SCENE_TRIM_CONTINUE_RATIO = 0.75
 const SCENE_TRIM_MIN_VARIANCE = 0.02
 const SCENE_TRIM_THRESHOLD = 0.015
 const PINNED_SCENE_THRESHOLD = 0.04
@@ -1179,7 +1180,9 @@ export function looksLikeVerticalWipe(image: Buffer, width: number, height: numb
 
 /**
  * 去掉後段開頭與前一段內容重複的捲動場景。sticky 面板停在視窗上方時，
- * 幾何裁切後仍會再寫入同一張照片。純色底不裁，以免把留白誤刪。
+ * 幾何裁切後仍會再寫入同一張照片。純色底不裁，以免把留白誤刪。後段幾乎
+ * 整段都還是同一幕時視為預留高度的延續，不裁，以免滿 viewport 的 sticky
+ * 場景被削短。
  *
  * @param previous 前一個已保留區段。
  * @param next 目前區段。
@@ -1232,6 +1235,8 @@ export async function trimDuplicateScenePrefix(previous: Buffer, next: Buffer, w
 
         matchedRows = start + windowRows
     }
+
+    if (nextRows > 0 && matchedRows / nextRows >= SCENE_TRIM_CONTINUE_RATIO) return next
 
     const trimPx = Math.min(Math.round(matchedRows / scale), Math.floor(nextHeight * SCENE_TRIM_MAX_RATIO))
 

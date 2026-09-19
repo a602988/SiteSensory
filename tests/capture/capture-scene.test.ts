@@ -36,6 +36,18 @@ describe('capture scene heuristics', () => {
         expect(channelSpreadVariance(await rawWindow(next, 864))).toBeGreaterThan(0.2)
     })
 
+    it('keeps a continuing high-detail scene that fills reserved height', async () => {
+        const scene = await panelPng('#315ceb', 864)
+        const previous = await stackPngs([
+            await solidPng('#f2efe8', 216),
+            scene,
+        ])
+        const trimmed = await trimDuplicateScenePrefix(previous, scene, WIDTH)
+        const metadata = await sharp(trimmed).metadata()
+
+        expect(metadata.height).toBe(864)
+    })
+
     it('trims a repeated high-detail sticky band from the next segment', async () => {
         const band = await stripePng(400)
         const previous = await stackPngs([
@@ -123,6 +135,25 @@ async function solidPng(color: string, height: number): Promise<Buffer>
             width: WIDTH,
         },
     }).png().toBuffer()
+}
+
+async function panelPng(color: string, height: number): Promise<Buffer>
+{
+    const raw = Buffer.alloc(WIDTH * height * 3)
+    const fill = color === '#315ceb' ? [49, 92, 235] : [34, 197, 94]
+
+    for (let row = 0; row < height; row += 1) {
+        for (let column = 0; column < WIDTH; column += 1) {
+            const index = (row * WIDTH + column) * 3
+            const inset = column >= 120 && column < WIDTH - 120
+
+            raw[index] = inset ? fill[0] : 242
+            raw[index + 1] = inset ? fill[1] : 239
+            raw[index + 2] = inset ? fill[2] : 232
+        }
+    }
+
+    return sharp(raw, { raw: { channels: 3, height, width: WIDTH } }).png().toBuffer()
 }
 
 async function stripePng(height: number): Promise<Buffer>
