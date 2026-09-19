@@ -1807,11 +1807,10 @@ function findRepeatCut(
                 lowerPair,
                 PHOTO_BELT_SIGNATURE_WIDTH,
             )
-            const viewportPeriod = false
             const upperHasWipe = cardScale
                 && looksLikeVerticalWipe(upperSlice, PHOTO_BELT_SIGNATURE_WIDTH, bandRows)
             const pairLimit = cardScale
-                ? (upperHasWipe || viewportPeriod ? PHOTO_CARD_WIPE_THRESHOLD : 0.025)
+                ? (upperHasWipe ? PHOTO_CARD_WIPE_THRESHOLD : 0.025)
                 : (bandPx < PHOTO_BELT_THIN_PX ? PHOTO_BELT_THIN_THRESHOLD : PHOTO_BELT_THRESHOLD)
 
             if (pairDifference > pairLimit) continue
@@ -1828,7 +1827,7 @@ function findRepeatCut(
             let aboveIsPage = false
 
             if (nothingAbove) {
-                if (!(cardScale && (upperHasWipe || viewportPeriod))) continue
+                if (!(cardScale && upperHasWipe)) continue
             }
             else {
                 const aboveStart = Math.max(0, bestUpper - bandRows)
@@ -1846,7 +1845,7 @@ function findRepeatCut(
                     )
                     : 0
 
-                if (cardScale && !aboveIsPage && !upperHasWipe && !viewportPeriod) continue
+                if (cardScale && !aboveIsPage && !upperHasWipe) continue
 
                 if (aboveIsPage && !cardScale) continue
 
@@ -2314,30 +2313,6 @@ export async function isSamePinnedScene(previous: Buffer, next: Buffer, width: n
     if (masked <= PINNED_MASKED_SAME_THRESHOLD && visual >= PINNED_SCENE_THRESHOLD) return true
 
     return visual <= PINNED_SCENE_THRESHOLD
-}
-
-/**
- * 用 settle 解析度判斷一個虛擬畫布視窗是否還帶 wipe。stitch 時若前一
- * 幀是 wipe、下一幀已是同一幕的乾淨畫面，要留下乾淨的那張。
- *
- * @param image PNG。
- * @param width 寬度。
- * @returns 指紋上看起來像垂直 wipe 時為 true。
- */
-async function viewportLooksLikeWipe(image: Buffer, width: number): Promise<boolean>
-{
-    const height = (await sharp(image).metadata()).height ?? 0
-
-    if (height < 80) return false
-
-    const rows = Math.max(8, Math.round(height * PHOTO_BELT_SIGNATURE_WIDTH / width))
-    const signature = await sharp(image)
-        .resize(PHOTO_BELT_SIGNATURE_WIDTH, rows, { fit: 'fill' })
-        .removeAlpha()
-        .raw()
-        .toBuffer()
-
-    return looksLikeVerticalWipe(signature, PHOTO_BELT_SIGNATURE_WIDTH, rows)
 }
 
 /**
