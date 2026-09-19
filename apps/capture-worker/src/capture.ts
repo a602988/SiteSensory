@@ -32,8 +32,13 @@ const STICKY_SIDE_MIN_HEIGHT_RATIO = 0.2
 const STICKY_CHROME_SIDE_MAX_PX = 80
 const SCENE_TRIM_MAX_RATIO = 0.8
 const SCENE_TRIM_CONTINUE_RATIO = 0.75
+const SCENE_TRIM_SCRAP_RATIO = 0.35
 const SCENE_TRIM_MIN_VARIANCE = 0.02
 const SCENE_TRIM_THRESHOLD = 0.015
+const SCENE_TAIL_BAND_RATIO = 0.22
+const NUDGE_RATIOS = [0.12, 0.22, 0.34]
+const NUDGE_PEEK_MS = 350
+const VIEWPORT_LOCKED_WIPE_SAMPLES = 8
 const PINNED_SCENE_THRESHOLD = 0.04
 const PINNED_SCENE_ROWS_RATIO = 0.35
 const WIPE_BAR_MIN_COUNT = 3
@@ -153,7 +158,9 @@ export async function capturePage(options: CaptureOptions): Promise<CapturedPage
         }
 
         const hero = await settleVisibleViewport(page)
-        const viewportBuffer = hero.image
+        const viewportBuffer = hero.hasWipeArtifact
+            ? (await nudgeForCleanViewport(page, 0))?.image ?? hero.image
+            : hero.image
         const fullPageBuffer = await captureFullPage(page)
         const finalUrl = normalizeUrl(page.url())
         const [viewport, fullPage] = await Promise.all([
@@ -304,7 +311,18 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             document.documentElement.toggleAttribute(hideFixedAttribute, scrollTop > 0)
             window.scrollTo(0, scrollTop)
         }, { hideFixedAttribute: HIDE_FIXED_ATTRIBUTE, scrollTop: target })
-        const settled = await settleVisibleViewport(page)
+        let settled = await settleVisibleViewport(page)
+
+        if (settled.hasWipeArtifact) {
+            const clean = await nudgeForCleanViewport(page, target)
+
+            if (clean && hasVirtualCanvas) {
+                settled = clean
+            }
+            else {
+                continue
+            }
+        }
 
         let actualScroll = await page.evaluate(() => Math.round(window.scrollY))
 
@@ -327,13 +345,8 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             throw new Error(`無法擷取頁面 ${target}px 到 ${target + dimensions.viewportHeight}px 的區段`)
         }
 
-        if (hasVirtualCanvas && settled.hasWipeArtifact) {
-            documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
-            continue
-        }
-
         const viewport = settled.image
-        let segment = await sharp(viewport)
+        let segment: Buffer | null = await sharp(viewport)
             .extract({
                 height: segmentHeight,
                 left: 0,
@@ -346,8 +359,17 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             const previous = keptSegments.at(-1)
 
             if (previous) {
-                segment = Buffer.from(await trimDuplicateScenePrefix(previous, segment, dimensions.width))
+                segment = await trimDuplicateScenePrefix(previous, segment, dimensions.width)
             }
+        }
+
+        if (segment) {
+            segment = await trimRepeatedTailBand(segment, dimensions.width)
+        }
+
+        if (!segment) {
+            documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
+            continue
         }
 
         const trimmedMeta = await sharp(segment).metadata()
@@ -937,7 +959,8 @@ async function dismissAndHideOverlaysInPage(options: {
  * 細條 wipe／遮罩仍在移動，並比對大型可見元素的 opacity、transform、
  * clip-path。CSS／WAAPI 有限次動畫仍要等完；無限循環動畫不列入。
  * 直條若貫穿整段指紋且連續穩定超過設計停留門檻，視為版面線條而非
- * wipe。只打在照片帶上的直條即使停住也不當設計。逾時後保存當時畫面。
+ * wipe。只打在照片帶上的直條若連續穩定，視為跟捲動綁死的半完成揭示，
+ * 提早結束 settle，交給呼叫端微移或略過，不可把逾時垃圾寫進成品。
  * 不使用 prefers-reduced-motion。
  *
  * @param page 已捲到目標位置的 Playwright 頁面。
@@ -986,9 +1009,16 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
         latestHasWipe = hasWipe
         wipeHoldSamples = hasWipe && motionStopped ? wipeHoldSamples + 1 : 0
         const wipeLooksLikeDesign = pageLevelWipe && wipeHoldSamples >= VIEWPORT_WIPE_HOLD_SAMPLES
+        const wipeLooksLocked = hasWipe && !pageLevelWipe && motionStopped
+            && wipeHoldSamples >= VIEWPORT_LOCKED_WIPE_SAMPLES
+
         stableSamples = motionStopped && (!hasWipe || wipeLooksLikeDesign) ? stableSamples + 1 : 0
         previousSignature = signature
         previousLayout = layout
+
+        if (wipeLooksLocked) {
+            return { hasWipeArtifact: true, image: screenshot }
+        }
 
         if (stableSamples >= VIEWPORT_SETTLE_STABLE_SAMPLES) {
             return { hasWipeArtifact: hasWipe && !wipeLooksLikeDesign, image: screenshot }
@@ -1000,6 +1030,49 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
     if (!latest) latest = await screenshotViewport(page, 'allow')
 
     return { hasWipeArtifact: latestHasWipe, image: latest }
+}
+
+/**
+ * 半完成 wipe 若跟捲動進度綁死，再等也不會結束。往後微移幾個位置，
+ * 找到沒有 wipe 的視窗就採用；都找不到則放棄該幀。
+ *
+ * @param page Playwright 頁面。
+ * @param target 原本的擷取捲動位置。
+ * @returns 乾淨視窗；找不到時為 null。
+ */
+async function nudgeForCleanViewport(
+    page: import('playwright').Page,
+    target: number,
+): Promise<{ hasWipeArtifact: boolean, image: Buffer } | null>
+{
+    const limits = await page.evaluate(() => ({
+        maxScroll: Math.max(
+            Math.max(document.body.scrollHeight, document.documentElement.scrollHeight) - window.innerHeight,
+            0,
+        ),
+        viewportHeight: window.innerHeight,
+    }))
+
+    for (const ratio of NUDGE_RATIOS) {
+        const nextTop = Math.min(target + Math.round(limits.viewportHeight * ratio), limits.maxScroll)
+
+        if (nextTop <= target) continue
+
+        await page.evaluate(scrollTop => window.scrollTo(0, scrollTop), nextTop)
+        await page.waitForTimeout(NUDGE_PEEK_MS)
+        await page.evaluate(() => new Promise<void>(resolve => {
+            requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+        }))
+
+        const image = await screenshotViewport(page, 'allow')
+        const signature = await createSettleSignature(image)
+
+        if (!looksLikeVerticalWipe(signature, SETTLE_SIGNATURE_WIDTH, SETTLE_SIGNATURE_HEIGHT)) {
+            return { hasWipeArtifact: false, image }
+        }
+    }
+
+    return null
 }
 
 /**
@@ -1237,9 +1310,10 @@ function countWipeSpikesInBand(image: Buffer, width: number, rowStart: number, r
  * @param previous 前一個已保留區段。
  * @param next 目前區段。
  * @param width 區段寬度。
- * @returns 去掉重複前綴後的區段；沒有重複則原樣返回。
+ * @returns 去掉重複前綴後的區段；沒有重複則原樣返回；只剩同一張照片的
+ * 邊角碎帶時為 null，呼叫端應略過該段。
  */
-export async function trimDuplicateScenePrefix(previous: Buffer, next: Buffer, width: number): Promise<Buffer>
+export async function trimDuplicateScenePrefix(previous: Buffer, next: Buffer, width: number): Promise<Buffer | null>
 {
     const previousMeta = await sharp(previous).metadata()
     const nextMeta = await sharp(next).metadata()
@@ -1286,17 +1360,91 @@ export async function trimDuplicateScenePrefix(previous: Buffer, next: Buffer, w
         matchedRows = start + windowRows
     }
 
-    if (nextRows > 0 && matchedRows / nextRows >= SCENE_TRIM_CONTINUE_RATIO) return next
+    if (nextRows > 0 && matchedRows / nextRows >= SCENE_TRIM_CONTINUE_RATIO) {
+        return isVerticallyUniformScene(nextSignature, nextRows) ? next : null
+    }
 
     const trimPx = Math.min(Math.round(matchedRows / scale), Math.floor(nextHeight * SCENE_TRIM_MAX_RATIO))
 
     if (trimPx <= 8 || trimPx >= nextHeight) return next
+
+    if (nextHeight - trimPx <= nextHeight * SCENE_TRIM_SCRAP_RATIO) return null
 
     return sharp(next)
         .extract({
             height: nextHeight - trimPx,
             left: 0,
             top: trimPx,
+            width,
+        })
+        .toBuffer()
+}
+
+/**
+ * 去掉同一區段底部與上方內容重複的照片帶。拼接或遮罩揭示常會把同一條
+ * 照片再寫一次，形成底部五分之一的重複腰帶。
+ *
+ * @param image 已擷取區段。
+ * @param width 區段寬度。
+ * @returns 去掉重複尾帶後的區段；沒有重複則原樣返回。
+ */
+/**
+ * 判斷區段是否上下幾乎同一種畫面。滿 viewport 的 sticky 色塊或直條紋
+ * 是延續預留高度；上下內容不同的照片卡若整段重複則應丟掉。
+ *
+ * @param signature 區段縮圖 RGB。
+ * @param rows 縮圖列數。
+ * @returns 頂部與底部高細節帶很接近時為 true。
+ */
+function isVerticallyUniformScene(signature: Buffer, rows: number): boolean
+{
+    const rowBytes = SETTLE_SIGNATURE_WIDTH * 3
+    const windowRows = Math.min(8, rows)
+
+    if (windowRows < 4) return true
+
+    const top = signature.subarray(0, windowRows * rowBytes)
+    const bottom = signature.subarray((rows - windowRows) * rowBytes, rows * rowBytes)
+
+    if (rowSliceVariance(top) < SCENE_TRIM_MIN_VARIANCE) return true
+
+    return visualDifference(top, bottom) <= SCENE_TRIM_THRESHOLD * 2
+}
+
+export async function trimRepeatedTailBand(image: Buffer, width: number): Promise<Buffer>
+{
+    const metadata = await sharp(image).metadata()
+    const height = metadata.height ?? 0
+    const band = Math.max(40, Math.round(height * SCENE_TAIL_BAND_RATIO))
+
+    if (height < band * 2 + 40) return image
+
+    const tail = await sharp(image)
+        .extract({ height: band, left: 0, top: height - band, width })
+        .toBuffer()
+    const above = await sharp(image)
+        .extract({ height: band, left: 0, top: height - band * 2, width })
+        .toBuffer()
+    const rows = Math.max(8, Math.round(band * SETTLE_SIGNATURE_WIDTH / width))
+    const tailSignature = await sharp(tail)
+        .resize(SETTLE_SIGNATURE_WIDTH, rows, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+    const aboveSignature = await sharp(above)
+        .resize(SETTLE_SIGNATURE_WIDTH, rows, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+
+    if (rowSliceVariance(tailSignature) < SCENE_TRIM_MIN_VARIANCE) return image
+    if (visualDifference(tailSignature, aboveSignature) > SCENE_TRIM_THRESHOLD) return image
+
+    return sharp(image)
+        .extract({
+            height: height - band,
+            left: 0,
+            top: 0,
             width,
         })
         .toBuffer()

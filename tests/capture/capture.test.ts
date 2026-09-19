@@ -135,6 +135,37 @@ describe('capture worker', { timeout: 60_000 }, () => {
         expect(await samplePixel(fullPage, 200, 1500)).toEqual([34, 197, 94])
     })
 
+    it('does not publish a scroll-locked wipe after settle timeout', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?lockedWipe=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+
+        expect(await samplePixel(fullPage, 200, 1260)).toEqual([34, 197, 94])
+        expect(await samplePixel(fullPage, 200, 1260)).not.toEqual([255, 255, 255])
+        expect(await samplePixel(fullPage, 200, 1500)).toEqual([34, 197, 94])
+    })
+
+    it('does not stitch a leftover horizontal photo belt', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?photoBelt=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+
+        expect(await samplePixel(fullPage, 960, 1200)).toEqual([34, 197, 94])
+        expect(await samplePixel(fullPage, 960, 2100)).toEqual([49, 92, 235])
+        expect(await samplePixel(fullPage, 960, 2100)).not.toEqual([34, 197, 94])
+        expect(await samplePixel(fullPage, 960, 2100)).not.toEqual([21, 128, 61])
+    })
+
     it('waits for the hero reveal after returning to the top', async () => {
         const storage = createLocalObjectStorage(storageRoot)
         const result = await capturePage({
@@ -431,6 +462,8 @@ function createFixtureServer(): Server
         const stickySidebar = parameters.has('stickySidebar')
         const stickyScene = parameters.has('stickyScene')
         const pinnedCanvas = parameters.has('pinnedCanvas')
+        const lockedWipe = parameters.has('lockedWipe')
+        const photoBelt = parameters.has('photoBelt')
 
         if (cookies) {
             const html = `<!doctype html>
@@ -660,6 +693,65 @@ addEventListener('scroll',()=>{
 <section style="height:2500px;background:#f8f5ef">
 <div style="position:sticky;top:0;height:400px;background-image:repeating-linear-gradient(90deg,#22c55e 0 40px,#15803d 40px 80px)"></div>
 </section>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (lockedWipe) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Locked Wipe Fixture</title></head>
+<body style="margin:0;background:#f5f5f7">
+<section style="height:1080px;background:#315ceb"></section>
+<section id="scene" style="height:1080px;background:#f5f5f7;position:relative">
+<div id="photo" style="position:absolute;left:80px;top:120px;width:820px;height:520px;background:#22c55e;overflow:hidden">
+<div id="wipes" style="position:absolute;left:0;right:0;top:0;height:140px"></div>
+</div>
+</section>
+<script>
+const paint=show=>{
+    const wipes=document.querySelector('#wipes')
+    if(show){
+        if(wipes.dataset.on==='1') return
+        wipes.dataset.on='1'
+        wipes.innerHTML=''
+        for(let i=0;i<8;i+=1){
+            const bar=document.createElement('div')
+            bar.style.cssText='position:absolute;top:0;bottom:0;width:16px;background:#fff;left:'+(40+i*48)+'px'
+            wipes.appendChild(bar)
+        }
+        return
+    }
+    wipes.dataset.on=''
+    wipes.innerHTML=''
+}
+const sync=()=>paint((scrollY-680)/400<0.85)
+addEventListener('scroll',sync)
+sync()
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (photoBelt) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Photo Belt Fixture</title></head>
+<body style="margin:0">
+<section style="height:1080px;background:#f8f5ef"></section>
+<section style="height:900px;background:#f8f5ef">
+<div style="position:sticky;top:0;height:800px">
+<div style="height:400px;background:#22c55e"></div>
+<div style="height:400px;background-image:repeating-linear-gradient(90deg,#22c55e 0 40px,#15803d 40px 80px)"></div>
+</div>
+</section>
+<section style="height:1080px;background:#315ceb"></section>
 </body></html>`
 
             response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })

@@ -7,6 +7,7 @@ import {
     looksLikeVerticalWipe,
     rowSliceVariance,
     trimDuplicateScenePrefix,
+    trimRepeatedTailBand,
 } from '../../apps/capture-worker/src/capture.js'
 
 const WIDTH = 1920
@@ -47,6 +48,29 @@ describe('capture scene heuristics', () => {
         const metadata = await sharp(trimmed).metadata()
 
         expect(metadata.height).toBe(864)
+    })
+
+    it('drops a leftover scrap after a mostly-duplicate photo segment', async () => {
+        const photo = await stackPngs([
+            await stripePng(400),
+            await panelPng('#315ceb', 464),
+        ])
+
+        await expect(trimDuplicateScenePrefix(photo, photo, WIDTH)).resolves.toBeNull()
+    })
+
+    it('trims a repeated horizontal photo belt from the bottom of one segment', async () => {
+        const belt = await stripePng(200)
+        const stacked = await stackPngs([
+            await solidPng('#f8f5ef', 400),
+            belt,
+            belt,
+        ])
+        const trimmed = await trimRepeatedTailBand(stacked, WIDTH)
+        const metadata = await sharp(trimmed).metadata()
+
+        expect(metadata.height).toBe(624)
+        expect(await sampleRgb(trimmed, 20, 500)).toEqual([34, 197, 94])
     })
 
     it('trims a repeated high-detail sticky band from the next segment', async () => {
