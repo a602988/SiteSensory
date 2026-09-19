@@ -1550,7 +1550,7 @@ async function trimOnePhotoBelt(
     const cardCut = height > PHOTO_BELT_REFERENCE_HEIGHT
         ? findRepeatCut(
             coarseContext,
-            PHOTO_CARD_RATIOS.filter(ratio => ratio < 0.95),
+            PHOTO_CARD_RATIOS.filter(ratio => options.viewportTiles === true || ratio < 0.95),
             true,
         )
         : null
@@ -1660,9 +1660,11 @@ type RepeatScanContext = {
 }
 
 /**
- * 虛擬畫布成品是整張 1080 視窗相疊。先比相鄰 viewport 磚，不依賴滑動
- * 掃描一定抓到 wipe：wipe 幀與乾淨幀用遮罩差即可認出，即使粗指紋
- * 條紋偵測沒過。這才能裁掉作品集中段「上一張卡 + wipe 視窗 + 乾淨視窗」。
+ * 虛擬畫布成品常是整張 1080 視窗相疊，但前一刀若已切掉非整數視窗
+ * （live 14040→13598），堆疊就不再落在 0／1080／2160。只比對齊磚會
+ * 完全錯過 y3822 這種中段 wipe→乾淨。先走對齊磚（快），沒命中再滑動
+ * 一個 viewport，並用左／右半幅比照片（左圖右文或右圖左文），不要求
+ * 整磚近白或一定掃到三條 wipe。
  *
  * @param context 粗指紋。
  * @returns 要裁掉的那一磚；找不到則為 null。
@@ -1671,53 +1673,129 @@ function findViewportTileCut(
     context: RepeatScanContext,
 ): { cutHeight: number, cutStart: number } | null
 {
+    return scanViewportTiles(context, 'aligned') ?? scanViewportTiles(context, 'slide')
+}
+
+/**
+ * 掃描相鄰 1080 視窗。aligned 只踩 0／1080／2160；slide 以約 20px
+ * 步進，才能對上已被切過、不再對齊 viewport 的成品。
+ *
+ * @param context 粗指紋。
+ * @param mode 對齊磚或滑動。
+ * @returns 要裁掉的那一磚；找不到則為 null。
+ */
+function scanViewportTiles(
+    context: RepeatScanContext,
+    mode: 'aligned' | 'slide',
+): { cutHeight: number, cutStart: number } | null
+{
     const { height, reference, rowBytes, scale, signature, signatureHeight } = context
     const tileRows = Math.max(16, Math.round(reference / scale))
 
     if (signatureHeight < tileRows * 2) return null
 
-    for (let upper = 0; upper + tileRows * 2 <= signatureHeight; upper += tileRows) {
+    const step = mode === 'aligned' ? tileRows : 4
+    const pairRows = Math.max(8, Math.round(tileRows * 0.62))
+    const pairOffset = (tileRows - pairRows) * rowBytes
+    let cutStart = -1
+    let cutHeight = 0
+    let cutDifference = 1
+    let cutHadWipe = false
+
+    for (let upper = 0; upper + tileRows * 2 <= signatureHeight; upper += step) {
         const lower = upper + tileRows
         const upperSlice = signature.subarray(upper * rowBytes, (upper + tileRows) * rowBytes)
         const lowerSlice = signature.subarray(lower * rowBytes, (lower + tileRows) * rowBytes)
 
-        if (contentPixelVariance(lowerSlice) < 0.05) continue
-        if (interiorContentVariance(lowerSlice, rowBytes) < 0.03) continue
-        if (
-            interiorContentVariance(upperSlice, rowBytes) < 0.03
-            && !looksLikeVerticalWipe(upperSlice, PHOTO_BELT_SIGNATURE_WIDTH, tileRows)
-        ) {
-            continue
-        }
+        if (contentPixelVariance(lowerSlice) < 0.04) continue
+        if (interiorContentVariance(lowerSlice, rowBytes) < 0.025) continue
 
-        const pairRows = Math.max(8, Math.round(tileRows * 0.7))
-        const pairOffset = (tileRows - pairRows) * rowBytes
-        const pairDifference = contentMaskedDifference(
+        const cheapPair = sampledContentDifference(
             upperSlice.subarray(pairOffset),
             lowerSlice.subarray(pairOffset),
             PHOTO_BELT_SIGNATURE_WIDTH,
         )
-        const fullDifference = contentMaskedDifference(
+
+        if (cheapPair > VIEWPORT_TILE_THRESHOLD + 0.05) continue
+
+        const upperInterior = interiorContentVariance(upperSlice, rowBytes)
+        const upperHasWipe = upperInterior < 0.025 || cheapPair > PHOTO_CARD_WIPE_THRESHOLD
+            ? looksLikeVerticalWipe(upperSlice, PHOTO_BELT_SIGNATURE_WIDTH, tileRows)
+            : false
+
+        if (upperInterior < 0.025 && !upperHasWipe) continue
+
+        const pairDifference = sceneBandDifference(
+            upperSlice.subarray(pairOffset),
+            lowerSlice.subarray(pairOffset),
+            PHOTO_BELT_SIGNATURE_WIDTH,
+        )
+        const fullDifference = sceneBandDifference(
             upperSlice,
             lowerSlice,
             PHOTO_BELT_SIGNATURE_WIDTH,
         )
-        const upperHasWipe = looksLikeVerticalWipe(
-            upperSlice,
-            PHOTO_BELT_SIGNATURE_WIDTH,
-            tileRows,
+        const bestDifference = Math.min(pairDifference, fullDifference)
+
+        if (bestDifference > VIEWPORT_TILE_THRESHOLD) continue
+
+        const candidateStart = Math.round(upper * scale)
+        const candidateHeight = Math.min(
+            Math.round(tileRows * scale),
+            height - candidateStart,
         )
-        const tileLimit = upperHasWipe ? PHOTO_CARD_WIPE_THRESHOLD : VIEWPORT_TILE_THRESHOLD
 
-        if (pairDifference > tileLimit && fullDifference > tileLimit) continue
-
-        return {
-            cutHeight: Math.min(Math.round(tileRows * scale), height - Math.round(upper * scale)),
-            cutStart: Math.round(upper * scale),
+        if (mode === 'aligned') {
+            return {
+                cutHeight: candidateHeight,
+                cutStart: candidateStart,
+            }
         }
+
+        const preferWipe = upperHasWipe && !cutHadWipe
+        const betterDiff = bestDifference < cutDifference - 0.002
+        const similarEarlier = Math.abs(bestDifference - cutDifference) <= 0.002
+            && (cutStart < 0 || candidateStart < cutStart)
+
+        if (preferWipe || betterDiff || similarEarlier || cutStart < 0) {
+            cutDifference = bestDifference
+            cutHadWipe = cutHadWipe || upperHasWipe
+            cutStart = candidateStart
+            cutHeight = candidateHeight
+        }
+
+        if (cutDifference < 0.004 && cutHadWipe) break
     }
 
-    return null
+    if (cutStart < 0 || cutHeight < PHOTO_BELT_MIN_CUT) return null
+
+    return {
+        cutHeight,
+        cutStart,
+    }
+}
+
+/**
+ * 整幅、左半、右半的遮罩差取最小。作品集卡照片只在一側，另一側近白
+ * 會讓全幅差被留白稀釋或抬高；半幅才能對上 live 左圖／右圖。
+ *
+ * @param left 上帶。
+ * @param right 下帶。
+ * @param width 指紋寬度。
+ * @returns 介於 0 與 1 的最小內容差。
+ */
+function sceneBandDifference(left: Buffer, right: Buffer, width: number): number
+{
+    const full = contentMaskedDifference(left, right, width)
+    const half = Math.floor(width / 2)
+    const leftHalf = contentMaskedDifference(left, right, width, 0, half)
+    const rightHalf = contentMaskedDifference(left, right, width, half, width)
+    let best = full
+
+    if (leftHalf < best) best = leftHalf
+    if (rightHalf < best) best = rightHalf
+
+    return best
 }
 
 /**
@@ -1916,7 +1994,9 @@ function findRepeatCut(
 
 /**
  * 用一維列指紋找 12–36px 細帶。14k 長圖上若再做 2px／列的二維對齊
- * 掃描會跑數分鐘，列比對只要幾百萬次運算。
+ * 掃描會跑數分鐘，列比對只要幾百萬次運算。暗照片腳帶若底下已是頁面
+ * 留白，不再要求與上方 luma 差 ≥ 0.02，但上方探測區必須仍是有空間
+ * 變異的照片，以免裁掉平面色塊。
  *
  * @param context 細指紋。
  * @returns 裁切起點與高度；找不到則為 null。
@@ -2013,9 +2093,8 @@ function findThinBelt1D(
                 Math.min(period, aboveRows),
             )
 
-            if (aboveDifference < 0.02) continue
-
             const belowStart = lower + period
+            let belowIsPage = belowStart >= signatureHeight
 
             if (belowStart < signatureHeight) {
                 const belowRows = Math.min(period, signatureHeight - belowStart)
@@ -2025,11 +2104,28 @@ function findThinBelt1D(
                     if (!content[row]) belowPage += 1
                 }
 
-                if (belowPage < belowRows * 0.5) {
+                belowIsPage = belowPage >= belowRows * 0.5
+
+                if (!belowIsPage) {
                     const belowDifference = windowDifference(lower, belowStart, belowRows)
 
                     if (belowDifference < PHOTO_BELT_ABOVE_DELTA) continue
                 }
+            }
+
+            if (aboveDifference < 0.02) {
+                if (!belowIsPage) continue
+
+                // 暗腳帶與上方暗內容的 1D luma 常幾乎一樣；底下已是留白時
+                // 仍可能是接縫複本。平面色塊（綠卡腳）上方探測沒有照片
+                // 空間變異，不可裁。
+                const probeStart = Math.max(0, lower - period - Math.max(16, period * 3))
+                const probeSlice = signature.subarray(
+                    probeStart * rowBytes,
+                    (lower - period) * rowBytes,
+                )
+
+                if (contentPixelVariance(probeSlice) < 0.03) continue
             }
 
             const candidateStart = Math.round(lower * scale)
@@ -2117,17 +2213,31 @@ function sampledContentDifference(left: Buffer, right: Buffer, width: number): n
  * @param left 第一段。
  * @param right 第二段。
  * @param width 指紋寬度；大於 0 時略過 wipe 欄。
+ * @param columnStart 只比這欄之後（含）。
+ * @param columnEnd 只比這欄之前。
  * @returns 介於 0 與 1 的內容差異；內容太少時為 1。
  */
-function contentMaskedDifference(left: Buffer, right: Buffer, width = 0): number
+function contentMaskedDifference(
+    left: Buffer,
+    right: Buffer,
+    width = 0,
+    columnStart = 0,
+    columnEnd = 0,
+): number
 {
     if (left.length !== right.length || left.length < 3) return 1
 
     if (width > 0 && left.length % (width * 3) !== 0) return 1
 
+    const lastColumn = columnEnd > 0 ? columnEnd : width > 0 ? width : 0
     const differences: number[] = []
 
     for (let index = 0; index < left.length; index += 3) {
+        if (width > 0) {
+            const column = (index / 3) % width
+
+            if (column < columnStart || column >= lastColumn) continue
+        }
         const leftLuma = 0.299 * (left[index] ?? 0)
             + 0.587 * (left[index + 1] ?? 0)
             + 0.114 * (left[index + 2] ?? 0)
@@ -2158,7 +2268,10 @@ function contentMaskedDifference(left: Buffer, right: Buffer, width = 0): number
         differences.push(pixel)
     }
 
-    if (differences.length < left.length / 3 * 0.08) return 1
+    const examinedColumns = lastColumn > columnStart ? lastColumn - columnStart : width
+    const columnFactor = width > 0 ? examinedColumns / width : 1
+
+    if (differences.length < left.length / 3 * 0.08 * columnFactor) return 1
 
     differences.sort((leftValue, rightValue) => leftValue - rightValue)
 
