@@ -38,6 +38,7 @@ const VIEWPORT_SETTLE_THRESHOLD = 0.004
 const VIEWPORT_SETTLE_STRIP_THRESHOLD = 0.025
 const SETTLE_SIGNATURE_HEIGHT = 108
 const SETTLE_SIGNATURE_WIDTH = 192
+const SCREENSHOT_TIMEOUT_MS = 120_000
 
 export type CaptureOptions = {
     allowLocalNetwork?: boolean
@@ -135,7 +136,7 @@ export async function capturePage(options: CaptureOptions): Promise<CapturedPage
         }
 
         await waitForVisibleViewportToSettle(page)
-        const viewportBuffer = await page.screenshot({ animations: 'disabled', fullPage: false, type: 'png' })
+        const viewportBuffer = await screenshotViewport(page, 'disabled')
         const fullPageBuffer = await captureFullPage(page)
         const finalUrl = normalizeUrl(page.url())
         const [viewport, fullPage] = await Promise.all([
@@ -308,7 +309,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             throw new Error(`無法擷取頁面 ${target}px 到 ${target + dimensions.viewportHeight}px 的區段`)
         }
 
-        const viewport = await page.screenshot({ animations: 'disabled', fullPage: false, type: 'png' })
+        const viewport = await screenshotViewport(page, 'disabled')
         const segment = await sharp(viewport)
             .extract({
                 height: segmentHeight,
@@ -868,7 +869,7 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
     while (Date.now() < deadline) {
         const hasCssMotion = await hasFiniteViewportAnimations(page)
         const layout = await readViewportLayoutState(page)
-        const screenshot = await page.screenshot({ animations: 'allow', fullPage: false, type: 'png' })
+        const screenshot = await screenshotViewport(page, 'allow')
         const signature = await createSettleSignature(screenshot)
         const visuallyStable = Boolean(
             previousSignature
@@ -1023,6 +1024,27 @@ function maxStripDifference(left: Buffer, right: Buffer, width: number, height: 
     }
 
     return maximum
+}
+
+/**
+ * 擷取目前視窗 PNG。重型機構頁在 settle 輪詢時會連續截圖並等待字型，
+ * Playwright 預設 30 秒不夠，必須顯式拉長。
+ *
+ * @param page Playwright 頁面。
+ * @param animations 截圖時是否凍結 CSS／Web Animation。
+ * @returns 目前視窗的 PNG。
+ */
+async function screenshotViewport(
+    page: import('playwright').Page,
+    animations: 'allow' | 'disabled',
+): Promise<Buffer>
+{
+    return page.screenshot({
+        animations,
+        fullPage: false,
+        timeout: SCREENSHOT_TIMEOUT_MS,
+        type: 'png',
+    })
 }
 
 /**
