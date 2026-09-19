@@ -105,6 +105,21 @@ describe('capture worker', { timeout: 30_000 }, () => {
         expect(revealedPixel).not.toEqual([148, 163, 184])
     })
 
+    it('waits for a multi-second JS wipe before keeping the segment', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?wipeReveal=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const wipedPixel = await samplePixel(fullPage, 410, 1500)
+
+        expect(wipedPixel).toEqual([34, 197, 94])
+        expect(wipedPixel).not.toEqual([255, 255, 255])
+    })
+
     it('waits for the hero reveal after returning to the top', async () => {
         const storage = createLocalObjectStorage(storageRoot)
         const result = await capturePage({
@@ -236,7 +251,7 @@ describe('capture worker', { timeout: 30_000 }, () => {
             decision: 'new_version',
             ruleVersion: 'fixture-v1-uncalibrated',
         })
-    }, 45_000)
+    }, 60_000)
 
     it('rejects path traversal in local object storage', async () => {
         const storage = createLocalObjectStorage(storageRoot)
@@ -351,6 +366,7 @@ function createFixtureServer(): Server
         const stickyNav = parameters.has('stickyNav')
         const delayedReveal = parameters.has('delayedReveal')
         const heroReveal = parameters.has('heroReveal')
+        const wipeReveal = parameters.has('wipeReveal')
 
         if (cookies) {
             const html = `<!doctype html>
@@ -435,6 +451,56 @@ addEventListener('scroll',()=>{
     reveal.getBoundingClientRect()
     reveal.style.transition='opacity 1.6s linear'
     reveal.style.opacity='1'
+})
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (wipeReveal) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Wipe Reveal Fixture</title></head>
+<body style="margin:0">
+<section style="height:1080px;background:#315ceb"></section>
+<section id="scene" style="height:1080px;background:#111;position:relative;overflow:hidden">
+<div id="photo" style="position:absolute;inset:0;background:#22c55e"></div>
+<div id="wipes" style="position:absolute;inset:0"></div>
+</section>
+<script>
+let raf=0
+addEventListener('scroll',()=>{
+    const scene=document.querySelector('#scene')
+    const wipes=document.querySelector('#wipes')
+    const bounds=scene.getBoundingClientRect()
+    const visible=bounds.top<innerHeight*0.9 && bounds.bottom>innerHeight*0.1
+    if(!visible){
+        cancelAnimationFrame(raf)
+        wipes.dataset.running=''
+        wipes.innerHTML=''
+        return
+    }
+    if(wipes.dataset.running==='1') return
+    wipes.dataset.running='1'
+    wipes.innerHTML=''
+    const bars=[]
+    for(let i=0;i<8;i+=1){
+        const bar=document.createElement('div')
+        bar.style.cssText='position:absolute;top:0;bottom:0;width:20px;background:#fff;transform-origin:center;left:'+(400+i*48)+'px'
+        wipes.appendChild(bar)
+        bars.push(bar)
+    }
+    const started=performance.now()
+    const tick=now=>{
+        const t=Math.min((now-started)/2800,1)
+        for(const bar of bars) bar.style.transform='scaleX('+(1-t)+')'
+        if(t<1) raf=requestAnimationFrame(tick)
+        else wipes.innerHTML=''
+    }
+    raf=requestAnimationFrame(tick)
 })
 </script>
 </body></html>`

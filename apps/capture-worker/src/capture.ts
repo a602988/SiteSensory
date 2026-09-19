@@ -31,10 +31,13 @@ const OVERLAY_SETTLE_MS = 250
 const SIGNATURE_HEIGHT = 18
 const SIGNATURE_WIDTH = 32
 const VIRTUAL_CANVAS_DUPLICATE_THRESHOLD = 0.015
-const VIEWPORT_SETTLE_TIMEOUT_MS = 6_000
+const VIEWPORT_SETTLE_TIMEOUT_MS = 12_000
 const VIEWPORT_SETTLE_POLL_MS = 200
-const VIEWPORT_SETTLE_STABLE_SAMPLES = 2
-const VIEWPORT_SETTLE_THRESHOLD = 0.015
+const VIEWPORT_SETTLE_STABLE_SAMPLES = 5
+const VIEWPORT_SETTLE_THRESHOLD = 0.004
+const VIEWPORT_SETTLE_STRIP_THRESHOLD = 0.025
+const SETTLE_SIGNATURE_HEIGHT = 108
+const SETTLE_SIGNATURE_WIDTH = 192
 
 export type CaptureOptions = {
     allowLocalNetwork?: boolean
@@ -841,9 +844,10 @@ async function dismissAndHideOverlaysInPage(options: {
 
 /**
  * 等到目前可見區域的進入動畫與揭示完成：先保留既有的最短停留、兩次
- * requestAnimationFrame 與可見圖片等待，再以連續畫面指紋確認畫面不再變化，
- * 且視窗內沒有仍在進行的有限次 CSS／Web Animation。逾時後保存當時畫面，
- * 避免無限循環動畫讓工作掛住。不使用 prefers-reduced-motion。
+ * requestAnimationFrame 與可見圖片等待，再以較高解析畫面指紋確認沒有
+ * 細條 wipe／遮罩仍在移動，並比對大型可見元素的 opacity、transform、
+ * clip-path。CSS／WAAPI 有限次動畫仍要等完；無限循環動畫不列入。
+ * 逾時後保存當時畫面。不使用 prefers-reduced-motion。
  *
  * @param page 已捲到目標位置的 Playwright 頁面。
  * @returns 畫面穩定或等待上限用盡後結束。
@@ -858,19 +862,29 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
 
     const deadline = Date.now() + VIEWPORT_SETTLE_TIMEOUT_MS
     let previousSignature: Buffer | null = null
+    let previousLayout = ''
     let stableSamples = 0
 
     while (Date.now() < deadline) {
-        const hasMotion = await hasFiniteViewportAnimations(page)
+        const hasCssMotion = await hasFiniteViewportAnimations(page)
+        const layout = await readViewportLayoutState(page)
         const screenshot = await page.screenshot({ animations: 'allow', fullPage: false, type: 'png' })
-        const signature = await createVisualSignature(screenshot)
+        const signature = await createSettleSignature(screenshot)
         const visuallyStable = Boolean(
             previousSignature
-            && visualDifference(previousSignature, signature) <= VIEWPORT_SETTLE_THRESHOLD,
+            && visualDifference(previousSignature, signature) <= VIEWPORT_SETTLE_THRESHOLD
+            && maxStripDifference(
+                previousSignature,
+                signature,
+                SETTLE_SIGNATURE_WIDTH,
+                SETTLE_SIGNATURE_HEIGHT,
+            ) <= VIEWPORT_SETTLE_STRIP_THRESHOLD,
         )
+        const layoutStable = previousLayout !== '' && previousLayout === layout
 
-        stableSamples = !hasMotion && visuallyStable ? stableSamples + 1 : 0
+        stableSamples = !hasCssMotion && visuallyStable && layoutStable ? stableSamples + 1 : 0
         previousSignature = signature
+        previousLayout = layout
 
         if (stableSamples >= VIEWPORT_SETTLE_STABLE_SAMPLES) return
 
@@ -906,6 +920,109 @@ async function hasFiniteViewportAnimations(page: import('playwright').Page): Pro
             && bounds.right > 0
             && bounds.left < window.innerWidth
     }))
+}
+
+/**
+ * 讀取視窗內大型元素的幾何與遮罩狀態。GSAP／JS 驅動的 clip-path、
+ * transform、opacity 不會出現在 document.getAnimations()，但會改這些值。
+ *
+ * @param page Playwright 頁面。
+ * @returns 可供前後比較的版面摘要。
+ */
+async function readViewportLayoutState(page: import('playwright').Page): Promise<string>
+{
+    return page.evaluate(() => {
+        const minArea = window.innerWidth * window.innerHeight * 0.02
+        const parts: string[] = []
+
+        for (const element of document.body.querySelectorAll<HTMLElement>('*')) {
+            const bounds = element.getBoundingClientRect()
+
+            if (bounds.width * bounds.height < minArea) continue
+            if (bounds.bottom <= 0 || bounds.top >= window.innerHeight) continue
+            if (bounds.right <= 0 || bounds.left >= window.innerWidth) continue
+
+            const style = getComputedStyle(element)
+
+            if (style.display === 'none' || style.visibility === 'hidden') continue
+
+            parts.push([
+                Math.round(bounds.x),
+                Math.round(bounds.y),
+                Math.round(bounds.width),
+                Math.round(bounds.height),
+                style.opacity,
+                style.transform,
+                style.clipPath,
+                style.maskImage,
+                style.getPropertyValue('-webkit-mask-image'),
+            ].join(','))
+        }
+
+        return parts.join('|')
+    })
+}
+
+/**
+ * 將目前視窗縮成較高解析的 RGB 指紋，用來發現細條 wipe，而不是只看 32×18。
+ *
+ * @param image 目前視窗截圖。
+ * @returns 固定長度的 RGB 像素資料。
+ */
+async function createSettleSignature(image: Buffer): Promise<Buffer>
+{
+    return sharp(image)
+        .resize(SETTLE_SIGNATURE_WIDTH, SETTLE_SIGNATURE_HEIGHT, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+}
+
+/**
+ * 計算兩個同尺寸指紋中，單一直欄或橫列的最大平均差異。
+ * 細的垂直或水平擦除條在全域平均裡會被稀釋，但會拉高單一欄／列。
+ *
+ * @param left 前一幀指紋。
+ * @param right 目前指紋。
+ * @param width 指紋寬度。
+ * @param height 指紋高度。
+ * @returns 介於 0 與 1 的最大欄或列差異。
+ */
+function maxStripDifference(left: Buffer, right: Buffer, width: number, height: number): number
+{
+    if (left.length !== right.length || left.length !== width * height * 3) return 1
+
+    let maximum = 0
+
+    for (let column = 0; column < width; column += 1) {
+        let total = 0
+
+        for (let row = 0; row < height; row += 1) {
+            const index = (row * width + column) * 3
+
+            total += Math.abs((left[index] ?? 0) - (right[index] ?? 0))
+            total += Math.abs((left[index + 1] ?? 0) - (right[index + 1] ?? 0))
+            total += Math.abs((left[index + 2] ?? 0) - (right[index + 2] ?? 0))
+        }
+
+        maximum = Math.max(maximum, total / height / 3 / 255)
+    }
+
+    for (let row = 0; row < height; row += 1) {
+        let total = 0
+
+        for (let column = 0; column < width; column += 1) {
+            const index = (row * width + column) * 3
+
+            total += Math.abs((left[index] ?? 0) - (right[index] ?? 0))
+            total += Math.abs((left[index + 1] ?? 0) - (right[index + 1] ?? 0))
+            total += Math.abs((left[index + 2] ?? 0) - (right[index + 2] ?? 0))
+        }
+
+        maximum = Math.max(maximum, total / width / 3 / 255)
+    }
+
+    return maximum
 }
 
 /**
