@@ -39,6 +39,8 @@ const PINNED_SCENE_ROWS_RATIO = 0.35
 const WIPE_BAR_MIN_COUNT = 3
 const WIPE_BAR_NEIGHBOR_DELTA = 35
 const WIPE_BAR_MIN_LUMINANCE = 190
+const WIPE_BAND_RATIO = 0.18
+const WIPE_BAND_MIN_ROWS = 6
 const VIEWPORT_WIPE_HOLD_SAMPLES = 12
 const OVERLAY_SETTLE_MS = 250
 const SIGNATURE_HEIGHT = 18
@@ -932,8 +934,9 @@ async function dismissAndHideOverlaysInPage(options: {
  * requestAnimationFrame 與可見圖片等待，再以較高解析畫面指紋確認沒有
  * 細條 wipe／遮罩仍在移動，並比對大型可見元素的 opacity、transform、
  * clip-path。CSS／WAAPI 有限次動畫仍要等完；無限循環動畫不列入。
- * 直條若連續穩定超過設計停留門檻，視為版面線條而非 wipe。逾時後保存
- * 當時畫面。不使用 prefers-reduced-motion。
+ * 直條若貫穿整段指紋且連續穩定超過設計停留門檻，視為版面線條而非
+ * wipe。只打在照片帶上的直條即使停住也不當設計。逾時後保存當時畫面。
+ * 不使用 prefers-reduced-motion。
  *
  * @param page 已捲到目標位置的 Playwright 頁面。
  * @returns 最後一張視窗截圖，以及該幀是否仍像 wipe。
@@ -975,11 +978,12 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
         )
         const layoutStable = previousLayout !== '' && previousLayout === layout
         const motionStopped = !hasCssMotion && visuallyStable && layoutStable
+        const pageLevelWipe = looksLikeFullColumnWipe(signature, SETTLE_SIGNATURE_WIDTH, SETTLE_SIGNATURE_HEIGHT)
 
         latest = screenshot
         latestHasWipe = hasWipe
         wipeHoldSamples = hasWipe && motionStopped ? wipeHoldSamples + 1 : 0
-        const wipeLooksLikeDesign = wipeHoldSamples >= VIEWPORT_WIPE_HOLD_SAMPLES
+        const wipeLooksLikeDesign = pageLevelWipe && wipeHoldSamples >= VIEWPORT_WIPE_HOLD_SAMPLES
         stableSamples = motionStopped && (!hasWipe || wipeLooksLikeDesign) ? stableSamples + 1 : 0
         previousSignature = signature
         previousLayout = layout
@@ -1130,24 +1134,64 @@ function maxStripDifference(left: Buffer, right: Buffer, width: number, height: 
 }
 
 /**
- * 判斷指紋是否像照片上的垂直 wipe 白條：亮而窄的直欄穿過中等亮度的內容區。
+ * 判斷指紋是否像照片上的垂直 wipe 白條。必須同時看整欄與水平帶：
+ * 只打斷照片上半、底下仍是內容或白底的直條，整欄平均會被稀釋到門檻以下。
  * 頁面底的淡格線因鄰近欄也接近白色，不會被算進去。
  *
  * @param image 較高解析 RGB 指紋。
  * @param width 指紋寬度。
  * @param height 指紋高度。
- * @returns 偵測到至少三條疑似 wipe 直條時為 true。
+ * @returns 整欄或任一水平帶出現至少三條疑似 wipe 直條時為 true。
  */
 export function looksLikeVerticalWipe(image: Buffer, width: number, height: number): boolean
 {
     if (image.length !== width * height * 3) return false
+    if (looksLikeFullColumnWipe(image, width, height)) return true
+
+    const bandHeight = Math.max(WIPE_BAND_MIN_ROWS, Math.round(height * WIPE_BAND_RATIO))
+    const step = Math.max(2, Math.floor(bandHeight / 2))
+
+    for (let start = 0; start + bandHeight <= height; start += step) {
+        if (countWipeSpikesInBand(image, width, start, bandHeight) >= WIPE_BAR_MIN_COUNT) return true
+    }
+
+    return false
+}
+
+/**
+ * 舊的整欄平均偵測：直條必須貫穿整段指紋高度才會過門檻。
+ *
+ * @param image 較高解析 RGB 指紋。
+ * @param width 指紋寬度。
+ * @param height 指紋高度。
+ * @returns 整欄平均出現至少三條 wipe 尖峰時為 true。
+ */
+export function looksLikeFullColumnWipe(image: Buffer, width: number, height: number): boolean
+{
+    if (image.length !== width * height * 3) return false
+
+    return countWipeSpikesInBand(image, width, 0, height) >= WIPE_BAR_MIN_COUNT
+}
+
+/**
+ * 計算一段列範圍內、亮於左右鄰欄的直條數量。
+ *
+ * @param image RGB 指紋。
+ * @param width 指紋寬度。
+ * @param rowStart 列起點。
+ * @param rowCount 列數。
+ * @returns 符合亮度與鄰欄差的直條數。
+ */
+function countWipeSpikesInBand(image: Buffer, width: number, rowStart: number, rowCount: number): number
+{
+    if (rowCount <= 0) return 0
 
     const columnMean = new Float64Array(width)
 
     for (let column = 0; column < width; column += 1) {
         let total = 0
 
-        for (let row = 0; row < height; row += 1) {
+        for (let row = rowStart; row < rowStart + rowCount; row += 1) {
             const index = (row * width + column) * 3
 
             total += 0.299 * (image[index] ?? 0)
@@ -1155,27 +1199,28 @@ export function looksLikeVerticalWipe(image: Buffer, width: number, height: numb
                 + 0.114 * (image[index + 2] ?? 0)
         }
 
-        columnMean[column] = total / height
+        columnMean[column] = total / rowCount
     }
 
     let spikes = 0
 
     for (let column = 2; column < width - 2; column += 1) {
-        const neighborhood = (
-            (columnMean[column - 2] ?? 0)
-            + (columnMean[column - 1] ?? 0)
-            + (columnMean[column + 1] ?? 0)
-            + (columnMean[column + 2] ?? 0)
-        ) / 4
+        const left = ((columnMean[column - 2] ?? 0) + (columnMean[column - 1] ?? 0)) / 2
+        const right = ((columnMean[column + 1] ?? 0) + (columnMean[column + 2] ?? 0)) / 2
+        const neighborhood = (left + right) / 2
         const current = columnMean[column] ?? 0
-        const sitsOnContent = neighborhood > 25 && neighborhood < 220
+        const sitsInsideContent = left > 25 && left < 220 && right > 25 && right < 220
 
-        if (sitsOnContent && current > neighborhood + WIPE_BAR_NEIGHBOR_DELTA && current > WIPE_BAR_MIN_LUMINANCE) {
+        if (
+            sitsInsideContent
+            && current > neighborhood + WIPE_BAR_NEIGHBOR_DELTA
+            && current > WIPE_BAR_MIN_LUMINANCE
+        ) {
             spikes += 1
         }
     }
 
-    return spikes >= WIPE_BAR_MIN_COUNT
+    return spikes
 }
 
 /**

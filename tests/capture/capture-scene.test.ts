@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
     isSamePinnedScene,
+    looksLikeFullColumnWipe,
     looksLikeVerticalWipe,
     rowSliceVariance,
     trimDuplicateScenePrefix,
@@ -70,6 +71,20 @@ describe('capture scene heuristics', () => {
         const signature = await createSettleSignature(await photoWithWipeBars())
 
         expect(looksLikeVerticalWipe(signature, SETTLE_WIDTH, SETTLE_HEIGHT)).toBe(true)
+    })
+
+    it('detects bright bars that only interrupt the top of a photo card', async () => {
+        const signature = await createSettleSignature(await photoCardWithPartialWipeBars())
+
+        expect(looksLikeFullColumnWipe(signature, SETTLE_WIDTH, SETTLE_HEIGHT)).toBe(false)
+        expect(looksLikeVerticalWipe(signature, SETTLE_WIDTH, SETTLE_HEIGHT)).toBe(true)
+    })
+
+    it('does not treat a finished photo card on a white page as a wipe', async () => {
+        const signature = await createSettleSignature(await photoCardWithPartialWipeBars({ bars: false }))
+
+        expect(looksLikeVerticalWipe(signature, SETTLE_WIDTH, SETTLE_HEIGHT)).toBe(false)
+        expect(looksLikeFullColumnWipe(signature, SETTLE_WIDTH, SETTLE_HEIGHT)).toBe(false)
     })
 
     it('does not treat a flat brand color or a light page grid as a wipe', async () => {
@@ -172,6 +187,45 @@ async function stripePng(height: number): Promise<Buffer>
     }
 
     return sharp(raw, { raw: { channels: 3, height, width: WIDTH } }).png().toBuffer()
+}
+
+async function photoCardWithPartialWipeBars(options: { bars?: boolean } = {}): Promise<Buffer>
+{
+    const withBars = options.bars !== false
+    const raw = Buffer.alloc(WIDTH * 1080 * 3)
+
+    for (let row = 0; row < 1080; row += 1) {
+        for (let column = 0; column < WIDTH; column += 1) {
+            const index = (row * WIDTH + column) * 3
+            const inPhoto = column >= 80 && column < 900 && row >= 180 && row < 700
+            const inBarBand = inPhoto && row < 320
+            const bar = withBars
+                && inBarBand
+                && column >= 120
+                && (column - 120) % 48 < 16
+                && column < 120 + 8 * 48
+
+            if (bar) {
+                raw[index] = 255
+                raw[index + 1] = 255
+                raw[index + 2] = 255
+                continue
+            }
+
+            if (inPhoto) {
+                raw[index] = 50 + ((row + column) % 60)
+                raw[index + 1] = 70 + ((row * 2 + column) % 70)
+                raw[index + 2] = 90 + ((row * 3 + column * 2) % 80)
+                continue
+            }
+
+            raw[index] = 245
+            raw[index + 1] = 245
+            raw[index + 2] = 247
+        }
+    }
+
+    return sharp(raw, { raw: { channels: 3, height: 1080, width: WIDTH } }).png().toBuffer()
 }
 
 async function photoWithWipeBars(): Promise<Buffer>
