@@ -888,7 +888,7 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
 async function hasFiniteViewportAnimations(page: import('playwright').Page): Promise<boolean>
 {
     return page.evaluate(() => document.getAnimations().some(animation => {
-        if (animation.playState !== 'running' && animation.playState !== 'pending') return false
+        if (animation.playState !== 'running') return false
 
         const effect = animation.effect
 

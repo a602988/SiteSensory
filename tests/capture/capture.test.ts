@@ -413,24 +413,28 @@ document.querySelector('#decline').addEventListener('click', () => {
 <head><meta charset="utf-8"><title>Delayed Reveal Fixture</title></head>
 <body style="margin:0">
 <section style="height:1080px;background:#315ceb"></section>
-<section id="scene" style="height:1080px;background:#e5e7eb"></section>
+<section id="scene" style="height:1080px;background:#e5e7eb;position:relative">
+<div id="reveal" style="position:absolute;inset:0;background:#22c55e;opacity:0"></div>
+</section>
 <script>
-let generation = 0
 addEventListener('scroll',()=>{
     const scene=document.querySelector('#scene')
+    const reveal=document.querySelector('#reveal')
     const bounds=scene.getBoundingClientRect()
     const visible=bounds.top<innerHeight*0.9 && bounds.bottom>innerHeight*0.1
     if(!visible){
-        generation+=1
-        scene.dataset.running=''
-        scene.style.background='#e5e7eb'
+        reveal.dataset.running=''
+        reveal.style.transition='none'
+        reveal.style.opacity='0'
         return
     }
-    if(scene.dataset.running==='1') return
-    scene.dataset.running='1'
-    const id=generation
-    scene.style.background='#94a3b8'
-    setTimeout(()=>{if(id===generation) scene.style.background='#22c55e'},1600)
+    if(reveal.dataset.running==='1') return
+    reveal.dataset.running='1'
+    reveal.style.transition='none'
+    reveal.style.opacity='0'
+    reveal.getBoundingClientRect()
+    reveal.style.transition='opacity 1.6s linear'
+    reveal.style.opacity='1'
 })
 </script>
 </body></html>`
@@ -448,12 +452,13 @@ addEventListener('scroll',()=>{
 <main id="hero" style="min-height:2200px;background:#dc2626"></main>
 <script>
 let atTop=true
-let generation=0
 const startHero=()=>{
-    const id=++generation
     const hero=document.querySelector('#hero')
+    hero.style.transition='none'
     hero.style.background='#dc2626'
-    setTimeout(()=>{if(id===generation) hero.style.background='#22c55e'},1600)
+    hero.getBoundingClientRect()
+    hero.style.transition='background-color 1.6s linear'
+    hero.style.background='#22c55e'
 }
 startHero()
 addEventListener('scroll',()=>{
