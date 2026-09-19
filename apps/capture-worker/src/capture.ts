@@ -31,6 +31,10 @@ const OVERLAY_SETTLE_MS = 250
 const SIGNATURE_HEIGHT = 18
 const SIGNATURE_WIDTH = 32
 const VIRTUAL_CANVAS_DUPLICATE_THRESHOLD = 0.015
+const VIEWPORT_SETTLE_TIMEOUT_MS = 6_000
+const VIEWPORT_SETTLE_POLL_MS = 200
+const VIEWPORT_SETTLE_STABLE_SAMPLES = 2
+const VIEWPORT_SETTLE_THRESHOLD = 0.015
 
 export type CaptureOptions = {
     allowLocalNetwork?: boolean
@@ -127,6 +131,7 @@ export async function capturePage(options: CaptureOptions): Promise<CapturedPage
             throw new Error('目標網站回傳存取驗證頁，未取得可分析的網站內容')
         }
 
+        await waitForVisibleViewportToSettle(page)
         const viewportBuffer = await page.screenshot({ animations: 'disabled', fullPage: false, type: 'png' })
         const fullPageBuffer = await captureFullPage(page)
         const finalUrl = normalizeUrl(page.url())
@@ -277,11 +282,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             document.documentElement.toggleAttribute(hideFixedAttribute, scrollTop > 0)
             window.scrollTo(0, scrollTop)
         }, { hideFixedAttribute: HIDE_FIXED_ATTRIBUTE, scrollTop: target })
-        await page.waitForTimeout(CAPTURE_SETTLE_MS)
-        await page.evaluate(() => new Promise<void>(resolve => {
-            requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
-        }))
-        await waitForVisibleImages(page)
+        await waitForVisibleViewportToSettle(page)
 
         let actualScroll = await page.evaluate(() => Math.round(window.scrollY))
 
@@ -836,6 +837,75 @@ async function dismissAndHideOverlaysInPage(options: {
 
         return /^(close|dismiss|×|✕|⨯|✖|x)$/i.test(text)
     }
+}
+
+/**
+ * 等到目前可見區域的進入動畫與揭示完成：先保留既有的最短停留、兩次
+ * requestAnimationFrame 與可見圖片等待，再以連續畫面指紋確認畫面不再變化，
+ * 且視窗內沒有仍在進行的有限次 CSS／Web Animation。逾時後保存當時畫面，
+ * 避免無限循環動畫讓工作掛住。不使用 prefers-reduced-motion。
+ *
+ * @param page 已捲到目標位置的 Playwright 頁面。
+ * @returns 畫面穩定或等待上限用盡後結束。
+ */
+async function waitForVisibleViewportToSettle(page: import('playwright').Page): Promise<void>
+{
+    await page.waitForTimeout(CAPTURE_SETTLE_MS)
+    await page.evaluate(() => new Promise<void>(resolve => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+    }))
+    await waitForVisibleImages(page)
+
+    const deadline = Date.now() + VIEWPORT_SETTLE_TIMEOUT_MS
+    let previousSignature: Buffer | null = null
+    let stableSamples = 0
+
+    while (Date.now() < deadline) {
+        const hasMotion = await hasFiniteViewportAnimations(page)
+        const screenshot = await page.screenshot({ animations: 'allow', fullPage: false, type: 'png' })
+        const signature = await createVisualSignature(screenshot)
+        const visuallyStable = Boolean(
+            previousSignature
+            && visualDifference(previousSignature, signature) <= VIEWPORT_SETTLE_THRESHOLD,
+        )
+
+        stableSamples = !hasMotion && visuallyStable ? stableSamples + 1 : 0
+        previousSignature = signature
+
+        if (stableSamples >= VIEWPORT_SETTLE_STABLE_SAMPLES) return
+
+        await page.waitForTimeout(VIEWPORT_SETTLE_POLL_MS)
+    }
+}
+
+/**
+ * 判斷目前視窗內是否仍有有限次數的進入動畫或轉場。無限循環動畫不列入，
+ * 以免輪播或背景動態讓擷取永遠等下去。
+ *
+ * @param page Playwright 頁面。
+ * @returns 存在仍在進行且目標落在視窗內的有限次動畫時為 true。
+ */
+async function hasFiniteViewportAnimations(page: import('playwright').Page): Promise<boolean>
+{
+    return page.evaluate(() => document.getAnimations().some(animation => {
+        if (animation.playState !== 'running' && animation.playState !== 'pending') return false
+
+        const effect = animation.effect
+
+        if (!(effect instanceof KeyframeEffect)) return false
+        if (effect.getComputedTiming().iterations === Infinity) return false
+
+        const target = effect.target
+
+        if (!(target instanceof Element)) return false
+
+        const bounds = target.getBoundingClientRect()
+
+        return bounds.bottom > 0
+            && bounds.top < window.innerHeight
+            && bounds.right > 0
+            && bounds.left < window.innerWidth
+    }))
 }
 
 /**

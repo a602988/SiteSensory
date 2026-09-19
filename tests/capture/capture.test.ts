@@ -29,7 +29,7 @@ let server: Server
 let fixtureUrl: string
 let storageRoot: string
 
-describe('capture worker', { timeout: 20_000 }, () => {
+describe('capture worker', { timeout: 30_000 }, () => {
     beforeAll(async () => {
         browser = await chromium.launch({ headless: true })
         storageRoot = await mkdtemp(join(tmpdir(), 'sitesensory-capture-'))
@@ -88,6 +88,37 @@ describe('capture worker', { timeout: 20_000 }, () => {
             .toBuffer()
 
         expect([...pixel]).toEqual([18, 181, 122])
+    })
+
+    it('waits past the minimum delay for a slow reveal after scroll', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?delayedReveal=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const revealedPixel = await samplePixel(fullPage, 960, 1500)
+
+        expect(revealedPixel).toEqual([34, 197, 94])
+        expect(revealedPixel).not.toEqual([148, 163, 184])
+    })
+
+    it('waits for the hero reveal after returning to the top', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?heroReveal=1`,
+        })
+        const viewport = await storage.get(result.viewport.objectKey)
+        const fullPage = await storage.get(result.fullPage.objectKey)
+
+        expect(await samplePixel(viewport, 960, 540)).toEqual([34, 197, 94])
+        expect(await samplePixel(fullPage, 960, 540)).toEqual([34, 197, 94])
+        expect(await samplePixel(viewport, 960, 540)).not.toEqual([220, 38, 38])
     })
 
     it('waits for a scrolled block to finish revealing before capture', async () => {
@@ -205,7 +236,7 @@ describe('capture worker', { timeout: 20_000 }, () => {
             decision: 'new_version',
             ruleVersion: 'fixture-v1-uncalibrated',
         })
-    }, 15_000)
+    }, 45_000)
 
     it('rejects path traversal in local object storage', async () => {
         const storage = createLocalObjectStorage(storageRoot)
@@ -318,6 +349,8 @@ function createFixtureServer(): Server
         const cookies = parameters.has('cookies')
         const cookieOverlay = parameters.has('cookieOverlay')
         const stickyNav = parameters.has('stickyNav')
+        const delayedReveal = parameters.has('delayedReveal')
+        const heroReveal = parameters.has('heroReveal')
 
         if (cookies) {
             const html = `<!doctype html>
@@ -367,6 +400,68 @@ document.querySelector('#decline').addEventListener('click', () => {
 <div role="dialog" aria-modal="true" style="position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);width:640px;height:280px;background:#7c3aed;color:#fff;z-index:9999;padding:32px">
 <p>This site uses cookies to improve your experience. See our privacy policy.</p>
 </div>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (delayedReveal) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Delayed Reveal Fixture</title></head>
+<body style="margin:0">
+<section style="height:1080px;background:#315ceb"></section>
+<section id="scene" style="height:1080px;background:#e5e7eb"></section>
+<script>
+let generation = 0
+addEventListener('scroll',()=>{
+    const scene=document.querySelector('#scene')
+    const bounds=scene.getBoundingClientRect()
+    const visible=bounds.top<innerHeight*0.9 && bounds.bottom>innerHeight*0.1
+    if(!visible){
+        generation+=1
+        scene.dataset.running=''
+        scene.style.background='#e5e7eb'
+        return
+    }
+    if(scene.dataset.running==='1') return
+    scene.dataset.running='1'
+    const id=generation
+    scene.style.background='#94a3b8'
+    setTimeout(()=>{if(id===generation) scene.style.background='#22c55e'},1600)
+})
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (heroReveal) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Hero Reveal Fixture</title></head>
+<body style="margin:0">
+<main id="hero" style="min-height:2200px;background:#dc2626"></main>
+<script>
+let atTop=true
+let generation=0
+const startHero=()=>{
+    const id=++generation
+    const hero=document.querySelector('#hero')
+    hero.style.background='#dc2626'
+    setTimeout(()=>{if(id===generation) hero.style.background='#22c55e'},1600)
+}
+startHero()
+addEventListener('scroll',()=>{
+    const nowAtTop=scrollY<8
+    if(nowAtTop && !atTop) startHero()
+    atTop=nowAtTop
+})
+</script>
 </body></html>`
 
             response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
