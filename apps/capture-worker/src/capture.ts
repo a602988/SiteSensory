@@ -1440,6 +1440,17 @@ export async function trimRepeatedTailBand(image: Buffer, width: number): Promis
     if (rowSliceVariance(tailSignature) < SCENE_TRIM_MIN_VARIANCE) return image
     if (visualDifference(tailSignature, aboveSignature) > SCENE_TRIM_THRESHOLD) return image
 
+    const top = await sharp(image)
+        .extract({ height: band, left: 0, top: 0, width })
+        .toBuffer()
+    const topSignature = await sharp(top)
+        .resize(SETTLE_SIGNATURE_WIDTH, rows, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+
+    if (visualDifference(topSignature, tailSignature) <= SCENE_TRIM_THRESHOLD) return image
+
     return sharp(image)
         .extract({
             height: height - band,
