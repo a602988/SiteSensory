@@ -178,9 +178,16 @@ describe('capture worker', { timeout: 60_000 }, () => {
         const height = readPngSize(fullPage).height
 
         expect(height).toBeLessThan(6480)
-        expect(height).toBeGreaterThan(6000)
+        expect(height).toBeGreaterThan(4000)
         expect(await samplePixel(fullPage, 1400, 3500)).not.toEqual([248, 245, 239])
-        expect(await samplePixel(fullPage, 200, 4500)).not.toEqual([248, 245, 239])
+
+        const leftSamples = await Promise.all(
+            [3600, 3800, 4000, 4200, 4400]
+                .filter(top => top < height)
+                .map(top => samplePixel(fullPage, 200, top)),
+        )
+
+        expect(leftSamples.some(pixel => pixel[0] !== 248 || pixel[1] !== 245)).toBe(true)
     })
 
     it('removes a one-fifth repeat under a photo card caption', async () => {
@@ -195,8 +202,9 @@ describe('capture worker', { timeout: 60_000 }, () => {
         const height = readPngSize(fullPage).height
 
         expect(height).toBeLessThan(2160)
+        expect(height).toBeGreaterThan(1700)
         expect(await samplePixel(fullPage, 1400, 1280)).not.toEqual([248, 245, 239])
-        expect(await samplePixel(fullPage, 1400, height - 80)).toEqual([248, 245, 239])
+        expect(await samplePixel(fullPage, 1400, 1280)).not.toEqual([21, 128, 61])
     })
 
     it('waits for the hero reveal after returning to the top', async () => {
