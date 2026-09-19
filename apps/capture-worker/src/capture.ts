@@ -36,8 +36,9 @@ const SCENE_TRIM_SCRAP_RATIO = 0.35
 const SCENE_TRIM_MIN_VARIANCE = 0.02
 const SCENE_TRIM_THRESHOLD = 0.015
 const PHOTO_BELT_RATIOS = [0.22, 0.19, 0.16, 0.13, 0.1]
-const PHOTO_BELT_THRESHOLD = 0.02
+const PHOTO_BELT_THRESHOLD = 0.012
 const PHOTO_BELT_ABOVE_DELTA = 0.08
+const PHOTO_BELT_ALIGN_ROWS = 6
 const PHOTO_BELT_PAGE_LUMA = 230
 const PHOTO_BELT_REFERENCE_HEIGHT = 1080
 const PHOTO_BELT_SIGNATURE_WIDTH = 384
@@ -1420,7 +1421,7 @@ export async function trimRepeatedTailBand(image: Buffer, width: number): Promis
 {
     let current = image
 
-    for (let pass = 0; pass < 6; pass += 1) {
+    for (let pass = 0; pass < 3; pass += 1) {
         const next = await trimOnePhotoBelt(current, width)
         const before = (await sharp(current).metadata()).height ?? 0
         const after = (await sharp(next).metadata()).height ?? 0
@@ -1435,7 +1436,8 @@ export async function trimRepeatedTailBand(image: Buffer, width: number): Promis
 
 /**
  * 在一張圖裡找最靠近下方的一條照片腰帶並裁掉。帶寬以 viewport 尺度
- * 計算，並略過近白頁面欄，以免標題／留白把照片卡上的重複帶稀釋掉。
+ * 計算，並在約 ±30px 內找最佳對齊，以便長圖接縫上的錯位複製品也能對上。
+ * 略過任一方近白的像素，以免白底上的 CTA 把照片欄的重複稀釋掉。
  *
  * @param image PNG。
  * @param width 寬度。
@@ -1459,6 +1461,7 @@ async function trimOnePhotoBelt(image: Buffer, width: number): Promise<Buffer>
     const rowBytes = PHOTO_BELT_SIGNATURE_WIDTH * 3
     let cutStart = -1
     let cutHeight = 0
+    let cutDifference = 1
 
     for (const ratio of PHOTO_BELT_RATIOS) {
         const bandPx = Math.max(48, Math.round(reference * ratio))
@@ -1468,60 +1471,69 @@ async function trimOnePhotoBelt(image: Buffer, width: number): Promise<Buffer>
 
         const minimumLower = bandRows * 2 + 1
         const maximumLower = signatureHeight - bandRows - 1
-        const step = Math.max(1, Math.round(bandRows / 4))
+        const step = 2
 
         for (let lower = maximumLower; lower >= minimumLower; lower -= step) {
-            let matched = false
+            const lowerSlice = signature.subarray(lower * rowBytes, (lower + bandRows) * rowBytes)
 
-            for (const offset of [0, -1, 1]) {
+            if (contentPixelVariance(lowerSlice) < SCENE_TRIM_MIN_VARIANCE) continue
+            if (verticalBandDifference(lowerSlice, rowBytes) <= PHOTO_BELT_THRESHOLD) continue
+
+            let bestUpper = -1
+            let bestDifference = 1
+
+            for (let offset = -PHOTO_BELT_ALIGN_ROWS; offset <= PHOTO_BELT_ALIGN_ROWS; offset += 1) {
                 const upper = lower - bandRows + offset
 
                 if (upper < bandRows) continue
 
                 const upperSlice = signature.subarray(upper * rowBytes, (upper + bandRows) * rowBytes)
-                const lowerSlice = signature.subarray(lower * rowBytes, (lower + bandRows) * rowBytes)
-
-                if (contentPixelVariance(lowerSlice) < SCENE_TRIM_MIN_VARIANCE) continue
-                if (verticalBandDifference(lowerSlice, rowBytes) <= PHOTO_BELT_THRESHOLD) continue
-
                 const pairDifference = contentMaskedDifference(upperSlice, lowerSlice)
 
-                if (pairDifference > PHOTO_BELT_THRESHOLD) continue
-
-                const aboveSlice = signature.subarray((upper - bandRows) * rowBytes, upper * rowBytes)
-
-                if (rowSliceVariance(aboveSlice) < SCENE_TRIM_MIN_VARIANCE) continue
-
-                const aboveDifference = contentMaskedDifference(aboveSlice, upperSlice)
-
-                if (aboveDifference < Math.max(PHOTO_BELT_ABOVE_DELTA, pairDifference * 4)) {
-                    continue
+                if (pairDifference < bestDifference) {
+                    bestDifference = pairDifference
+                    bestUpper = upper
                 }
-
-                const belowStart = lower + bandRows
-
-                if (belowStart < signatureHeight) {
-                    const belowRows = Math.min(bandRows, signatureHeight - belowStart)
-                    const belowSlice = signature.subarray(
-                        belowStart * rowBytes,
-                        (belowStart + belowRows) * rowBytes,
-                    )
-                    const belowIsPage = rowSliceVariance(belowSlice) < SCENE_TRIM_MIN_VARIANCE
-                    const belowDifference = contentMaskedDifference(belowSlice, lowerSlice)
-
-                    if (!belowIsPage && belowDifference < PHOTO_BELT_ABOVE_DELTA) continue
-                }
-
-                cutStart = Math.round(lower * scale)
-                cutHeight = Math.round(bandRows * scale)
-                matched = true
-                break
             }
 
-            if (matched) break
+            if (bestUpper < 0 || bestDifference > PHOTO_BELT_THRESHOLD) continue
+
+            const upperSlice = signature.subarray(bestUpper * rowBytes, (bestUpper + bandRows) * rowBytes)
+            const aboveSlice = signature.subarray((bestUpper - bandRows) * rowBytes, bestUpper * rowBytes)
+
+            if (rowSliceVariance(aboveSlice) < SCENE_TRIM_MIN_VARIANCE) continue
+
+            const aboveDifference = contentMaskedDifference(aboveSlice, upperSlice)
+
+            if (aboveDifference < Math.max(PHOTO_BELT_ABOVE_DELTA, bestDifference * 4)) continue
+
+            const belowStart = lower + bandRows
+
+            if (belowStart < signatureHeight) {
+                const belowRows = Math.min(bandRows, signatureHeight - belowStart)
+                const belowSlice = signature.subarray(
+                    belowStart * rowBytes,
+                    (belowStart + belowRows) * rowBytes,
+                )
+                const belowIsPage = rowSliceVariance(belowSlice) < SCENE_TRIM_MIN_VARIANCE
+                const belowDifference = contentMaskedDifference(belowSlice, lowerSlice)
+
+                if (!belowIsPage && belowDifference < PHOTO_BELT_ABOVE_DELTA) continue
+            }
+
+            const candidateStart = Math.round(lower * scale)
+            const candidateHeight = Math.round(bandRows * scale)
+
+            if (bestDifference < cutDifference) {
+                cutDifference = bestDifference
+                cutStart = candidateStart
+                cutHeight = candidateHeight
+            }
+
+            if (cutDifference < 0.004) break
         }
 
-        if (cutStart >= 0) break
+        if (cutDifference < 0.004) break
     }
 
     if (cutStart < 24 || cutHeight < 32 || cutStart + cutHeight > height) return image
@@ -1581,7 +1593,7 @@ function contentMaskedDifference(left: Buffer, right: Buffer): number
             + 0.587 * (right[index + 1] ?? 0)
             + 0.114 * (right[index + 2] ?? 0)
 
-        if (leftLuma > PHOTO_BELT_PAGE_LUMA && rightLuma > PHOTO_BELT_PAGE_LUMA) continue
+        if (leftLuma > PHOTO_BELT_PAGE_LUMA || rightLuma > PHOTO_BELT_PAGE_LUMA) continue
 
         const pixel = (
             Math.abs((left[index] ?? 0) - (right[index] ?? 0))

@@ -14,7 +14,7 @@ const WIDTH = 1920
 const SETTLE_WIDTH = 192
 const SETTLE_HEIGHT = 108
 
-describe('capture scene heuristics', () => {
+describe('capture scene heuristics', { timeout: 15_000 }, () => {
     it('treats a saturated solid color as zero spatial variance', () => {
         const slice = Buffer.alloc(SETTLE_WIDTH * 8 * 3)
 
@@ -98,6 +98,20 @@ describe('capture scene heuristics', () => {
         expect((await sharp(trimmed).metadata()).height).toBe(2160)
         expect(await sampleRgb(trimmed, 200, 1500)).toEqual([34, 197, 94])
     })
+
+    it('trims a mid-page ~1/5 belt on a tall stitch that narrow-offset scan misses', async () => {
+        const page = await tallStitchCardBelt()
+        const legacy = await legacyNarrowOffsetBeltTrim(page)
+        const trimmed = await trimRepeatedTailBand(page, WIDTH)
+        const legacyHeight = (await sharp(legacy).metadata()).height ?? 0
+        const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
+
+        expect(legacyHeight).toBe(6480)
+        expect(trimmedHeight).toBeLessThan(6360)
+        expect(trimmedHeight).toBeGreaterThan(6100)
+        expect(await sampleRgb(trimmed, 1400, 4500)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 200, 5600)).not.toEqual([248, 245, 239])
+    }, 20_000)
 
     it('does not trim a unique photo card that has no repeated belt', async () => {
         const card = await photoCardWithCaptionBelt({ repeatBelt: false })
@@ -482,18 +496,22 @@ async function rawWindow(image: Buffer, height: number): Promise<Buffer>
         .toBuffer()
 }
 
-async function photoCardWithCaptionBelt(options: { repeatBelt?: boolean } = {}): Promise<Buffer>
+async function photoCardWithCaptionBelt(options: { beltGap?: number, repeatBelt?: boolean } = {}): Promise<Buffer>
 {
     const repeatBelt = options.repeatBelt !== false
+    const beltGap = options.beltGap ?? 0
     const raw = Buffer.alloc(WIDTH * 1080 * 3)
+    const firstBelt = 500
+    const secondBelt = firstBelt + 140 + beltGap
+    const photoBottom = secondBelt + 140
 
     for (let row = 0; row < 1080; row += 1) {
         for (let column = 0; column < WIDTH; column += 1) {
             const index = (row * WIDTH + column) * 3
-            const inPhoto = column >= 960 && column < 1860 && row >= 40 && row < 780
-            const inFirstBelt = repeatBelt && inPhoto && row >= 500 && row < 640
-            const inSecondBelt = repeatBelt && inPhoto && row >= 640 && row < 780
-            const inCta = inSecondBelt && column >= 1000 && column < 1240 && row >= 690 && row < 730
+            const inPhoto = column >= 960 && column < 1860 && row >= 40 && row < photoBottom
+            const inFirstBelt = repeatBelt && inPhoto && row >= firstBelt && row < firstBelt + 140
+            const inSecondBelt = repeatBelt && inPhoto && row >= secondBelt && row < secondBelt + 140
+            const inCta = inSecondBelt && column >= 700 && column < 1120 && row >= secondBelt + 36 && row < secondBelt + 88
 
             if (inCta) {
                 raw[index] = 255
@@ -503,7 +521,7 @@ async function photoCardWithCaptionBelt(options: { repeatBelt?: boolean } = {}):
             }
 
             if (inFirstBelt || inSecondBelt) {
-                const beltRow = row - (inSecondBelt ? 640 : 500)
+                const beltRow = row - (inSecondBelt ? secondBelt : firstBelt)
                 const sample = beltTexel(beltRow, column)
 
                 raw[index] = sample[0]
@@ -528,6 +546,150 @@ async function photoCardWithCaptionBelt(options: { repeatBelt?: boolean } = {}):
     }
 
     return sharp(raw, { raw: { channels: 3, height: 1080, width: WIDTH } }).png().toBuffer()
+}
+
+async function tallStitchCardBelt(): Promise<Buffer>
+{
+    return stackPngs([
+        await solidPng('#f8f5ef', 4320),
+        await photoCardWithCaptionBelt({ beltGap: 12 }),
+        await nextPhotoCardOnCream(),
+    ])
+}
+
+async function nextPhotoCardOnCream(): Promise<Buffer>
+{
+    const raw = Buffer.alloc(WIDTH * 1080 * 3)
+
+    for (let row = 0; row < 1080; row += 1) {
+        for (let column = 0; column < WIDTH; column += 1) {
+            const index = (row * WIDTH + column) * 3
+            const inPhoto = column >= 80 && column < 900 && row >= 40 && row < 560
+
+            if (inPhoto) {
+                const blob = Math.hypot(row - 220, column - 400)
+
+                raw[index] = 90 + Math.min(80, Math.floor(blob / 6))
+                raw[index + 1] = 40 + Math.floor((column % 220) / 3)
+                raw[index + 2] = 30 + Math.floor(row / 8) % 70
+                continue
+            }
+
+            raw[index] = 248
+            raw[index + 1] = 245
+            raw[index + 2] = 239
+        }
+    }
+
+    return sharp(raw, { raw: { channels: 3, height: 1080, width: WIDTH } }).png().toBuffer()
+}
+
+/**
+ * 舊掃描只允許 ±1 列指紋、較緊門檻，且雙方都近白才略過。
+ * 長圖接縫上錯開約 12px、CTA 壓在留白上的腰帶會錯過。
+ *
+ * @param image 長圖 PNG。
+ * @returns 舊邏輯處理後的圖。
+ */
+async function legacyNarrowOffsetBeltTrim(image: Buffer): Promise<Buffer>
+{
+    const height = (await sharp(image).metadata()).height ?? 0
+
+    if (height < 160) return image
+
+    const signatureHeight = Math.max(16, Math.round(height * 384 / WIDTH))
+    const signature = await sharp(image)
+        .resize(384, signatureHeight, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+    const scale = height / signatureHeight
+    const rowBytes = 384 * 3
+    const reference = Math.min(1080, height)
+
+    for (const ratio of [0.22, 0.19, 0.16, 0.13, 0.1]) {
+        const bandPx = Math.max(48, Math.round(reference * ratio))
+        const bandRows = Math.max(4, Math.round(bandPx / scale))
+
+        if (bandRows * 3 > signatureHeight) continue
+
+        const minimumLower = bandRows * 2 + 1
+        const maximumLower = signatureHeight - bandRows - 1
+        const step = Math.max(1, Math.round(bandRows / 4))
+
+        for (let lower = maximumLower; lower >= minimumLower; lower -= step) {
+            for (const offset of [0, -1, 1]) {
+                const upper = lower - bandRows + offset
+
+                if (upper < 2) continue
+
+                const upperSlice = signature.subarray(upper * rowBytes, (upper + bandRows) * rowBytes)
+                const lowerSlice = signature.subarray(lower * rowBytes, (lower + bandRows) * rowBytes)
+                let total = 0
+                let count = 0
+
+                for (let index = 0; index < lowerSlice.length; index += 3) {
+                    const leftLuma = 0.299 * (upperSlice[index] ?? 0)
+                        + 0.587 * (upperSlice[index + 1] ?? 0)
+                        + 0.114 * (upperSlice[index + 2] ?? 0)
+                    const rightLuma = 0.299 * (lowerSlice[index] ?? 0)
+                        + 0.587 * (lowerSlice[index + 1] ?? 0)
+                        + 0.114 * (lowerSlice[index + 2] ?? 0)
+
+                    if (leftLuma > 230 && rightLuma > 230) continue
+
+                    total += Math.abs((upperSlice[index] ?? 0) - (lowerSlice[index] ?? 0))
+                    total += Math.abs((upperSlice[index + 1] ?? 0) - (lowerSlice[index + 1] ?? 0))
+                    total += Math.abs((upperSlice[index + 2] ?? 0) - (lowerSlice[index + 2] ?? 0))
+                    count += 1
+                }
+
+                if (count < lowerSlice.length / 3 * 0.08) continue
+
+                const difference = total / count / 3 / 255
+
+                if (difference > 0.02) continue
+
+                const cutStart = Math.round(lower * scale)
+                const cutHeight = Math.round(bandRows * scale)
+
+                if (cutStart < 24 || cutHeight < 32 || cutStart + cutHeight > height) return image
+
+                const top = await sharp(image)
+                    .extract({ height: cutStart, left: 0, top: 0, width: WIDTH })
+                    .toBuffer()
+                const bottomHeight = height - cutStart - cutHeight
+
+                if (bottomHeight <= 0) return top
+
+                const bottom = await sharp(image)
+                    .extract({
+                        height: bottomHeight,
+                        left: 0,
+                        top: cutStart + cutHeight,
+                        width: WIDTH,
+                    })
+                    .toBuffer()
+
+                return sharp({
+                    create: {
+                        background: '#ffffff',
+                        channels: 3,
+                        height: cutStart + bottomHeight,
+                        width: WIDTH,
+                    },
+                })
+                    .composite([
+                        { input: top, left: 0, top: 0 },
+                        { input: bottom, left: 0, top: cutStart },
+                    ])
+                    .png()
+                    .toBuffer()
+            }
+        }
+    }
+
+    return image
 }
 
 /**
