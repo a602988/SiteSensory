@@ -266,7 +266,7 @@ async function headingOnCreamPng(): Promise<Buffer>
     for (let row = 0; row < 1080; row += 1) {
         for (let column = 0; column < WIDTH; column += 1) {
             const index = (row * WIDTH + column) * 3
-            const inGlyph = row >= 200 && row < 360 && (column + 80) % 220 < 140
+            const inGlyph = row >= 200 && row < 360 && (column + 40) % 90 < 48
 
             raw[index] = inGlyph ? 24 : 242
             raw[index + 1] = inGlyph ? 33 : 239
