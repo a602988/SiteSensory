@@ -40,6 +40,7 @@ const PHOTO_BELT_RATIOS = [0.22, 0.19, 0.16, 0.13, 0.1, 0.06, 0.04, 0.02, 0.015,
 const PHOTO_BELT_THICK_RATIO = 0.1
 const PHOTO_BELT_THRESHOLD = 0.012
 const PHOTO_BELT_THIN_THRESHOLD = 0.028
+const PHOTO_RESIDUAL_SPIKE_FLOOR = 0.028
 const PHOTO_BELT_THIN_PX = 36
 const PHOTO_CARD_WIPE_THRESHOLD = 0.04
 const VIEWPORT_TILE_THRESHOLD = 0.055
@@ -1465,8 +1466,22 @@ function mergePairWipeColumns(
     const leftWipes = listBlendedWipeColumns(left, width)
     const rightWipes = listBlendedWipeColumns(right, width)
     const residual = listResidualWipeColumns(left, right, width)
+    const rowBytes = width * 3
+    const rows = Math.floor(left.length / rowBytes)
+    const topRows = Math.max(4, Math.round(rows * 0.4))
+    const topBytes = topRows * rowBytes
+    const topResidual = rows >= 4 && left.length >= topBytes && right.length >= topBytes
+        ? listResidualWipeColumns(
+            left.subarray(0, topBytes),
+            right.subarray(0, topBytes),
+            width,
+        )
+        : residual
     const merged = leftWipes.map((flag, column) => (
-        flag || rightWipes[column] === true || residual[column] === true
+        flag
+        || rightWipes[column] === true
+        || residual[column] === true
+        || topResidual[column] === true
     ))
     const count = merged.reduce((total, flag) => total + (flag ? 1 : 0), 0)
 
@@ -1525,13 +1540,16 @@ function listResidualWipeColumns(left: Buffer, right: Buffer, width: number): bo
 
     values.sort((leftValue, rightValue) => leftValue - rightValue)
     const median = values[Math.floor(values.length / 2)] ?? 0
-    const spike = Math.max(0.045, median * 2.2)
+    // 384 寬後 3–20px 白條只剩 0.6–4px，欄均殘差常落在 0.03–0.04；
+    // 0.045 會把 live 上半寬條當成普通紋理。兩張不同照片的中位數
+    // 本來就高，2.2×median 仍擋得住誤標。
+    const spike = Math.max(PHOTO_RESIDUAL_SPIKE_FLOOR, median * 2.2)
 
     for (let column = 2; column < width - 2; column += 1) {
         const current = totals[column] ?? 0
         const neighborhood = ((totals[column - 2] ?? 0) + (totals[column + 2] ?? 0)) / 2
 
-        if (current > spike && current > neighborhood + 0.02) flags[column] = true
+        if (current > spike && current > neighborhood + 0.015) flags[column] = true
     }
 
     return flags
@@ -1540,6 +1558,44 @@ function listResidualWipeColumns(left: Buffer, right: Buffer, width: number): bo
 function countResidualWipeColumns(left: Buffer, right: Buffer, width: number): number
 {
     return listResidualWipeColumns(left, right, width).reduce((total, flag) => total + (flag ? 1 : 0), 0)
+}
+
+/**
+ * card-scale 視窗常比 wipe 區還高：下緣已是乾淨照片或 CTA，整帶
+ * 欄均會把上半百葉窗稀釋掉。上 40% 自己有直條／殘差就當成 wipe。
+ *
+ * @param upperSlice 上帶。
+ * @param lowerSlice 下帶。
+ * @param width 指紋寬度。
+ * @returns 上帶（或它的上 40%）像 wipe 時為 true。
+ */
+function bandHasWipe(upperSlice: Buffer, lowerSlice: Buffer, width: number): boolean
+{
+    const rowBytes = width * 3
+    const rows = Math.floor(upperSlice.length / rowBytes)
+
+    if (width < 8 || rows < 4 || lowerSlice.length < rowBytes) return false
+
+    if (countResidualWipeColumns(upperSlice, lowerSlice, width) >= WIPE_BAR_MIN_COUNT) {
+        return true
+    }
+
+    const topRows = Math.max(4, Math.round(rows * 0.4))
+    const topBytes = topRows * rowBytes
+    const topUpper = upperSlice.subarray(0, Math.min(topBytes, upperSlice.length))
+    const topLower = lowerSlice.subarray(0, Math.min(topBytes, lowerSlice.length))
+
+    if (
+        topUpper.length === topLower.length
+        && countResidualWipeColumns(topUpper, topLower, width) >= WIPE_BAR_MIN_COUNT
+    ) {
+        return true
+    }
+
+    return looksLikeVerticalWipe(upperSlice, width, rows)
+        || looksLikeVerticalWipe(topUpper, width, Math.floor(topUpper.length / rowBytes))
+        || countBlendedWipeColumns(upperSlice, width) >= WIPE_BAR_MIN_COUNT
+        || countBlendedWipeColumns(topUpper, width) >= WIPE_BAR_MIN_COUNT
 }
 
 /**
@@ -1909,12 +1965,11 @@ function scanViewportTiles(
         }
 
         const upperInterior = interiorContentVariance(upperSlice, rowBytes)
-        const upperHasWipe = looksLikeVerticalWipe(
+        const upperHasWipe = bandHasWipe(
             upperSlice,
+            lowerSlice,
             PHOTO_BELT_SIGNATURE_WIDTH,
-            tileRows,
-        ) || countBlendedWipeColumns(upperSlice, PHOTO_BELT_SIGNATURE_WIDTH) >= WIPE_BAR_MIN_COUNT
-            || residualWipeCount >= WIPE_BAR_MIN_COUNT
+        ) || residualWipeCount >= WIPE_BAR_MIN_COUNT
 
         if (upperInterior < 0.025 && !upperHasWipe) continue
 
@@ -2068,7 +2123,8 @@ function sceneBandDifference(
 /**
  * 頂部主照片在哪一側必須一致。上一張右圖卡的褶衣若只剩頂部一截，
  * 右半會被當成照片、左半 festival 仍對得上；這種殘留不可整段拒裁。
- * 真正的混窗是左／右主照片對調（奶油對照片）。
+ * 真正的混窗是左半奶油對左半照片（右圖卡對上左圖 wipe）。
+ * 右圖褶衣殘留仍允許：左半 festival 對得上就好。
  *
  * @param upperTop 上磚頂部。
  * @param lowerTop 下磚頂部。
@@ -2078,15 +2134,40 @@ function sceneBandDifference(
 function topLayoutMismatch(upperTop: Buffer, lowerTop: Buffer, width: number): boolean
 {
     const half = Math.floor(width / 2)
-    const leftUpper = regionHasPhoto(upperTop, width, 0, half)
-    const leftLower = regionHasPhoto(lowerTop, width, 0, half)
-    const rightUpper = regionHasPhoto(upperTop, width, half, width)
-    const rightLower = regionHasPhoto(lowerTop, width, half, width)
+    const leftUpper = regionHasPhotoSide(upperTop, width, 0, half)
+    const leftLower = regionHasPhotoSide(lowerTop, width, 0, half)
+    const rightUpper = regionHasPhotoSide(upperTop, width, half, width)
+    const rightLower = regionHasPhotoSide(lowerTop, width, half, width)
 
+    // 左圖對左圖：上一張右圖褶衣殘留不可整段拒裁。
     if (leftUpper && leftLower) return false
+    // 左半一邊奶油、一邊照片＝混窗（右圖卡對上左圖 wipe）。
+    if (leftUpper !== leftLower) return true
+    // 右圖對右圖（BRAKKA／gym）。
     if (rightUpper && rightLower) return false
 
-    return leftUpper !== leftLower || rightUpper !== rightLower
+    return rightUpper !== rightLower
+}
+
+/**
+ * 半幅有照片或淡化 wipe 佔比。密百葉窗的白條 luma>230，regionHasPhoto
+ * 會把它們當頁面；佔比仍要把 wipe 欄算進去，否則 wipe→乾淨會被當成混窗。
+ *
+ * @param slice RGB。
+ * @param width 指紋寬度。
+ * @param columnStart 欄起點。
+ * @param columnEnd 欄終點。
+ * @returns 該側像照片或 wipe 時為 true。
+ */
+function regionHasPhotoSide(
+    slice: Buffer,
+    width: number,
+    columnStart: number,
+    columnEnd: number,
+): boolean
+{
+    return regionHasPhoto(slice, width, columnStart, columnEnd)
+        || regionPhotoOccupancy(slice, width, columnStart, columnEnd) >= 0.25
 }
 
 /**
@@ -2170,9 +2251,12 @@ function regionPhotoOccupancy(
 /**
  * 在指紋上找一處相鄰重複帶。cardScale 時視窗可以比實際週期大（上複本
  * 常帶 wipe、下緣還有 CTA／留白），因此 lower 上方只需放得下上複本，
- * 週期可小於視窗。作品集中段上一張卡不必是近白；上複本有 wipe 時門檻
- * 放寬。接近一整個 viewport 的週期，只要配對夠近就裁，不要求一定偵測
- * 到 wipe。細帶則仍要求上方是另一段高細節照片。
+ * 週期可小於視窗。拼接步進 80% 時 wipe 幀會疊在乾淨幀上，週期約
+ * 432–864，同一個 1080 裁切裡同時看得到上半 wipe 與下半乾淨複本；
+ * 這種短週期的 pair 窗會切到上一張褶衣殘留，必須用半幅比左圖，並認
+ * 上帶上 40% 的 wipe／殘差。作品集中段上一張卡不必是近白；上複本有
+ * wipe 時門檻放寬。接近一整個 viewport 的週期，只要配對夠近就裁，不
+ * 要求一定偵測到 wipe。細帶則仍要求上方是另一段高細節照片。
  *
  * @param context 已縮好的長圖指紋。
  * @param ratios viewport 高度比例。
@@ -2249,39 +2333,45 @@ function findRepeatCut(
             if (bestUpper < 0) continue
 
             const upperSlice = signature.subarray(bestUpper * rowBytes, (bestUpper + bandRows) * rowBytes)
-            const pairDifference = contentMaskedDifference(
-                upperSlice.subarray(pairOffset),
-                lowerPair,
-                PHOTO_BELT_SIGNATURE_WIDTH,
-            )
             const skipColumns = cardScale
                 ? mergePairWipeColumns(upperSlice, lowerSlice, PHOTO_BELT_SIGNATURE_WIDTH)
                 : undefined
-            const maskedPair = skipColumns
-                ? contentMaskedDifference(
-                    upperSlice.subarray(pairOffset),
+            const pairWindow = upperSlice.subarray(pairOffset)
+            const maskedPair = cardScale
+                ? sceneBandDifference(
+                    pairWindow,
                     lowerPair,
                     PHOTO_BELT_SIGNATURE_WIDTH,
-                    0,
-                    0,
                     skipColumns,
                 )
-                : pairDifference
-            const upperHasWipe = cardScale
-                && (
-                    looksLikeVerticalWipe(upperSlice, PHOTO_BELT_SIGNATURE_WIDTH, bandRows)
-                    || countBlendedWipeColumns(upperSlice, PHOTO_BELT_SIGNATURE_WIDTH) >= WIPE_BAR_MIN_COUNT
-                    || countResidualWipeColumns(
-                        upperSlice,
-                        lowerSlice,
-                        PHOTO_BELT_SIGNATURE_WIDTH,
-                    ) >= WIPE_BAR_MIN_COUNT
+                : contentMaskedDifference(
+                    pairWindow,
+                    lowerPair,
+                    PHOTO_BELT_SIGNATURE_WIDTH,
                 )
+            const upperHasWipe = cardScale && bandHasWipe(
+                upperSlice,
+                lowerSlice,
+                PHOTO_BELT_SIGNATURE_WIDTH,
+            )
             const pairLimit = cardScale
                 ? (upperHasWipe ? PHOTO_CARD_WIPE_THRESHOLD : 0.025)
                 : (bandPx < PHOTO_BELT_THIN_PX ? PHOTO_BELT_THIN_THRESHOLD : PHOTO_BELT_THRESHOLD)
 
             if (maskedPair > pairLimit) continue
+
+            if (cardScale) {
+                const layoutRows = Math.max(6, Math.round(bandRows * 0.38))
+                const layoutBytes = layoutRows * rowBytes
+
+                if (topLayoutMismatch(
+                    upperSlice.subarray(0, layoutBytes),
+                    lowerSlice.subarray(0, layoutBytes),
+                    PHOTO_BELT_SIGNATURE_WIDTH,
+                )) {
+                    continue
+                }
+            }
 
             if (
                 cardScale
@@ -2582,6 +2672,22 @@ function isWipeVersusPhoto(leftLuma: number, rightLuma: number): boolean
         || (rightLuma > PHOTO_WIPE_LUMA && photoSide(leftLuma))
 }
 
+function isSmearedWipeVersusPhoto(leftLuma: number, rightLuma: number): boolean
+{
+    if (isWipeVersusPhoto(leftLuma, rightLuma)) return true
+
+    const photoSide = (luma: number): boolean => (
+        luma >= WIPE_NEIGHBOR_MIN_LUMA
+        && luma < PHOTO_BELT_PAGE_LUMA
+    )
+    const high = Math.max(leftLuma, rightLuma)
+    const low = Math.min(leftLuma, rightLuma)
+
+    return high >= BLENDED_WIPE_MIN_LUMINANCE
+        && high - low >= BLENDED_WIPE_NEIGHBOR_DELTA
+        && photoSide(low)
+}
+
 /**
  * 對齊用的便宜內容差。每隔幾個像素取樣、不排序，只用來找最佳
  * offset；通過後再用完整 `contentMaskedDifference` 把門檻。
@@ -2609,7 +2715,7 @@ function sampledContentDifference(left: Buffer, right: Buffer, width: number): n
 
         if (leftLuma > PHOTO_BELT_PAGE_LUMA || rightLuma > PHOTO_BELT_PAGE_LUMA) continue
 
-        if (isWipeVersusPhoto(leftLuma, rightLuma)) {
+        if (isSmearedWipeVersusPhoto(leftLuma, rightLuma)) {
             wipeSkipped += 1
             continue
         }

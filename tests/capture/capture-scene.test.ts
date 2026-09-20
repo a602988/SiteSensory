@@ -280,6 +280,26 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
         expect(await sampleRgb(trimmed, 200, trimmedHeight - 8)).toEqual([248, 245, 239])
     }, 20_000)
 
+    it('trims a live-like overlapping wipe→clean stack whose period is shorter than one viewport', async () => {
+        const page = await liveOverlappingWipeStack()
+        const sourceHeight = (await sharp(page).metadata()).height ?? 0
+        const trimmed = await trimRepeatedTailBand(page, WIDTH, { viewportTiles: true })
+        const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
+
+        expect(sourceHeight).toBe(6414)
+        expect(3822 + 432).toBe(4254)
+        expect(await sampleRgb(page, 150, 4000)).toEqual([255, 255, 255])
+        expect(await sampleRgb(page, 200, 4500)).not.toEqual([255, 255, 255])
+        expect(await sampleRgb(page, 200, 4500)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(page, 1400, 3500)).not.toEqual([248, 245, 239])
+        expect(trimmedHeight).toBeLessThan(6100)
+        expect(trimmedHeight).toBeGreaterThan(5000)
+        expect(await sampleRgb(trimmed, 150, 4000)).not.toEqual([255, 255, 255])
+        expect(await sampleRgb(trimmed, 200, 4000)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 1400, 3000)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 200, trimmedHeight - 8)).toEqual([248, 245, 239])
+    }, 30_000)
+
     it('trims a dark right-photo foot belt that strict above-luma skip would keep', async () => {
         const page = await darkRightPhotoFootBeltPage()
         const sourceHeight = (await sharp(page).metadata()).height ?? 0
@@ -1090,6 +1110,41 @@ async function liveFashionRemnantWideWipeStack(): Promise<Buffer>
         await venetianFestivalViewport({ wipe: false }),
         await darkRightPhotoFootBelt(),
     ])
+}
+
+async function liveOverlappingWipeStack(): Promise<Buffer>
+{
+    const period = 432
+    const base = await stackPngs([
+        await solidPng('#f8f5ef', 2742),
+        await rightFashionViewport(),
+        await venetianFestivalViewport({ remnant: true, wipe: true }),
+    ])
+    const overlay = await stackPngs([
+        await venetianFestivalViewport({ wipe: false }),
+        await darkRightPhotoFootBelt(),
+    ])
+
+    return overlayPngAt(base, overlay, 2742 + 1080 + period)
+}
+
+async function overlayPngAt(base: Buffer, overlay: Buffer, top: number): Promise<Buffer>
+{
+    const baseHeight = (await sharp(base).metadata()).height ?? 0
+    const overlayHeight = (await sharp(overlay).metadata()).height ?? 0
+    const height = Math.max(baseHeight, top + overlayHeight)
+
+    return sharp({
+        create: {
+            background: '#f8f5ef',
+            channels: 3,
+            height,
+            width: WIDTH,
+        },
+    }).composite([
+        { input: base, left: 0, top: 0 },
+        { input: overlay, left: 0, top },
+    ]).png().toBuffer()
 }
 
 async function darkRightPhotoFootBeltPage(): Promise<Buffer>
