@@ -1898,15 +1898,17 @@ function scanViewportTiles(
             lowerSlice.subarray(pairOffset),
             PHOTO_BELT_SIGNATURE_WIDTH,
         )
-
-        if (cheapPair > VIEWPORT_TILE_THRESHOLD + 0.05) continue
-
-        const upperInterior = interiorContentVariance(upperSlice, rowBytes)
         const residualWipeCount = countResidualWipeColumns(
             upperSlice,
             lowerSlice,
             PHOTO_BELT_SIGNATURE_WIDTH,
         )
+
+        if (cheapPair > VIEWPORT_TILE_THRESHOLD + 0.05 && residualWipeCount < WIPE_BAR_MIN_COUNT) {
+            continue
+        }
+
+        const upperInterior = interiorContentVariance(upperSlice, rowBytes)
         const upperHasWipe = looksLikeVerticalWipe(
             upperSlice,
             PHOTO_BELT_SIGNATURE_WIDTH,
@@ -1951,7 +1953,28 @@ function scanViewportTiles(
                 lowerSlice.subarray(0, topRows * rowBytes),
                 PHOTO_BELT_SIGNATURE_WIDTH,
             ) >= WIPE_BAR_MIN_COUNT
-        const bestDifference = Math.min(pairDifference, fullDifference)
+        let bestDifference = Math.min(pairDifference, fullDifference)
+
+        if (upperHasWipe && bestDifference > 0.02) {
+            for (const shift of [-4, -2, 2, 4]) {
+                const shiftedLower = lower + shift
+
+                if (shiftedLower < 0 || shiftedLower + tileRows > signatureHeight) continue
+
+                const shiftedSlice = signature.subarray(
+                    shiftedLower * rowBytes,
+                    (shiftedLower + tileRows) * rowBytes,
+                )
+                const shiftedDifference = sceneBandDifference(
+                    upperSlice,
+                    shiftedSlice,
+                    PHOTO_BELT_SIGNATURE_WIDTH,
+                    skipColumns,
+                )
+
+                if (shiftedDifference < bestDifference) bestDifference = shiftedDifference
+            }
+        }
 
         // 頂部必須也是同一張照片，否則滑動會切到錯位 100px 的奶油自比，
         // 或「上一張卡 + wipe」混窗。濃密百葉窗縮到 384 後，白條常被
@@ -2043,20 +2066,27 @@ function sceneBandDifference(
 }
 
 /**
- * 頂部左右哪一側是照片必須一致。否則「上一張右圖卡 + wipe」混窗
- * 會因左半幅 festival 殘差對上而被提早裁進前一張卡。
+ * 頂部主照片在哪一側必須一致。上一張右圖卡的褶衣若只剩頂部一截，
+ * 右半會被當成照片、左半 festival 仍對得上；這種殘留不可整段拒裁。
+ * 真正的混窗是左／右主照片對調（奶油對照片）。
  *
  * @param upperTop 上磚頂部。
  * @param lowerTop 下磚頂部。
  * @param width 指紋寬度。
- * @returns 左右照片布局不一致時為 true。
+ * @returns 主照片側不一致時為 true。
  */
 function topLayoutMismatch(upperTop: Buffer, lowerTop: Buffer, width: number): boolean
 {
     const half = Math.floor(width / 2)
+    const leftUpper = regionHasPhoto(upperTop, width, 0, half)
+    const leftLower = regionHasPhoto(lowerTop, width, 0, half)
+    const rightUpper = regionHasPhoto(upperTop, width, half, width)
+    const rightLower = regionHasPhoto(lowerTop, width, half, width)
 
-    return regionHasPhoto(upperTop, width, 0, half) !== regionHasPhoto(lowerTop, width, 0, half)
-        || regionHasPhoto(upperTop, width, half, width) !== regionHasPhoto(lowerTop, width, half, width)
+    if (leftUpper && leftLower) return false
+    if (rightUpper && rightLower) return false
+
+    return leftUpper !== leftLower || rightUpper !== rightLower
 }
 
 /**
@@ -2224,13 +2254,34 @@ function findRepeatCut(
                 lowerPair,
                 PHOTO_BELT_SIGNATURE_WIDTH,
             )
+            const skipColumns = cardScale
+                ? mergePairWipeColumns(upperSlice, lowerSlice, PHOTO_BELT_SIGNATURE_WIDTH)
+                : undefined
+            const maskedPair = skipColumns
+                ? contentMaskedDifference(
+                    upperSlice.subarray(pairOffset),
+                    lowerPair,
+                    PHOTO_BELT_SIGNATURE_WIDTH,
+                    0,
+                    0,
+                    skipColumns,
+                )
+                : pairDifference
             const upperHasWipe = cardScale
-                && looksLikeVerticalWipe(upperSlice, PHOTO_BELT_SIGNATURE_WIDTH, bandRows)
+                && (
+                    looksLikeVerticalWipe(upperSlice, PHOTO_BELT_SIGNATURE_WIDTH, bandRows)
+                    || countBlendedWipeColumns(upperSlice, PHOTO_BELT_SIGNATURE_WIDTH) >= WIPE_BAR_MIN_COUNT
+                    || countResidualWipeColumns(
+                        upperSlice,
+                        lowerSlice,
+                        PHOTO_BELT_SIGNATURE_WIDTH,
+                    ) >= WIPE_BAR_MIN_COUNT
+                )
             const pairLimit = cardScale
                 ? (upperHasWipe ? PHOTO_CARD_WIPE_THRESHOLD : 0.025)
                 : (bandPx < PHOTO_BELT_THIN_PX ? PHOTO_BELT_THIN_THRESHOLD : PHOTO_BELT_THRESHOLD)
 
-            if (pairDifference > pairLimit) continue
+            if (maskedPair > pairLimit) continue
 
             if (
                 cardScale
@@ -2267,8 +2318,8 @@ function findRepeatCut(
                 if (aboveIsPage && !cardScale) continue
 
                 const aboveLimit = !cardScale && bandPx < PHOTO_BELT_THIN_PX
-                    ? Math.max(0.03, pairDifference * 4)
-                    : Math.max(PHOTO_BELT_ABOVE_DELTA, pairDifference * 4)
+                    ? Math.max(0.03, maskedPair * 4)
+                    : Math.max(PHOTO_BELT_ABOVE_DELTA, maskedPair * 4)
 
                 if (!aboveIsPage && (aboveDifference === 0 || aboveDifference < aboveLimit)) {
                     continue
@@ -2298,18 +2349,18 @@ function findRepeatCut(
             const candidateHeight = Math.round(matchedPeriod * scale)
             const betterPage = cardScale && aboveIsPage && !cutFromPage
             const worsePage = cardScale && cutFromPage && !aboveIsPage
-            const betterDiff = pairDifference < cutDifference - 0.002
-            const similarLarger = Math.abs(pairDifference - cutDifference) <= 0.002
+            const betterDiff = maskedPair < cutDifference - 0.002
+            const similarLarger = Math.abs(maskedPair - cutDifference) <= 0.002
                 && candidateHeight > cutHeight
             const betterViewport = cardScale
                 && candidateHeight >= reference * 0.85
                 && cutHeight < reference * 0.7
-                && pairDifference <= PHOTO_CARD_WIPE_THRESHOLD
+                && maskedPair <= PHOTO_CARD_WIPE_THRESHOLD
 
             if (worsePage && !betterDiff && !betterViewport) continue
 
             if (betterPage || betterViewport || betterDiff || similarLarger || cutStart < 0) {
-                cutDifference = pairDifference
+                cutDifference = maskedPair
                 cutFromPage = aboveIsPage
                 cutStart = candidateStart
                 cutHeight = candidateHeight

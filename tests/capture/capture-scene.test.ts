@@ -263,6 +263,23 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
         expect(await sampleRgb(trimmed, 200, trimmedHeight - 40)).toEqual([248, 245, 239])
     }, 20_000)
 
+    it('trims a live-like wide upper wipe whose top-right still has the previous fashion remnant', async () => {
+        const page = await liveFashionRemnantWideWipeStack()
+        const sourceHeight = (await sharp(page).metadata()).height ?? 0
+        const trimmed = await trimRepeatedTailBand(page, WIDTH, { viewportTiles: true })
+        const trimmedHeight = (await sharp(trimmed).metadata()).height ?? 0
+
+        expect(sourceHeight).toBe(7062)
+        expect(await sampleRgb(page, 150, 4000)).toEqual([255, 255, 255])
+        expect(await sampleRgb(page, 1400, 3860)).not.toEqual([248, 245, 239])
+        expect(trimmedHeight).toBeLessThan(6100)
+        expect(trimmedHeight).toBeGreaterThan(5600)
+        expect(await sampleRgb(trimmed, 1400, 3600)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 150, 4000)).not.toEqual([255, 255, 255])
+        expect(await sampleRgb(trimmed, 200, 4000)).not.toEqual([248, 245, 239])
+        expect(await sampleRgb(trimmed, 200, trimmedHeight - 8)).toEqual([248, 245, 239])
+    }, 20_000)
+
     it('trims a dark right-photo foot belt that strict above-luma skip would keep', async () => {
         const page = await darkRightPhotoFootBeltPage()
         const sourceHeight = (await sharp(page).metadata()).height ?? 0
@@ -1058,9 +1075,20 @@ async function liveVenetianOffsetStack(): Promise<Buffer>
     return stackPngs([
         await solidPng('#f8f5ef', 2742),
         await rightFashionViewport(),
-        await venetianFestivalViewport({ wipe: true }),
+        await venetianFestivalViewport({ remnant: true, wipe: true }),
         await venetianFestivalViewport({ wipe: false }),
         await leftWallpaperFootBelt(),
+    ])
+}
+
+async function liveFashionRemnantWideWipeStack(): Promise<Buffer>
+{
+    return stackPngs([
+        await solidPng('#f8f5ef', 2742),
+        await rightFashionViewport(),
+        await venetianFestivalViewport({ remnant: true, wideWipe: true, wipe: true }),
+        await venetianFestivalViewport({ wipe: false }),
+        await darkRightPhotoFootBelt(),
     ])
 }
 
@@ -1163,22 +1191,42 @@ async function rightFashionViewport(): Promise<Buffer>
     return sharp(raw, { raw: { channels: 3, height: 1080, width: WIDTH } }).png().toBuffer()
 }
 
-async function venetianFestivalViewport(options: { wipe?: boolean } = {}): Promise<Buffer>
+async function venetianFestivalViewport(
+    options: { remnant?: boolean, wideWipe?: boolean, wipe?: boolean } = {},
+): Promise<Buffer>
 {
     const raw = Buffer.alloc(WIDTH * 1080 * 3)
+    const wipePeriod = options.wideWipe === true ? 52 : 12
+    const wipeBar = options.wideWipe === true ? 20 : 3
+    const wipeUntil = options.wideWipe === true ? 560 : 940
+    const wipeStart = options.wideWipe === true ? 140 : 100
+    const wipeEnd = options.wideWipe === true ? 900 : 940
 
     for (let row = 0; row < 1080; row += 1) {
         for (let column = 0; column < WIDTH; column += 1) {
             const index = (row * WIDTH + column) * 3
+            const inRemnant = options.remnant === true
+                && column >= 960
+                && column < 1860
+                && row < 160
             const inPhoto = column >= 80 && column < 980 && row >= 20 && row < 1020
             const inCaption = column >= 1100 && column < 1700 && row >= 40 && row < 110
             const inCta = column >= 1100 && column < 1480 && row >= 520 && row < 570
             const wipeColumn = options.wipe === true
                 && inPhoto
-                && row < 940
-                && (column - 100) % 12 < 3
-                && column >= 100
-                && column < 940
+                && row < wipeUntil
+                && (column - wipeStart) % wipePeriod < wipeBar
+                && column >= wipeStart
+                && column < wipeEnd
+
+            if (inRemnant) {
+                const fold = Math.abs(((column - 1400) % 70) - 35)
+
+                raw[index] = 236 - fold
+                raw[index + 1] = 232 - Math.floor(fold / 2)
+                raw[index + 2] = 228 - Math.floor(row / 90)
+                continue
+            }
 
             if (wipeColumn) {
                 raw[index] = 255
