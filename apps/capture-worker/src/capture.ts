@@ -29,6 +29,9 @@ const STICKY_CHROME_MIN_WIDTH_RATIO = 0.5
 const STICKY_CHROME_TOP_MAX_PX = 80
 const STICKY_SIDE_MAX_WIDTH_RATIO = 0.4
 const STICKY_SIDE_MIN_HEIGHT_RATIO = 0.2
+const STICKY_PIN_LABEL_MAX_WIDTH_RATIO = 0.4
+const STICKY_PIN_LABEL_MAX_HEIGHT_RATIO = 0.55
+const STICKY_PIN_LABEL_SIDE_RATIO = 0.22
 const STICKY_CHROME_SIDE_MAX_PX = 80
 const SCENE_TRIM_MAX_RATIO = 0.8
 const SCENE_TRIM_CONTINUE_RATIO = 0.75
@@ -71,6 +74,8 @@ const BLENDED_WIPE_NEIGHBOR_DELTA = 24
 const WIPE_BAND_RATIO = 0.18
 const WIPE_BAND_MIN_ROWS = 6
 const VIEWPORT_WIPE_HOLD_SAMPLES = 12
+const VIEWPORT_REVEAL_HOLD_SAMPLES = 10
+const SCROLL_POSITION_ATTEMPTS = 3
 const OVERLAY_SETTLE_MS = 250
 const SIGNATURE_HEIGHT = 18
 const SIGNATURE_WIDTH = 32
@@ -83,7 +88,15 @@ const VIEWPORT_SETTLE_STRIP_THRESHOLD = 0.025
 const SETTLE_SIGNATURE_HEIGHT = 108
 const SETTLE_SIGNATURE_WIDTH = 192
 const SCREENSHOT_TIMEOUT_MS = 120_000
-
+const DOCUMENT_HEIGHT_TOLERANCE_PX = 8
+const DOCUMENT_ROW_IDENTITY = 0.003
+const CURSOR_FOLLOWER_ATTRIBUTE = 'data-sitesensory-hide-cursor'
+const SETTLED_REVEAL_ATTRIBUTE = 'data-sitesensory-settled'
+const SUPPRESSED_SWAP_ATTRIBUTE = 'data-sitesensory-suppress-swap'
+const VIRTUAL_CANVAS_SCENE_RATIO = 0.45
+const SCROLL_SHELL_HEIGHT_RATIO = 1.35
+const OVERLAP_SEAM_THRESHOLD = 0.012
+const OVERLAP_SEAM_MIN_VARIANCE = 0.05
 export type CaptureOptions = {
     allowLocalNetwork?: boolean
     browser: Browser
@@ -123,6 +136,21 @@ export async function capturePage(options: CaptureOptions): Promise<CapturedPage
     try {
         const page = await context.newPage()
 
+        // tsx／esbuild 的 keepNames 會在送進瀏覽器的函式裡呼叫 __name。
+        // 頁面裡沒有這個 helper 時，逐段擷取會在 evaluate 直接失敗。
+        await page.addInitScript(() => {
+            const host = globalThis as typeof globalThis & {
+                __name?: (target: object, value: string) => object
+            }
+
+            if (typeof host.__name === 'function') return
+
+            host.__name = (target, value) => Object.defineProperty(target, 'name', {
+                configurable: true,
+                value,
+            })
+        })
+
         await page.route('**/*', async route => {
             const requestUrl = route.request().url()
             const protocol = new URL(requestUrl).protocol
@@ -161,6 +189,21 @@ export async function capturePage(options: CaptureOptions): Promise<CapturedPage
                 [${OVERLAY_ATTRIBUTE}] {
                     display: none !important;
                 }
+                [data-sitesensory-repeat-label] {
+                    visibility: hidden !important;
+                }
+                [${CURSOR_FOLLOWER_ATTRIBUTE}] {
+                    visibility: hidden !important;
+                }
+                [${SETTLED_REVEAL_ATTRIBUTE}] {
+                    clip-path: none !important;
+                    filter: none !important;
+                    opacity: 1 !important;
+                    transform: none !important;
+                }
+                [${SUPPRESSED_SWAP_ATTRIBUTE}] {
+                    opacity: 0 !important;
+                }
             `,
         })
         await dismissBlockingOverlays(page)
@@ -168,19 +211,76 @@ export async function capturePage(options: CaptureOptions): Promise<CapturedPage
         await dismissBlockingOverlays(page)
         await page.evaluate(async () => document.fonts.ready)
 
-        const evidence = await page.evaluate(() => ({
-            language: document.documentElement.lang || null,
-            links: [...document.querySelectorAll('a[href]')].map(link => (link as HTMLAnchorElement).href),
-            text: document.body.innerText.replace(/\s+/g, ' ').trim().slice(0, 20_000),
-            title: document.title.trim(),
-        }))
+        const evidence = await page.evaluate(() => {
+            /**
+             * 只收集畫面上真正看得見的文字。innerText 會帶進螢幕外選單、
+             * aria-hidden 與透明度為 0 的消息，那些不該進分析摘要。
+             */
+            function readVisiblePageText(): string
+            {
+                const chunks: string[] = []
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
+                let node = walker.nextNode()
+
+                while (node) {
+                    const parent = node.parentElement
+
+                    if (parent && isVisibleTextElement(parent)) {
+                        const value = node.textContent?.replace(/\s+/g, ' ').trim()
+
+                        if (value) chunks.push(value)
+                    }
+
+                    node = walker.nextNode()
+                }
+
+                return chunks.join(' ').replace(/\s+/g, ' ').trim().slice(0, 20_000)
+            }
+
+            function isVisibleTextElement(element: HTMLElement): boolean
+            {
+                let current: HTMLElement | null = element
+
+                while (current && current !== document.documentElement) {
+                    if (current.hidden || current.getAttribute('aria-hidden') === 'true' || current.inert) return false
+                    if (current instanceof HTMLDialogElement && !current.open) return false
+
+                    const style = getComputedStyle(current)
+
+                    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false
+
+                    current = current.parentElement
+                }
+
+                const bounds = element.getBoundingClientRect()
+
+                if (bounds.width < 1 || bounds.height < 1) return false
+
+                const top = bounds.top + window.scrollY
+                const left = bounds.left + window.scrollX
+                const scrollHeight = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)
+                const scrollWidth = Math.max(document.body.scrollWidth, document.documentElement.scrollWidth)
+
+                if (top + bounds.height < -1 || top > scrollHeight + 1) return false
+                if (left + bounds.width < -1 || left > scrollWidth + 1) return false
+
+                return true
+            }
+
+            return {
+                language: document.documentElement.lang || null,
+                links: [...document.querySelectorAll('a[href]')].map(link => (link as HTMLAnchorElement).href),
+                text: readVisiblePageText(),
+                title: document.title.trim(),
+            }
+        })
 
         if (isAccessInterstitial(evidence.title, evidence.text)) {
             throw new Error('目標網站回傳存取驗證頁，未取得可分析的網站內容')
         }
 
         const hero = await settleVisibleViewport(page)
-        const viewportBuffer = hero.hasWipeArtifact
+        const viewportBuffer = hero.hasWipeArtifact || hero.hasRevealArtifact
             ? (await nudgeForCleanViewport(page, 0))?.image ?? hero.image
             : hero.image
         const fullPageBuffer = await captureFullPage(page)
@@ -234,6 +334,92 @@ export function isAccessInterstitial(title: string, text: string): boolean
 }
 
 /**
+ * 把視窗與平滑捲動控制器一起跳到指定位置。Lenis 這類函式庫會用自己的
+ * scroll 值蓋掉 window.scrollTo；有立即捲動 API 時先叫它，再同步
+ * ScrollTrigger。這不是針對特定網域，只認頁面上的控制器。
+ *
+ * @param page Playwright 頁面。
+ * @param scrollTop 文件座標。
+ * @returns 完成捲動後結束。
+ */
+async function scrollPageTo(page: import('playwright').Page, scrollTop: number): Promise<void>
+{
+    await page.evaluate(top => {
+        const host = window as Window & {
+            ScrollTrigger?: { update?: () => void }
+            __lenis?: { scrollTo?: (target: number, options?: { force?: boolean, immediate?: boolean }) => void }
+            lenis?: { scrollTo?: (target: number, options?: { force?: boolean, immediate?: boolean }) => void }
+        }
+
+        for (const controller of [host.lenis, host.__lenis]) {
+            if (typeof controller?.scrollTo === 'function') {
+                controller.scrollTo(top, { force: true, immediate: true })
+            }
+        }
+
+        window.scrollTo(0, top)
+        document.documentElement.scrollTop = top
+        document.body.scrollTop = top
+        host.ScrollTrigger?.update?.()
+    }, scrollTop)
+}
+
+/**
+ * 讀取目前文件捲動位置。
+ *
+ * @param page Playwright 頁面。
+ * @returns 四捨五入後的 scrollY。
+ */
+async function readDocumentScroll(page: import('playwright').Page): Promise<number>
+{
+    return page.evaluate(() => Math.round(window.scrollY))
+}
+
+/**
+ * 捲到指定位置並確認沒有被平滑捲動再帶走。網站若把目標改寫到別的位置，
+ * 會再下達幾次立即捲動；每次都等到 scrollY 連續不動。
+ *
+ * @param page Playwright 頁面。
+ * @param scrollTop 文件座標。
+ * @returns 穩定後的 scrollY。可能仍與目標不同。
+ */
+async function scrollPageToAndHold(page: import('playwright').Page, scrollTop: number): Promise<number>
+{
+    let actual = await readDocumentScroll(page)
+
+    for (let attempt = 0; attempt < SCROLL_POSITION_ATTEMPTS; attempt += 1) {
+        await scrollPageTo(page, scrollTop)
+        actual = await waitUntilScrollStops(page)
+
+        if (Math.abs(actual - scrollTop) <= DOCUMENT_HEIGHT_TOLERANCE_PX) return actual
+    }
+
+    return actual
+}
+
+/**
+ * 等到 scrollY 連續兩次不變，避免把還在滑動的中間值當成擷取位置。
+ *
+ * @param page Playwright 頁面。
+ * @returns 停下時的 scrollY。
+ */
+async function waitUntilScrollStops(page: import('playwright').Page): Promise<number>
+{
+    let previous = await readDocumentScroll(page)
+    let stable = 0
+
+    for (let index = 0; index < 12 && stable < 2; index += 1) {
+        await page.waitForTimeout(40)
+        const current = await readDocumentScroll(page)
+
+        stable = current === previous ? stable + 1 : 0
+        previous = current
+    }
+
+    return previous
+}
+
+/**
  * 先瀏覽完整頁面，讓依賴捲動或 IntersectionObserver 的內容完成載入。
  *
  * @param page Playwright 頁面。
@@ -254,8 +440,20 @@ async function preparePageForCapture(page: import('playwright').Page): Promise<v
             )
             const bottom = Math.max(pageHeight - viewportHeight, 0)
             const next = Math.min(window.scrollY + step, bottom)
+            const host = window as Window & {
+                ScrollTrigger?: { update?: () => void }
+                __lenis?: { scrollTo?: (target: number, options?: { force?: boolean, immediate?: boolean }) => void }
+                lenis?: { scrollTo?: (target: number, options?: { force?: boolean, immediate?: boolean }) => void }
+            }
+
+            for (const controller of [host.lenis, host.__lenis]) {
+                if (typeof controller?.scrollTo === 'function') {
+                    controller.scrollTo(next, { force: true, immediate: true })
+                }
+            }
 
             window.scrollTo(0, next)
+            host.ScrollTrigger?.update?.()
 
             return { pageHeight, reachedBottom: next >= bottom }
         }, SCROLL_STEP_RATIO)
@@ -291,7 +489,7 @@ async function preparePageForCapture(page: import('playwright').Page): Promise<v
         undefined,
         { timeout: IMAGE_SETTLE_TIMEOUT_MS },
     ).catch(() => undefined)
-    await page.evaluate(() => window.scrollTo(0, 0))
+    await scrollPageTo(page, 0)
     await page.waitForTimeout(CONTENT_SETTLE_MS)
 }
 
@@ -318,56 +516,242 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         throw new Error(`頁面高度 ${dimensions.height}px 超過單次擷取上限 ${MAX_CAPTURE_HEIGHT}px`)
     }
 
-    await markFixedElements(page)
+    const hasVirtualCanvas = await markFixedElements(page)
+    const singleScreen = dimensions.height <= dimensions.viewportHeight + DOCUMENT_HEIGHT_TOLERANCE_PX
 
     const segments: OverlayOptions[] = []
     const keptSegments: Buffer[] = []
-    const hasVirtualCanvas = await detectsVirtualCanvas(page)
     const capturePositions = createCapturePositions(dimensions.height, dimensions.viewportHeight)
     let documentCoveredUntil = 0
     let outputHeight = 0
     let previousSignature: Buffer | null = null
+    let recentTail: Buffer | null = null
+    let stickyHold: StickySignature | null = null
+    let trimmedPixels = 0
+    const protectedBands: MediaBand[] = []
+    const emittedFadeSections = new Set<number>()
 
     for (const target of capturePositions) {
+        if (target + dimensions.viewportHeight <= documentCoveredUntil + DOCUMENT_HEIGHT_TOLERANCE_PX) continue
+
         await page.evaluate(({ hideFixedAttribute, scrollTop }) => {
             document.documentElement.toggleAttribute(hideFixedAttribute, scrollTop > 0)
-            window.scrollTo(0, scrollTop)
         }, { hideFixedAttribute: HIDE_FIXED_ATTRIBUTE, scrollTop: target })
+        await scrollPageToAndHold(page, target)
+        await freezeExpandingBoxes(page)
+        await settleScrollScrubbedFrame(page)
+        await hideRepeatedStickyPinLabels(page, Math.max(0, documentCoveredUntil - target))
         let settled = await settleVisibleViewport(page)
+        let acceptedNudge = false
 
-        if (settled.hasWipeArtifact) {
+        if (settled.hasWipeArtifact || settled.hasRevealArtifact) {
             const clean = await nudgeForCleanViewport(page, target)
 
-            if (clean && hasVirtualCanvas) {
-                settled = clean
+            if (clean) {
+                const nudged = await readDocumentScroll(page)
+                const opensGap = !hasVirtualCanvas && nudged > documentCoveredUntil + DOCUMENT_HEIGHT_TOLERANCE_PX
+
+                if (!opensGap) {
+                    settled = clean
+                    acceptedNudge = true
+                }
+                else {
+                    await scrollPageToAndHold(page, target)
+                }
             }
             else {
-                continue
+                await scrollPageToAndHold(page, target)
             }
+
+            const stillDirty = !acceptedNudge && settled.hasWipeArtifact && !settled.hasRevealArtifact
+            const laterCovers = capturePositions.some(position => position > target
+                && position <= documentCoveredUntil + DOCUMENT_HEIGHT_TOLERANCE_PX)
+
+            // 跟捲動綁死的 wipe 不寫進成品，但只在後面還有一段能從已覆蓋處接上時略過。
+            // 略過的範圍不是像素比對裁掉的重複，不能計入 trimmedPixels。
+            // 半完成揭示、以及後面接不上的區段，都寫入當時畫面；缺頁要讓高度檢查失敗。
+            if (stillDirty && laterCovers && !hasVirtualCanvas) continue
         }
 
-        let actualScroll = await page.evaluate(() => Math.round(window.scrollY))
-
-        if (actualScroll > target) {
-            await page.evaluate(scrollTop => window.scrollTo(0, scrollTop), target)
-            await page.waitForTimeout(SCROLL_DELAY_MS)
-            actualScroll = await page.evaluate(() => Math.round(window.scrollY))
-        }
+        let actualScroll = acceptedNudge
+            ? await readDocumentScroll(page)
+            : await scrollPageToAndHold(page, target)
 
         if (actualScroll > target && actualScroll > documentCoveredUntil) {
             throw new Error(`網站將 ${target}px 的擷取位置改到 ${actualScroll}px，無法產生無缺口的完整頁面`)
         }
 
-        const documentStart = hasVirtualCanvas ? actualScroll : Math.max(actualScroll, documentCoveredUntil)
-        const documentEnd = Math.min(actualScroll + dimensions.viewportHeight, dimensions.height)
-        const sourceTop = hasVirtualCanvas ? 0 : documentStart - actualScroll
-        const segmentHeight = hasVirtualCanvas ? dimensions.viewportHeight : documentEnd - documentStart
+        let documentStart = hasVirtualCanvas ? actualScroll : Math.max(actualScroll, documentCoveredUntil)
+        let documentEnd = Math.min(actualScroll + dimensions.viewportHeight, dimensions.height)
+        let sourceTop = hasVirtualCanvas ? 0 : documentStart - actualScroll
+        let segmentHeight = hasVirtualCanvas ? dimensions.viewportHeight : documentEnd - documentStart
+        let viewport = settled.image
 
         if (segmentHeight <= 0) {
-            throw new Error(`無法擷取頁面 ${target}px 到 ${target + dimensions.viewportHeight}px 的區段`)
+            const uncovered = dimensions.height - documentCoveredUntil
+
+            // 文件只比一個視窗高幾個像素，而且捲動被鎖住時，第二段切不出新像素。
+            // 單屏成品就是目前視窗，不能把這 4px 級的尾巴當成擷取失敗。
+            if (keptSegments.length > 0 && uncovered <= DOCUMENT_HEIGHT_TOLERANCE_PX) break
+
+            // 網站把這一步彈回已經寫過的釘住區段。後面還有能伸出已覆蓋範圍的位置就先跳過。
+            const laterCanPass = capturePositions.some(position => position > target
+                && position + dimensions.viewportHeight > documentCoveredUntil + DOCUMENT_HEIGHT_TOLERANCE_PX)
+            const windowAlreadyCovered = actualScroll + dimensions.viewportHeight
+                <= documentCoveredUntil + DOCUMENT_HEIGHT_TOLERANCE_PX
+
+            if (laterCanPass && windowAlreadyCovered) continue
+
+            for (let retry = 0; retry < 4 && segmentHeight <= 0; retry += 1) {
+                await page.waitForTimeout(400)
+                const landed = await scrollPageToAndHold(page, target)
+
+                if (landed + dimensions.viewportHeight <= documentCoveredUntil + DOCUMENT_HEIGHT_TOLERANCE_PX) continue
+
+                await freezeExpandingBoxes(page)
+                viewport = await screenshotViewport(page, 'allow')
+                actualScroll = landed
+                documentStart = hasVirtualCanvas ? actualScroll : Math.max(actualScroll, documentCoveredUntil)
+                documentEnd = Math.min(actualScroll + dimensions.viewportHeight, dimensions.height)
+                sourceTop = hasVirtualCanvas ? 0 : documentStart - actualScroll
+                segmentHeight = hasVirtualCanvas ? dimensions.viewportHeight : documentEnd - documentStart
+            }
+
+            if (segmentHeight <= 0) {
+                throw new Error(`無法擷取頁面 ${target}px 到 ${target + dimensions.viewportHeight}px 的區段（實際 ${actualScroll}px，已覆蓋到 ${documentCoveredUntil}px）`)
+            }
         }
 
-        const viewport = settled.image
+        if (!hasVirtualCanvas && !singleScreen) {
+            const stacked = await readStackedFadeSection(page)
+
+            if (
+                stacked
+                && !emittedFadeSections.has(stacked.start)
+                && documentCoveredUntil <= stacked.start + DOCUMENT_HEIGHT_TOLERANCE_PX
+                && actualScroll < stacked.end
+            ) {
+                const gap = stacked.start - documentCoveredUntil
+                const gapSourceTop = documentCoveredUntil - actualScroll
+                const gapFits = gap <= 8 || (gapSourceTop >= 0 && gapSourceTop + gap <= dimensions.viewportHeight)
+
+                if (gapFits) {
+                    const frames = await captureStackedFadeFrames(page, stacked, dimensions.viewportHeight)
+
+                    if (frames.length < stacked.count) {
+                        emittedFadeSections.add(stacked.start)
+                        await scrollPageToAndHold(page, actualScroll)
+                    }
+                    else {
+                        if (gap > 8 && viewport) {
+                            const gapImage = await sharp(viewport)
+                                .extract({
+                                    height: gap,
+                                    left: 0,
+                                    top: gapSourceTop,
+                                    width: dimensions.width,
+                                })
+                                .png()
+                                .toBuffer()
+
+                            segments.push({ input: gapImage, left: 0, top: outputHeight })
+                            keptSegments.push(gapImage)
+                            outputHeight += gap
+                            recentTail = gapImage
+                        }
+
+                        const span = stacked.end - stacked.start
+                        const overflow = Math.max(0, frames.length * dimensions.viewportHeight - span)
+                        const crop = Math.min(160, overflow > 8 ? Math.ceil(overflow / frames.length) : 0)
+                        const frameHeight = dimensions.viewportHeight - crop
+
+                        for (const frame of frames) {
+                            const image = crop > 0
+                                ? await sharp(frame)
+                                    .extract({
+                                        height: frameHeight,
+                                        left: 0,
+                                        top: crop,
+                                        width: dimensions.width,
+                                    })
+                                    .png()
+                                    .toBuffer()
+                                : frame
+
+                            segments.push({ input: image, left: 0, top: outputHeight })
+                            keptSegments.push(image)
+                            outputHeight += frameHeight
+                            recentTail = image
+                        }
+
+                        trimmedPixels += Math.max(0, span - frames.length * frameHeight)
+                        documentCoveredUntil = stacked.end
+                        emittedFadeSections.add(stacked.start)
+                        stickyHold = null
+                        continue
+                    }
+                }
+            }
+        }
+
+        const pinnedStart = !hasVirtualCanvas && !singleScreen && viewport
+            ? await readUnreadablePinnedSectionStart(page)
+            : null
+
+        if (
+            pinnedStart !== null
+            && viewport
+            && pinnedStart > documentStart + 24
+            && pinnedStart < documentEnd - 24
+        ) {
+            const revealScroll = Math.min(documentEnd - 24, pinnedStart + 280)
+            const landed = await scrollPageToAndHold(page, revealScroll)
+
+            if (landed >= pinnedStart - DOCUMENT_HEIGHT_TOLERANCE_PX) {
+                const lead = pinnedStart - documentStart
+                const leadImage = await sharp(viewport)
+                    .extract({
+                        height: lead,
+                        left: 0,
+                        top: sourceTop,
+                        width: dimensions.width,
+                    })
+                    .png()
+                    .toBuffer()
+
+                segments.push({ input: leadImage, left: 0, top: outputHeight })
+                keptSegments.push(leadImage)
+                outputHeight += lead
+
+                await freezeExpandingBoxes(page)
+                const frame = await screenshotViewport(page, 'allow')
+                const room = Math.min(dimensions.viewportHeight, Math.max(1, dimensions.height - landed))
+                const frameImage = room < dimensions.viewportHeight
+                    ? await sharp(frame)
+                        .extract({
+                            height: room,
+                            left: 0,
+                            top: 0,
+                            width: dimensions.width,
+                        })
+                        .png()
+                        .toBuffer()
+                    : frame
+
+                segments.push({ input: frameImage, left: 0, top: outputHeight })
+                keptSegments.push(frameImage)
+                outputHeight += room
+                recentTail = frameImage
+                trimmedPixels += Math.max(0, landed - pinnedStart)
+                documentCoveredUntil = Math.max(documentCoveredUntil, landed + room)
+                stickyHold = await readStickySignature(page)
+                continue
+            }
+
+            await scrollPageToAndHold(page, actualScroll)
+        }
+
+        const mediaBands = hasVirtualCanvas ? [] : await readUncroppedMediaBands(page)
         let segment: Buffer | null = await sharp(viewport)
             .extract({
                 height: segmentHeight,
@@ -376,20 +760,179 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
                 width: dimensions.width,
             })
             .toBuffer()
+        let segmentBands = viewportBandsToSegment(mediaBands, sourceTop, segmentHeight)
+
+        let preserveStickyFrame = false
+        let pendingSticky: StickySignature | null = null
+
+        if (segment && !hasVirtualCanvas && await stickyPinCoversViewport(page)) {
+            const safeToCollapse = segmentBands.every(band => {
+                const bandHeight = band.bottom - band.top
+
+                return bandHeight < 40 || bandHeight > dimensions.viewportHeight * 0.7
+            })
+
+            if (safeToCollapse) {
+                const signature = await readStickySignature(page)
+                const relation = relateStickySignatures(stickyHold, signature)
+
+                if (relation === 'drop-same') {
+                    const sameText = stickyHold?.texts === signature.texts
+                    const samePixels = !sameText || (recentTail
+                        ? visualDifference(
+                            await createVisualSignature(viewport),
+                            await createVisualSignature(recentTail),
+                        ) <= 0.06
+                        : true)
+
+                    if (samePixels) {
+                        trimmedPixels += Math.max(0, documentEnd - documentCoveredUntil)
+                        documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
+                        continue
+                    }
+                }
+
+                if (relation === 'empty') {
+                    const duplicatePrefix = recentTail
+                        ? await stickyDuplicatePrefixLength(segment, recentTail, dimensions.width)
+                        : 0
+
+                    if (duplicatePrefix >= segmentHeight - 2) {
+                        trimmedPixels += Math.max(0, documentEnd - documentCoveredUntil)
+                        documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
+                        continue
+                    }
+                }
+                else if (relation === 'replace' && stickyHold && keptSegments.length > 0) {
+                    const richer = await captureRicherStickyFrame(page, signature, viewport)
+                    const lastIndex = keptSegments.length - 1
+                    const previousBuffer = keptSegments[lastIndex] ?? richer.image
+                    const previousHeight = (await sharp(previousBuffer).metadata()).height ?? 0
+                    const nextHeight = (await sharp(richer.image).metadata()).height ?? 0
+                    const lastTop = Number(segments[lastIndex]?.top ?? 0)
+
+                    segments[lastIndex] = { input: richer.image, left: 0, top: lastTop }
+                    keptSegments[lastIndex] = richer.image
+                    outputHeight += nextHeight - previousHeight
+
+                    const advance = Math.max(0, documentEnd - documentCoveredUntil)
+
+                    trimmedPixels += Math.max(0, advance - (nextHeight - previousHeight))
+                    documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
+                    stickyHold = richer.signature
+                    recentTail = richer.image
+
+                    for (let bandIndex = protectedBands.length - 1; bandIndex >= 0; bandIndex -= 1) {
+                        if ((protectedBands[bandIndex]?.top ?? 0) >= lastTop) protectedBands.splice(bandIndex, 1)
+                    }
+
+                    continue
+                }
+                else if (relation === 'keep' || relation === 'drop-same') {
+                    const richer = await captureRicherStickyFrame(page, signature, viewport)
+                    const richerHeight = (await sharp(richer.image).metadata()).height ?? segmentHeight
+
+                    segment = richer.image
+                    segmentHeight = richerHeight
+                    sourceTop = 0
+                    segmentBands = viewportBandsToSegment(mediaBands, 0, richerHeight)
+                    preserveStickyFrame = true
+                    pendingSticky = richer.signature
+                }
+            }
+            else {
+                stickyHold = null
+            }
+        }
+        else if (!hasVirtualCanvas) {
+            stickyHold = null
+        }
+
+        if (!preserveStickyFrame && segment && !hasVirtualCanvas && recentTail && await stickyPinCoversViewport(page)) {
+            const safeToCollapse = segmentBands.every(band => {
+                const bandHeight = band.bottom - band.top
+
+                return bandHeight < 40 || bandHeight > dimensions.viewportHeight * 0.7
+            })
+            const duplicatePrefix = safeToCollapse
+                ? await stickyDuplicatePrefixLength(segment, recentTail, dimensions.width)
+                : 0
+
+            if (duplicatePrefix >= segmentHeight - 2) {
+                trimmedPixels += Math.max(0, documentEnd - documentCoveredUntil)
+                documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
+                continue
+            }
+
+            if (duplicatePrefix >= 24) {
+                segment = await sharp(segment)
+                    .extract({
+                        height: segmentHeight - duplicatePrefix,
+                        left: 0,
+                        top: duplicatePrefix,
+                        width: dimensions.width,
+                    })
+                    .png()
+                    .toBuffer()
+                trimmedPixels += duplicatePrefix
+                segmentBands = viewportBandsToSegment(
+                    mediaBands,
+                    sourceTop + duplicatePrefix,
+                    segmentHeight - duplicatePrefix,
+                )
+            }
+
+            if (segment && safeToCollapse) {
+                const edges = await stickyBlankEdges(segment, dimensions.width)
+                const heightNow = (await sharp(segment).metadata()).height ?? 0
+                const lead = edges.lead >= 200 && edges.lead < heightNow ? edges.lead : 0
+                const tail = edges.tail >= 200 && lead + edges.tail < heightNow ? edges.tail : 0
+
+                if (lead + tail >= 200 && edges.ink > 0) {
+                    segment = await sharp(segment)
+                        .extract({
+                            height: heightNow - lead - tail,
+                            left: 0,
+                            top: lead,
+                            width: dimensions.width,
+                        })
+                        .png()
+                        .toBuffer()
+                    trimmedPixels += lead + tail
+                    segmentBands = viewportBandsToSegment(mediaBands, sourceTop + duplicatePrefix + lead, heightNow - lead - tail)
+                }
+            }
+        }
 
         if (!hasVirtualCanvas) {
             const previous = keptSegments.at(-1)
 
             if (previous) {
-                segment = await trimDuplicateScenePrefix(previous, segment, dimensions.width)
+                const beforePrefix = segmentHeight
+
+                segment = await trimDuplicateScenePrefix(previous, segment, dimensions.width, {
+                    bandOrigin: sourceTop,
+                    identicalRows: true,
+                    protectedBands: preserveStickyFrame ? [] : mediaBands,
+                })
+
+                const afterPrefix = segment
+                    ? (await sharp(segment).metadata()).height ?? 0
+                    : 0
+
+                segmentBands = viewportBandsToSegment(mediaBands, sourceTop + (beforePrefix - afterPrefix), afterPrefix)
             }
         }
 
-        if (segment && !hasVirtualCanvas) {
-            segment = await trimRepeatedTailBand(segment, dimensions.width)
+        if (segment && !hasVirtualCanvas && !singleScreen) {
+            segment = await trimRepeatedTailBand(segment, dimensions.width, {
+                identicalRows: true,
+                protectedBands: segmentBands,
+            })
         }
 
         if (!segment) {
+            trimmedPixels += Math.max(0, documentEnd - documentCoveredUntil)
             documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
             continue
         }
@@ -398,9 +941,12 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         const keptHeight = trimmedMeta.height ?? 0
 
         if (keptHeight <= 0) {
+            trimmedPixels += Math.max(0, documentEnd - documentCoveredUntil)
             documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
             continue
         }
+
+        if (!hasVirtualCanvas) trimmedPixels += Math.max(0, segmentHeight - keptHeight)
 
         const signature = hasVirtualCanvas
             ? await createVisualSignature(segment)
@@ -437,9 +983,30 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
 
         segments.push({ input: segment, left: 0, top: outputHeight })
         keptSegments.push(segment)
+        stickyHold = pendingSticky ?? (hasVirtualCanvas ? stickyHold : null)
+
+        if (!hasVirtualCanvas) {
+            recentTail = await rememberRecentScene(recentTail, segment, dimensions.width, dimensions.viewportHeight)
+        }
+
+        if (!hasVirtualCanvas) {
+            for (const band of segmentBands) {
+                const top = outputHeight + band.top
+                const bottom = outputHeight + band.bottom
+
+                if (bottom - top >= 24 && bottom <= outputHeight + keptHeight) {
+                    protectedBands.push({ bottom, top })
+                }
+            }
+        }
+
         outputHeight += keptHeight
         documentCoveredUntil = documentEnd
         previousSignature = signature
+    }
+
+    if (outputHeight <= 0 || segments.length === 0) {
+        throw new Error('沒有可拼接的視窗，無法產生完整頁面')
     }
 
     const fullPage = await sharp({
@@ -462,12 +1029,62 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
     if (
         metadata.width !== dimensions.width
         || metadata.height !== outputHeight
-        || finalHeight !== dimensions.height
+        || Math.abs(finalHeight - dimensions.height) > DOCUMENT_HEIGHT_TOLERANCE_PX
     ) {
         throw new Error('完整頁面合成後的尺寸與穩定頁面尺寸不一致')
     }
 
-    return trimRepeatedTailBand(fullPage, dimensions.width, { viewportTiles: hasVirtualCanvas })
+    let trimmed = singleScreen
+        ? fullPage
+        : await trimRepeatedTailBand(
+            fullPage,
+            dimensions.width,
+            hasVirtualCanvas
+                ? { viewportTiles: true }
+                : { identicalRows: true, protectedBands },
+        )
+    let trimmedMeta = await sharp(trimmed).metadata()
+    let imageHeight = trimmedMeta.height ?? 0
+
+    if (!hasVirtualCanvas && imageHeight > finalHeight + DOCUMENT_HEIGHT_TOLERANCE_PX) {
+        const absorbed = await absorbStrictWhiteOvershoot(
+            trimmed,
+            dimensions.width,
+            imageHeight - finalHeight,
+            protectedBands,
+        )
+
+        if (absorbed) {
+            trimmed = absorbed
+            trimmedMeta = await sharp(trimmed).metadata()
+            imageHeight = trimmedMeta.height ?? 0
+        }
+    }
+
+    if (trimmedMeta.width !== dimensions.width) {
+        throw new Error('完整頁面合成後的尺寸與穩定頁面尺寸不一致')
+    }
+
+    if (!hasVirtualCanvas) {
+        const removedByTail = Math.max(0, outputHeight - imageHeight)
+        const accounted = trimmedPixels + removedByTail
+
+        if (imageHeight > finalHeight + DOCUMENT_HEIGHT_TOLERANCE_PX) {
+            throw new Error(`完整頁面高度 ${imageHeight}px 高於文件高度 ${finalHeight}px`)
+        }
+
+        if (imageHeight + accounted + DOCUMENT_HEIGHT_TOLERANCE_PX < finalHeight) {
+            throw new Error(`完整頁面高度 ${imageHeight}px 低於文件高度 ${finalHeight}px，且沒有對應的去重`)
+        }
+    }
+
+    const overlapSeam = await hasRepeatedOverlapSeam(trimmed, dimensions.width, dimensions.viewportHeight)
+
+    if (overlapSeam > 0) {
+        throw new Error(`拼接接縫以重疊步進重複同一段內容，拒絕保存（y=${overlapSeam}）`)
+    }
+
+    return trimmed
 }
 
 /**
@@ -490,32 +1107,6 @@ function createCapturePositions(pageHeight: number, viewportHeight: number): num
     if (positions.at(-1) !== maximumScroll) positions.push(maximumScroll)
 
     return positions
-}
-
-/**
- * 判斷目前頁面是否以覆蓋大部分 viewport 的 fixed 元素呈現捲動內容。
- * 接近整段 viewport 的 sticky 區塊是文件流裡的捲動場景，要保留預留高度，
- * 不可當成可壓縮的虛擬畫布。
- *
- * @param page Playwright 頁面。
- * @returns 存在可見的虛擬捲動畫布時為 true。
- */
-async function detectsVirtualCanvas(page: import('playwright').Page): Promise<boolean>
-{
-    return page.evaluate(canvasCoverageRatio => [...document.body.querySelectorAll<HTMLElement>('*')]
-        .some(element => {
-            const style = getComputedStyle(element)
-
-            if (style.position !== 'fixed') return false
-            if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false
-
-            const bounds = element.getBoundingClientRect()
-
-            return bounds.width >= window.innerWidth * canvasCoverageRatio
-                && bounds.height >= window.innerHeight * canvasCoverageRatio
-                && bounds.bottom > 0
-                && bounds.top < window.innerHeight
-        }), FIXED_CANVAS_COVERAGE_RATIO)
 }
 
 /**
@@ -554,26 +1145,342 @@ function visualDifference(left: Buffer, right: Buffer): number
 }
 
 /**
- * 標記頁首已存在的小型固定介面、頂部 sticky 導覽列，以及貼齊左右的
- * sticky 側欄，避免這些 chrome 在每段重複出現。覆蓋大部分 viewport 的
- * 固定畫布，與接近整段 viewport 高且接近全寬的 sticky 捲動場景不在此列。
+ * 計算指紋差異時略過裝飾區域。沒有遮罩時與全圖差異相同。
+ * 遮罩蓋滿時視為沒有可比較的內容變化。
+ *
+ * @param left 前一幀指紋。
+ * @param right 目前指紋。
+ * @param mask 為 1 的像素不比較；null 表示全圖比較。
+ * @returns 介於 0 與 1 的平均像素差異。
+ */
+function maskedVisualDifference(left: Buffer, right: Buffer, mask: Uint8Array | null): number
+{
+    if (!mask) return visualDifference(left, right)
+    if (left.length !== right.length) return 1
+
+    let total = 0
+    let count = 0
+
+    for (let pixel = 0; pixel < mask.length; pixel += 1) {
+        if (mask[pixel]) continue
+
+        const index = pixel * 3
+
+        total += Math.abs((left[index] ?? 0) - (right[index] ?? 0))
+        total += Math.abs((left[index + 1] ?? 0) - (right[index + 1] ?? 0))
+        total += Math.abs((left[index + 2] ?? 0) - (right[index + 2] ?? 0))
+        count += 3
+    }
+
+    if (count === 0) return 0
+
+    return total / count / 255
+}
+
+/**
+ * 單欄或單列差異，略過裝飾像素。整欄都被遮罩時不計入。
+ *
+ * @param left 前一幀指紋。
+ * @param right 目前指紋。
+ * @param width 指紋寬度。
+ * @param height 指紋高度。
+ * @param mask 為 1 的像素不比較；null 表示全圖比較。
+ * @returns 介於 0 與 1 的最大欄或列差異。
+ */
+function maskedStripDifference(
+    left: Buffer,
+    right: Buffer,
+    width: number,
+    height: number,
+    mask: Uint8Array | null,
+): number
+{
+    if (!mask) return maxStripDifference(left, right, width, height)
+    if (left.length !== right.length || left.length !== width * height * 3) return 1
+
+    let maximum = 0
+
+    for (let column = 0; column < width; column += 1) {
+        let total = 0
+        let count = 0
+
+        for (let row = 0; row < height; row += 1) {
+            if (mask[row * width + column]) continue
+
+            const index = (row * width + column) * 3
+
+            total += Math.abs((left[index] ?? 0) - (right[index] ?? 0))
+            total += Math.abs((left[index + 1] ?? 0) - (right[index + 1] ?? 0))
+            total += Math.abs((left[index + 2] ?? 0) - (right[index + 2] ?? 0))
+            count += 1
+        }
+
+        if (count > 0) maximum = Math.max(maximum, total / count / 3 / 255)
+    }
+
+    for (let row = 0; row < height; row += 1) {
+        let total = 0
+        let count = 0
+
+        for (let column = 0; column < width; column += 1) {
+            if (mask[row * width + column]) continue
+
+            const index = (row * width + column) * 3
+
+            total += Math.abs((left[index] ?? 0) - (right[index] ?? 0))
+            total += Math.abs((left[index + 1] ?? 0) - (right[index + 1] ?? 0))
+            total += Math.abs((left[index + 2] ?? 0) - (right[index + 2] ?? 0))
+            count += 1
+        }
+
+        if (count > 0) maximum = Math.max(maximum, total / count / 3 / 255)
+    }
+
+    return maximum
+}
+
+type ViewportRect = {
+    height: number
+    width: number
+    x: number
+    y: number
+}
+
+/**
+ * 找出視窗裡一直在動、但不該擋住定影的裝飾：canvas、video，以及
+ * 無限循環的 CSS／WAAPI 動畫目標。
  *
  * @param page Playwright 頁面。
- * @returns 完成 DOM 標記後結束。
+ * @returns 與視窗相交的矩形，單位是 CSS 像素。
  */
-async function markFixedElements(page: import('playwright').Page): Promise<void>
+async function readDecorativeViewportRects(page: import('playwright').Page): Promise<ViewportRect[]>
 {
-    await page.evaluate(({
-        attribute,
-        canvasCoverageRatio,
-        chromeMaxHeightRatio,
-        chromeMinWidthRatio,
-        chromeSideMaxPx,
-        chromeTopMaxPx,
-        sideMaxWidthRatio,
-        sideMinHeightRatio,
-    }) => {
+    return page.evaluate(() => {
+        const rects: ViewportRect[] = []
+        const seen = new Set<Element>()
+        const push = (element: Element): void => {
+            if (seen.has(element)) return
+
+            const bounds = element.getBoundingClientRect()
+
+            if (bounds.bottom <= 0 || bounds.top >= window.innerHeight) return
+            if (bounds.right <= 0 || bounds.left >= window.innerWidth) return
+            if (bounds.width < 8 || bounds.height < 8) return
+
+            seen.add(element)
+            rects.push({
+                height: bounds.height,
+                width: bounds.width,
+                x: bounds.x,
+                y: bounds.y,
+            })
+        }
+
+        for (const node of document.querySelectorAll('canvas, video')) push(node)
+
+        for (const animation of document.getAnimations()) {
+            if (animation.playState !== 'running') continue
+
+            const effect = animation.effect
+
+            if (!(effect instanceof KeyframeEffect)) continue
+            if (effect.getComputedTiming().iterations !== Infinity) continue
+            if (effect.target instanceof Element) push(effect.target)
+        }
+
+        return rects
+    })
+}
+
+/**
+ * 把裝飾矩形對到 settle 指紋的像素遮罩。
+ *
+ * @param rects 視窗座標中的裝飾範圍。
+ * @param viewportWidth 視窗寬度。
+ * @param viewportHeight 視窗高度。
+ * @returns 指紋像素遮罩；沒有裝飾時為 null。
+ */
+function buildDecorativeMask(rects: ViewportRect[], viewportWidth: number, viewportHeight: number): Uint8Array | null
+{
+    if (rects.length === 0 || viewportWidth <= 0 || viewportHeight <= 0) return null
+
+    const mask = new Uint8Array(SETTLE_SIGNATURE_WIDTH * SETTLE_SIGNATURE_HEIGHT)
+
+    for (const rect of rects) {
+        const x0 = Math.max(0, Math.floor(rect.x / viewportWidth * SETTLE_SIGNATURE_WIDTH))
+        const x1 = Math.min(
+            SETTLE_SIGNATURE_WIDTH,
+            Math.ceil((rect.x + rect.width) / viewportWidth * SETTLE_SIGNATURE_WIDTH),
+        )
+        const y0 = Math.max(0, Math.floor(rect.y / viewportHeight * SETTLE_SIGNATURE_HEIGHT))
+        const y1 = Math.min(
+            SETTLE_SIGNATURE_HEIGHT,
+            Math.ceil((rect.y + rect.height) / viewportHeight * SETTLE_SIGNATURE_HEIGHT),
+        )
+
+        for (let y = y0; y < y1; y += 1) {
+            for (let x = x0; x < x1; x += 1) mask[y * SETTLE_SIGNATURE_WIDTH + x] = 1
+        }
+    }
+
+    return mask
+}
+
+/**
+ * 檢查長圖是否在每個 viewport 接縫重複了 20% 重疊帶。
+ * 文件流正確拼接時，接縫前後是相鄰的文件內容；虛擬畫布誤判會把整張
+ * 1080 視窗以 864 步進疊上去，接縫兩側的 216px 就會是同一段畫面。
+ * 純色帶不算，避免留白長頁被誤殺。
+ *
+ * @param image 拼接後的完整頁面。
+ * @param width 圖片寬度。
+ * @param viewportHeight 擷取視窗高度。
+ * @returns 重複接縫的 y；沒有時為 0。
+ */
+export async function hasRepeatedOverlapSeam(
+    image: Buffer,
+    width: number,
+    viewportHeight: number,
+): Promise<number>
+{
+    const metadata = await sharp(image).metadata()
+    const height = metadata.height ?? 0
+    const overlap = Math.max(Math.round(viewportHeight * (1 - CAPTURE_STEP_RATIO)), 1)
+
+    if (height < viewportHeight + overlap || width <= 0) return 0
+
+    for (let seam = viewportHeight; seam + overlap <= height; seam += viewportHeight) {
+        const [before, after] = await Promise.all([
+            sharp(image).extract({
+                height: overlap,
+                left: 0,
+                top: seam - overlap,
+                width,
+            }).removeAlpha().raw().toBuffer(),
+            sharp(image).extract({
+                height: overlap,
+                left: 0,
+                top: seam,
+                width,
+            }).removeAlpha().raw().toBuffer(),
+        ])
+
+        if (before.length !== after.length || before.length === 0) continue
+        if (rowSliceVariance(before) < OVERLAP_SEAM_MIN_VARIANCE) continue
+        if (!bandHasVisualStructure(before)) continue
+        if (visualDifference(before, after) > OVERLAP_SEAM_THRESHOLD) continue
+
+        // 整段 sticky 場景會讓接縫前後都長一樣，而且再往下仍一樣。
+        // 864 步進沒裁重疊時，重複只佔一個 216px，下一段就是新內容。
+        if (seam + overlap * 2 <= height) {
+            const following = await sharp(image).extract({
+                height: overlap,
+                left: 0,
+                top: seam + overlap,
+                width,
+            }).removeAlpha().raw().toBuffer()
+
+            if (visualDifference(after, following) <= OVERLAP_SEAM_THRESHOLD) continue
+
+            return seam
+        }
+
+        if (seam - overlap * 2 >= 0) {
+            const preceding = await sharp(image).extract({
+                height: overlap,
+                left: 0,
+                top: seam - overlap * 2,
+                width,
+            }).removeAlpha().raw().toBuffer()
+
+            if (visualDifference(preceding, before) <= OVERLAP_SEAM_THRESHOLD) continue
+        }
+
+        return seam
+    }
+
+    return 0
+}
+
+/**
+ * 標記頁首已存在的小型固定介面、透明的固定殼、頂部 sticky 導覽列，
+ * 以及貼齊左右的 sticky 側欄，避免這些 chrome 在每段重複出現。
+ * 真正的虛擬畫布（不透明舞台，或裡頭有蓋住約半個視窗的 canvas／影片）
+ * 與接近整段 viewport 高且接近全寬的 sticky 捲動場景不在此列。
+ * 透明且 pointer-events:none、又沒有大型畫面的 fixed 殼不是虛擬畫布，
+ * 後段要藏起來，否則導覽鈕與裝飾圓會跟著每一段出現。
+ *
+ * @param page Playwright 頁面。
+ * @returns 頁面上存在虛擬捲動畫布時為 true。
+ */
+async function markFixedElements(page: import('playwright').Page): Promise<boolean>
+{
+    return page.evaluate(options => {
+        const backgroundAlpha = (style: CSSStyleDeclaration): number => {
+            const color = style.backgroundColor
+
+            if (!color || color === 'transparent') return 0
+
+            const slash = color.match(/\/\s*([\d.]+%?)\s*\)/u)
+
+            if (slash?.[1]) {
+                return slash[1].endsWith('%') ? Number(slash[1].slice(0, -1)) / 100 : Number(slash[1])
+            }
+
+            const rgba = color.match(/rgba\(\s*[\d.]+\s*,\s*[\d.]+\s*,\s*[\d.]+\s*,\s*([\d.]+)\s*\)/u)
+
+            if (rgba?.[1]) return Number(rgba[1])
+
+            return 1
+        }
+        const coversViewport = (bounds: DOMRect): boolean => bounds.width >= window.innerWidth * options.canvasCoverageRatio
+            && bounds.height >= window.innerHeight * options.canvasCoverageRatio
+            && bounds.bottom > 0
+            && bounds.top < window.innerHeight
+        const isVirtualCanvas = (element: HTMLElement): boolean => {
+            const style = getComputedStyle(element)
+
+            if (style.position !== 'fixed') return false
+            if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false
+            if (!coversViewport(element.getBoundingClientRect())) return false
+            if (element.scrollHeight > window.innerHeight * options.shellRatio) return false
+
+            for (const child of element.children) {
+                if (child instanceof HTMLElement && child.scrollHeight > window.innerHeight * options.shellRatio) return false
+            }
+
+            const coversScene = (target: Element): boolean => {
+                const targetBounds = target.getBoundingClientRect()
+
+                return targetBounds.width >= window.innerWidth * options.sceneRatio
+                    && targetBounds.height >= window.innerHeight * options.sceneRatio
+            }
+            const paintsScene = (target: HTMLElement): boolean => {
+                const targetStyle = getComputedStyle(target)
+
+                if (targetStyle.display === 'none' || targetStyle.visibility === 'hidden' || Number(targetStyle.opacity) === 0) {
+                    return false
+                }
+
+                if (!coversScene(target)) return false
+                if (target instanceof HTMLCanvasElement || target instanceof HTMLVideoElement) return true
+                if (targetStyle.backgroundImage && targetStyle.backgroundImage !== 'none') return true
+
+                return backgroundAlpha(targetStyle) >= 0.2
+            }
+
+            if (paintsScene(element)) return true
+            if ([...element.querySelectorAll('canvas, video')].some(node => coversScene(node))) return true
+
+            const transparent = backgroundAlpha(style) < 0.04
+                && (!style.backgroundImage || style.backgroundImage === 'none')
+
+            if (transparent && style.pointerEvents === 'none') return false
+
+            return [...element.querySelectorAll<HTMLElement>('*')].some(node => paintsScene(node))
+        }
         const elements = [...document.body.querySelectorAll<HTMLElement>('*')]
+        let hasVirtualCanvas = false
 
         for (const element of elements) {
             const style = getComputedStyle(element)
@@ -587,13 +1494,23 @@ async function markFixedElements(page: import('playwright').Page): Promise<void>
             }
 
             const bounds = element.getBoundingClientRect()
-            const coversViewport = bounds.width >= window.innerWidth * canvasCoverageRatio
-                && bounds.height >= window.innerHeight * canvasCoverageRatio
 
-            if (coversViewport) continue
+            if (position === 'fixed' && coversViewport(bounds)) {
+                if (isVirtualCanvas(element)) {
+                    hasVirtualCanvas = true
+                    continue
+                }
+
+                if (element.scrollHeight > window.innerHeight * options.shellRatio) continue
+
+                element.setAttribute(options.attribute, '')
+                continue
+            }
+
+            if (coversViewport(bounds)) continue
 
             if (position === 'fixed') {
-                element.setAttribute(attribute, '')
+                element.setAttribute(options.attribute, '')
                 continue
             }
 
@@ -602,24 +1519,26 @@ async function markFixedElements(page: import('playwright').Page): Promise<void>
             const right = Number.parseFloat(style.right)
             const inFirstViewport = bounds.bottom > 0 && bounds.top < window.innerHeight
             const isTopChrome = Number.isFinite(top)
-                && top <= chromeTopMaxPx
+                && top <= options.chromeTopMaxPx
                 && bounds.height > 0
-                && bounds.height < window.innerHeight * chromeMaxHeightRatio
-                && bounds.width >= window.innerWidth * chromeMinWidthRatio
+                && bounds.height < window.innerHeight * options.chromeMaxHeightRatio
+                && bounds.width >= window.innerWidth * options.chromeMinWidthRatio
                 && inFirstViewport
             const isSideChrome = inFirstViewport
                 && bounds.width > 0
-                && bounds.width < window.innerWidth * sideMaxWidthRatio
-                && bounds.height >= window.innerHeight * sideMinHeightRatio
+                && bounds.width < window.innerWidth * options.sideMaxWidthRatio
+                && bounds.height >= window.innerHeight * options.sideMinHeightRatio
                 && (
-                    Number.isFinite(left) && left <= chromeSideMaxPx
-                    || Number.isFinite(right) && right <= chromeSideMaxPx
+                    Number.isFinite(left) && left <= options.chromeSideMaxPx
+                    || Number.isFinite(right) && right <= options.chromeSideMaxPx
                     || bounds.left <= 8
                     || bounds.right >= window.innerWidth - 8
                 )
 
-            if (isTopChrome || isSideChrome) element.setAttribute(attribute, '')
+            if (isTopChrome || isSideChrome) element.setAttribute(options.attribute, '')
         }
+
+        return hasVirtualCanvas
     }, {
         attribute: FIXED_ELEMENT_ATTRIBUTE,
         canvasCoverageRatio: FIXED_CANVAS_COVERAGE_RATIO,
@@ -627,8 +1546,659 @@ async function markFixedElements(page: import('playwright').Page): Promise<void>
         chromeMinWidthRatio: STICKY_CHROME_MIN_WIDTH_RATIO,
         chromeSideMaxPx: STICKY_CHROME_SIDE_MAX_PX,
         chromeTopMaxPx: STICKY_CHROME_TOP_MAX_PX,
+        sceneRatio: VIRTUAL_CANVAS_SCENE_RATIO,
+        shellRatio: SCROLL_SHELL_HEIGHT_RATIO,
         sideMaxWidthRatio: STICKY_SIDE_MAX_WIDTH_RATIO,
         sideMinHeightRatio: STICKY_SIDE_MIN_HEIGHT_RATIO,
+    })
+}
+
+/**
+ * 把指標移出視窗，避免停在連結上時把「View Project」這類跟隨游標畫進截圖。
+ *
+ * @param page Playwright 頁面。
+ * @returns 移動完成後結束。
+ */
+async function parkPointer(page: import('playwright').Page): Promise<void>
+{
+    await page.mouse.move(-80, -80).catch(() => undefined)
+    await page.evaluate(() => {
+        window.dispatchEvent(new MouseEvent('mousemove', {
+            bubbles: true,
+            clientX: -200,
+            clientY: -200,
+        }))
+    }).catch(() => undefined)
+}
+
+/**
+ * 藏起跟著指標走的圓形游標。包含小圓點，以及寫著短標籤的較大圓泡。
+ * 按鈕、連結與返回頂端不藏。
+ *
+ * @param page Playwright 頁面。
+ * @returns 標記完成後結束。
+ */
+async function hideCustomCursorFollowers(page: import('playwright').Page): Promise<void>
+{
+    await page.evaluate(attribute => {
+        for (const element of document.body.querySelectorAll<HTMLElement>(`[${attribute}]`)) {
+            element.removeAttribute(attribute)
+        }
+
+        const rootCursor = getComputedStyle(document.documentElement).cursor
+        const bodyCursor = getComputedStyle(document.body).cursor
+        const systemCursorHidden = rootCursor === 'none' || bodyCursor === 'none'
+
+        for (const element of document.body.querySelectorAll<HTMLElement>('*')) {
+            const style = getComputedStyle(element)
+
+            if (style.position !== 'fixed') continue
+            if (style.visibility === 'hidden' || Number(style.opacity) === 0) continue
+
+            const bounds = element.getBoundingClientRect()
+            const size = Math.max(bounds.width, bounds.height)
+
+            if (bounds.width < 4 || bounds.height < 4 || size > 200) continue
+            if (bounds.bottom < 0 || bounds.right < 0) continue
+            const text = element.textContent?.replace(/\s+/g, ' ').trim() ?? ''
+            const followsPointer = style.pointerEvents === 'none'
+            const insideControl = element.closest('a, button, input, textarea, select, [role="button"]')
+
+            if (insideControl && !followsPointer) continue
+
+            if (text.length > 24) continue
+
+            const radius = Number.parseFloat(style.borderTopLeftRadius)
+            const round = style.borderRadius.includes('%')
+                || (Number.isFinite(radius) && radius >= Math.min(bounds.width, bounds.height) * 0.4)
+            const decorative = style.pointerEvents === 'none' || style.mixBlendMode === 'difference'
+            const tinyTracker = size <= 18 && text.length === 0 && style.pointerEvents === 'none'
+
+            if (!round && !tinyTracker) continue
+            if (!decorative && !systemCursorHidden) continue
+
+            element.setAttribute(attribute, '')
+            element.style.setProperty('visibility', 'hidden', 'important')
+        }
+    }, CURSOR_FOLLOWER_ATTRIBUTE)
+}
+
+/**
+ * 蓋滿視窗的 sticky 場景。這種畫面的新列若只是同一幀的空白或複本，
+ * 不能再往下接一截。
+ *
+ * @param page Playwright 頁面。
+ * @returns 有 sticky 層同時蓋住寬高約 85% 時為 true。
+ */
+async function stickyPinCoversViewport(page: import('playwright').Page): Promise<boolean>
+{
+    return page.evaluate(() => {
+        for (const element of document.body.querySelectorAll<HTMLElement>('*')) {
+            const style = getComputedStyle(element)
+
+            if (style.position !== 'sticky') continue
+            if (style.visibility === 'hidden' || Number(style.opacity) < 0.2) continue
+
+            const bounds = element.getBoundingClientRect()
+
+            if (bounds.width < window.innerWidth * 0.85 || bounds.height < window.innerHeight * 0.85) continue
+            if (bounds.top > window.innerHeight * 0.45) continue
+            if (bounds.bottom < window.innerHeight * 0.7) continue
+
+            return true
+        }
+
+        return false
+    })
+}
+
+/**
+ * 把還在長大的內聯盒子收到它自己的終態。只對已經佔據視窗的盒子往前看，
+ * 讀到寬高與圓角不再變化後回到原捲動位置，再用 !important 釘住那組尺寸。
+ *
+ * @param page 已停在擷取位置的頁面。
+ * @returns 釘住或確認不需要釘之後結束。
+ */
+async function freezeExpandingBoxes(page: import('playwright').Page): Promise<void>
+{
+    const original = await readDocumentScroll(page)
+
+    await page.evaluate(() => {
+        for (const node of document.querySelectorAll('[data-sitesensory-freeze-for]')) node.remove()
+    })
+
+    const candidate = await page.evaluate(() => {
+        let bestId = ''
+        let bestArea = 0
+        const viewportArea = window.innerWidth * window.innerHeight
+
+        for (const element of document.body.querySelectorAll<HTMLElement>('*')) {
+            if (element.style.width === '' || element.style.height === '') continue
+
+            const style = getComputedStyle(element)
+
+            if (style.position === 'fixed' || style.display === 'none') continue
+
+            const bounds = element.getBoundingClientRect()
+            const area = bounds.width * bounds.height
+
+            if (area < viewportArea * 0.28 || area <= bestArea) continue
+            if (bounds.bottom < window.innerHeight * 0.45 || bounds.top > window.innerHeight * 0.92) continue
+
+            const radiusText = style.borderTopLeftRadius
+            const radius = Number.parseFloat(radiusText)
+            const shorter = Math.min(bounds.width, bounds.height)
+            const circle = (radiusText.includes('%') && radius >= 40)
+                || (Number.isFinite(radius) && radius >= shorter * 0.45)
+
+            if (circle) continue
+
+            const fullBleed = bounds.width >= window.innerWidth - 8
+                && bounds.height >= window.innerHeight - 8
+                && (!Number.isFinite(radius) || radius < 1)
+
+            if (fullBleed) continue
+
+            const id = element.getAttribute('data-sitesensory-box-id')
+                ?? `box-${bestArea.toFixed(0)}-${Math.round(bounds.top)}`
+
+            element.setAttribute('data-sitesensory-box-id', id)
+            bestId = id
+            bestArea = area
+        }
+
+        return bestId
+    })
+
+    if (!candidate) return
+
+    const initial = await readFrozenBox(page, candidate)
+
+    await page.evaluate(id => {
+        document.querySelector(`[data-sitesensory-freeze-for="${id}"]`)?.remove()
+    }, candidate)
+
+    let saved: FrozenBox | null = null
+    let stable = 0
+
+    for (let step = 1; step <= 14; step += 1) {
+        const landed = await scrollPageToAndHold(page, original + step * 180)
+        const box = await readFrozenBox(page, candidate)
+
+        if (!box || Math.abs(landed - (original + step * 180)) > DOCUMENT_HEIGHT_TOLERANCE_PX * 4) break
+
+        const grew = saved === null
+            || box.width > saved.width + 4
+            || box.height > saved.height + 4
+            || box.radius < saved.radius - 1
+
+        saved = box
+        stable = grew ? 0 : stable + 1
+
+        const fullBleed = box.width >= 1912 && box.height >= 1072 && box.radius < 1
+
+        if (fullBleed || stable >= 2) break
+    }
+
+    await scrollPageToAndHold(page, original)
+
+    if (!saved || !initial) return
+
+    const grew = saved.width > initial.width + 4
+        || saved.height > initial.height + 4
+        || saved.radius < initial.radius - 1
+
+    if (!grew) return
+
+    const finalBox = saved
+    const top = initial.top > 160 ? initial.top : finalBox.top
+
+    await page.evaluate(({ box, id, top: lockedTop }) => {
+        const element = document.querySelector<HTMLElement>(`[data-sitesensory-box-id="${id}"]`)
+
+        if (!element) return
+
+        const style = document.createElement('style')
+
+        style.setAttribute('data-sitesensory-freeze-for', id)
+        style.textContent = `[data-sitesensory-box-id="${id}"]{width:${box.width}px !important;height:${box.height}px !important;top:${lockedTop}px !important;left:${box.left}px !important;border-radius:${box.radius}px !important;}`
+        document.head.appendChild(style)
+    }, { box: finalBox, id: candidate, top })
+}
+
+type FrozenBox = {
+    height: number
+    left: number
+    radius: number
+    top: number
+    width: number
+}
+
+/**
+ * 讀取正在展開的盒子目前尺寸。
+ *
+ * @param page Playwright 頁面。
+ * @param id 先前標上的盒子 id。
+ * @returns 找不到時為 null。
+ */
+async function readFrozenBox(page: import('playwright').Page, id: string): Promise<FrozenBox | null>
+{
+    return page.evaluate(boxId => {
+        const element = document.querySelector<HTMLElement>(`[data-sitesensory-box-id="${boxId}"]`)
+
+        if (!element) return null
+
+        const bounds = element.getBoundingClientRect()
+        const radius = Number.parseFloat(getComputedStyle(element).borderTopLeftRadius)
+
+        return {
+            height: Math.round(bounds.height),
+            left: Math.round(bounds.left),
+            radius: Number.isFinite(radius) ? Math.round(radius) : 0,
+            top: Math.round(bounds.top),
+            width: Math.round(bounds.width),
+        }
+    }, id)
+}
+
+/**
+ * 把視窗裡跟捲動綁住、又停在半路的揭示收到看得到的狀態。
+ * 有限次 CSS 轉場仍交給原本的等待。互相重疊、輪流出現的內容只留目前最明顯的那一層。
+ * 圖片、畫布與大面積的 translate／scale 收到版面位置，避免同一幕被縫成多種縮放。
+ *
+ * @param page Playwright 頁面。
+ * @returns 標記完成後結束。
+ */
+async function settleScrollScrubbedFrame(page: import('playwright').Page): Promise<void>
+{
+    await page.evaluate(options => {
+        for (const element of document.body.querySelectorAll<HTMLElement>(`[${options.settled}], [${options.suppressed}]`)) {
+            element.removeAttribute(options.settled)
+            element.removeAttribute(options.suppressed)
+        }
+
+        const viewportArea = window.innerWidth * window.innerHeight
+
+        type ScrubTarget = {
+            blur: number
+            bounds: DOMRect
+            element: HTMLElement
+            midClip: boolean
+            midScale: boolean
+            opacity: number
+        }
+
+        const fades: ScrubTarget[] = []
+
+        for (const element of document.body.querySelectorAll<HTMLElement>('*')) {
+            if (hasRunningFiniteAnimation(element)) continue
+            if (getComputedStyle(element).position === 'fixed') continue
+
+            const inlineOpacity = element.style.opacity !== ''
+            const inlineFilter = element.style.filter !== ''
+            const inlineClip = element.style.clipPath !== '' && element.style.clipPath !== 'none'
+            const inlineTransform = element.style.transform
+            const style = getComputedStyle(element)
+            const bounds = element.getBoundingClientRect()
+            const heading = element.tagName === 'H1' || element.tagName === 'H2' || element.tagName === 'H3'
+            const text = element.textContent?.replace(/\s+/g, ' ').trim() ?? ''
+            const glyph = (element.tagName === 'SPAN' || element.tagName === 'EM' || element.tagName === 'I')
+                && text.length > 0
+                && text.length < 28
+                && bounds.height > 8
+                && bounds.height < 220
+                && bounds.width < 480
+            const shift = translationOf(style.transform)
+            const verticalParallax = element.matches('img, video, canvas, [data-parallax]')
+                && shift !== null
+                && Math.abs(shift.y) > 8
+                && Math.abs(shift.x) < 16
+            const computedReveal = (heading || glyph)
+                && bounds.bottom > 4
+                && bounds.top < window.innerHeight - 4
+                && (Number(style.opacity) < 0.98 || blurAmount(style.filter) > 0.5 || (glyph && style.transform !== 'none'))
+
+            if (!inlineOpacity && !inlineFilter && !inlineClip && !inlineTransform && !computedReveal && !verticalParallax) continue
+
+            if (bounds.bottom <= 4 || bounds.top >= window.innerHeight - 4) continue
+            if (bounds.width < 8 || bounds.height < 8) continue
+            if (style.display === 'none' || style.visibility === 'hidden') continue
+
+            const scale = uniformScale(style.transform)
+            const shrunkHeading = heading
+                && scale !== null
+                && scale < 0.92
+                && scale > 0.05
+                && Number(style.opacity) >= 0.85
+            const target: ScrubTarget = {
+                blur: blurAmount(style.filter),
+                bounds,
+                element,
+                midClip: inlineClip && clipIsOpen(style.clipPath, bounds.height),
+                midScale: scaleIsMid(style.transform),
+                opacity: Number(style.opacity),
+            }
+
+            if (shrunkHeading) element.setAttribute(options.settled, '')
+            const area = bounds.width * bounds.height
+            const textual = inlineOpacity || inlineFilter || inlineClip || computedReveal
+
+            if (glyph && style.transform !== 'none' && target.opacity >= 0.9 && target.blur <= 0.5) {
+                element.setAttribute(options.settled, '')
+                continue
+            }
+
+            if (textual) fades.push(target)
+
+            const parallaxMedia = element.matches('img, video, canvas, [data-parallax]')
+                && (/translate|scale/i.test(inlineTransform) || verticalParallax)
+            const largeShift = area >= viewportArea * 0.2
+                && /translateY|translate3d|scale/i.test(inlineTransform)
+
+            if (verticalParallax || ((parallaxMedia || largeShift || target.midScale) && area >= viewportArea * 0.04)) {
+                element.setAttribute(options.settled, '')
+            }
+        }
+
+        const visited = new Set<HTMLElement>()
+
+        for (const seed of fades) {
+            if (visited.has(seed.element)) continue
+
+            const cluster: ScrubTarget[] = []
+            const queue = [seed]
+
+            visited.add(seed.element)
+
+            while (queue.length > 0) {
+                const current = queue.pop()
+
+                if (!current) continue
+
+                cluster.push(current)
+
+                for (const other of fades) {
+                    if (visited.has(other.element)) continue
+                    if (overlapRatio(current.bounds, other.bounds) <= 0.55) continue
+
+                    const largerCoverage = Math.min(
+                        coverageOf(current.bounds, other.bounds),
+                        coverageOf(other.bounds, current.bounds),
+                    )
+
+                    // 小標籤只蓋住大標題的一角時，不是同一組交叉淡化。
+                    if (largerCoverage <= 0.3) continue
+
+                    visited.add(other.element)
+                    queue.push(other)
+                }
+            }
+
+            const winner = cluster.reduce((best, item) => item.opacity > best.opacity ? item : best)
+            const winnerNeedsSettle = winner.opacity < 0.98
+                || winner.blur > 0.5
+                || winner.midClip
+                || winner.midScale
+
+            if (cluster.length < 2) {
+                if (seed.opacity < 0.2) {
+                    const text = seed.element.textContent?.replace(/\s+/g, ' ').trim() ?? ''
+
+                    if (shouldForceHiddenText(seed)) seed.element.setAttribute(options.settled, '')
+                    else if (text.length >= 2) seed.element.setAttribute(options.suppressed, '')
+
+                    continue
+                }
+
+                if (winnerNeedsSettle) seed.element.setAttribute(options.settled, '')
+
+                continue
+            }
+
+            if (winnerNeedsSettle) winner.element.setAttribute(options.settled, '')
+
+            for (const item of cluster) {
+                if (item.element === winner.element) continue
+                if (item.opacity >= winner.opacity - 0.02) continue
+
+                item.element.setAttribute(options.suppressed, '')
+            }
+        }
+
+        function hasRunningFiniteAnimation(element: HTMLElement): boolean
+        {
+            return element.getAnimations().some(animation => {
+                if (animation.playState !== 'running') return false
+
+                const effect = animation.effect
+
+                if (!(effect instanceof KeyframeEffect)) return false
+
+                return effect.getComputedTiming().iterations !== Infinity
+            })
+        }
+
+        function blurAmount(filter: string): number
+        {
+            const match = filter.match(/blur\(\s*([0-9.]+)px\s*\)/iu)
+
+            return match?.[1] ? Number.parseFloat(match[1]) : 0
+        }
+
+        function translationOf(transform: string): { x: number, y: number } | null
+        {
+            const match = transform.match(/matrix\(\s*([^)]+)\)/u)
+
+            if (!match?.[1]) return null
+
+            const parts = match[1].split(',').map(value => Number.parseFloat(value))
+            const x = parts[4]
+            const y = parts[5]
+
+            if (x === undefined || y === undefined || Number.isNaN(x) || Number.isNaN(y)) return null
+
+            return { x, y }
+        }
+
+        function uniformScale(transform: string): number | null
+        {
+            const match = transform.match(/matrix\(\s*([^)]+)\)/u)
+
+            if (!match?.[1]) return null
+
+            const parts = match[1].split(',').map(value => Number.parseFloat(value))
+            const a = parts[0]
+            const b = parts[1]
+            const c = parts[2]
+            const d = parts[3]
+
+            if (a === undefined || b === undefined || c === undefined || d === undefined) return null
+
+            const scaleX = Math.hypot(a, b)
+            const scaleY = Math.hypot(c, d)
+
+            if (Math.abs(scaleX - scaleY) > 0.08) return null
+
+            return Math.min(scaleX, scaleY)
+        }
+
+        function scaleIsMid(transform: string): boolean
+        {
+            const scale = uniformScale(transform)
+
+            return scale !== null && scale > 0.35 && scale < 0.94
+        }
+
+        function clipIsOpen(clip: string, elementHeight: number): boolean
+        {
+            const match = clip.match(/inset\(\s*([^)]+)\)/iu)
+
+            if (!match?.[1]) return false
+
+            const top = Number.parseFloat(match[1])
+            const pixels = match[1].trim().endsWith('%') ? top / 100 * elementHeight : top
+
+            return pixels > elementHeight * 0.08 && pixels < elementHeight * 0.92
+        }
+
+        function overlapRatio(left: DOMRect, right: DOMRect): number
+        {
+            const width = Math.min(left.right, right.right) - Math.max(left.left, right.left)
+            const height = Math.min(left.bottom, right.bottom) - Math.max(left.top, right.top)
+
+            if (width <= 0 || height <= 0) return 0
+
+            const smaller = Math.min(left.width * left.height, right.width * right.height)
+
+            return smaller > 0 ? (width * height) / smaller : 0
+        }
+
+        function coverageOf(target: DOMRect, other: DOMRect): number
+        {
+            const width = Math.min(target.right, other.right) - Math.max(target.left, other.left)
+            const height = Math.min(target.bottom, other.bottom) - Math.max(target.top, other.top)
+
+            if (width <= 0 || height <= 0) return 0
+
+            const area = target.width * target.height
+
+            return area > 0 ? (width * height) / area : 0
+        }
+
+        function shouldForceHiddenText(target: ScrubTarget): boolean
+        {
+            const text = target.element.textContent?.replace(/\s+/g, ' ').trim() ?? ''
+
+            if (text.length < 2) return false
+
+            let pin: HTMLElement | null = target.element
+
+            while (pin && getComputedStyle(pin).position !== 'sticky') pin = pin.parentElement
+
+            const scope = pin ?? target.element
+            const peers = fades.filter(other => {
+                if (other.element === target.element) return false
+                if (!scope.contains(other.element)) return false
+                // 只跟蓋住這一句大部分面積的另一句競爭。滑進標題角落的專案名稱不是交叉淡化。
+                if (coverageOf(target.bounds, other.bounds) <= 0.3) return false
+
+                const otherText = other.element.textContent?.replace(/\s+/g, ' ').trim() ?? ''
+
+                return otherText.length >= 2
+            })
+
+            if (peers.some(other => other.opacity > target.opacity + 0.04)) return false
+
+            const tied = peers.filter(other => Math.abs(other.opacity - target.opacity) <= 0.04)
+
+            if (tied.length > 0 && target.opacity < 0.5) {
+                const ordered = [target, ...tied].sort((left, right) => {
+                    const position = left.element.compareDocumentPosition(right.element)
+
+                    if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1
+                    if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1
+
+                    return 0
+                })
+
+                return ordered[0] === target && target.opacity >= 0.08
+            }
+
+            return true
+        }
+    }, {
+        settled: SETTLED_REVEAL_ATTRIBUTE,
+        suppressed: SUPPRESSED_SWAP_ATTRIBUTE,
+    })
+}
+
+/**
+ * 滿視窗的 sticky 場景要留下預留高度，但裡面靠左或靠右、又比視窗窄的
+ * 絕對定位標題會在每一段再畫一次。標題必須先在即將寫入的範圍裡真正看得見，
+ * 才算留過一次；第一次若還是透明，不能先標記，否則後面會把標題整句藏掉。
+ *
+ * @param page 已捲到此段的 Playwright 頁面。
+ * @param keptTop 這個視窗裡從上緣算起、已經覆蓋過、不會再寫入的像素。
+ * @returns 標記完成後結束。
+ */
+async function hideRepeatedStickyPinLabels(page: import('playwright').Page, keptTop: number): Promise<void>
+{
+    await page.evaluate(options => {
+        for (const node of document.querySelectorAll(`[${options.labelAttribute}]`)) {
+            node.removeAttribute(options.labelAttribute)
+        }
+
+        for (const element of document.body.querySelectorAll<HTMLElement>('*')) {
+            const style = getComputedStyle(element)
+
+            if (style.position !== 'sticky') continue
+
+            const bounds = element.getBoundingClientRect()
+
+            if (bounds.height < window.innerHeight * options.pinCoverage) continue
+            if (bounds.width < window.innerWidth * options.pinCoverage) continue
+            if (bounds.bottom <= 0 || bounds.top >= window.innerHeight) continue
+
+            const labels = sideLabels(element)
+            const visibleKept = labels.some(child => labelIsVisible(child) && labelInKeptBand(child))
+
+            if (!element.hasAttribute(options.seenAttribute)) {
+                if (visibleKept) element.setAttribute(options.seenAttribute, '')
+
+                continue
+            }
+
+            for (const child of labels) {
+                if (labelInKeptBand(child) || labelIsVisible(child)) child.setAttribute(options.labelAttribute, '')
+            }
+
+            function sideLabels(pin: HTMLElement): HTMLElement[]
+            {
+                const found: HTMLElement[] = []
+
+                for (const child of pin.querySelectorAll<HTMLElement>('*')) {
+                    const childStyle = getComputedStyle(child)
+
+                    if (childStyle.position !== 'absolute' && childStyle.position !== 'sticky') continue
+
+                    const childBounds = child.getBoundingClientRect()
+
+                    if (childBounds.width < 24 || childBounds.height < 24) continue
+                    if (childBounds.width >= window.innerWidth * options.labelMaxWidthRatio) continue
+                    if (childBounds.height >= window.innerHeight * options.labelMaxHeightRatio) continue
+                    if (childBounds.bottom <= 0 || childBounds.top >= window.innerHeight) continue
+
+                    const onSide = childBounds.left <= window.innerWidth * options.labelSideRatio
+                        || childBounds.right >= window.innerWidth * (1 - options.labelSideRatio)
+
+                    if (onSide) found.push(child)
+                }
+
+                return found
+            }
+
+            function labelIsVisible(child: HTMLElement): boolean
+            {
+                const childStyle = getComputedStyle(child)
+
+                return childStyle.visibility !== 'hidden' && Number(childStyle.opacity) >= 0.85
+            }
+
+            function labelInKeptBand(child: HTMLElement): boolean
+            {
+                const childBounds = child.getBoundingClientRect()
+
+                return childBounds.bottom > options.keptTop + 4 && childBounds.top < window.innerHeight - 4
+            }
+        }
+    }, {
+        keptTop,
+        labelAttribute: 'data-sitesensory-repeat-label',
+        labelMaxHeightRatio: STICKY_PIN_LABEL_MAX_HEIGHT_RATIO,
+        labelMaxWidthRatio: STICKY_PIN_LABEL_MAX_WIDTH_RATIO,
+        labelSideRatio: STICKY_PIN_LABEL_SIDE_RATIO,
+        pinCoverage: FIXED_CANVAS_COVERAGE_RATIO,
+        seenAttribute: 'data-sitesensory-pin-seen',
     })
 }
 
@@ -639,6 +2209,7 @@ async function markFixedElements(page: import('playwright').Page): Promise<void>
  * @returns 最後一張視窗截圖，以及是否仍偵測到 wipe 條紋。
  */
 async function settleVisibleViewport(page: import('playwright').Page): Promise<{
+    hasRevealArtifact: boolean
     hasWipeArtifact: boolean
     image: Buffer
 }>
@@ -994,13 +2565,16 @@ async function dismissAndHideOverlaysInPage(options: {
  * clip-path。CSS／WAAPI 有限次動畫仍要等完；無限循環動畫不列入。
  * 直條若貫穿整段指紋且連續穩定超過設計停留門檻，視為版面線條而非
  * wipe。只打在照片帶上的直條若連續穩定，視為跟捲動綁死的半完成揭示，
- * 提早結束 settle，交給呼叫端微移或略過，不可把逾時垃圾寫進成品。
+ * 提早結束 settle，交給呼叫端微移；後面接得上才略過，否則寫入當時畫面。
+ * 揭示停住約兩秒仍未結束時，視為跟捲動綁住的狀態並交回呼叫端，不再空等。
+ * canvas、video 與無限循環動畫的像素不列入定影，避免裝飾永遠等不完。
  * 不使用 prefers-reduced-motion。
  *
  * @param page 已捲到目標位置的 Playwright 頁面。
  * @returns 最後一張視窗截圖，以及該幀是否仍像 wipe。
  */
 async function waitForVisibleViewportToSettle(page: import('playwright').Page): Promise<{
+    hasRevealArtifact: boolean
     hasWipeArtifact: boolean
     image: Buffer
 }>
@@ -1012,27 +2586,41 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
     await waitForVisibleImages(page)
 
     const deadline = Date.now() + VIEWPORT_SETTLE_TIMEOUT_MS
+    const viewport = page.viewportSize() ?? {
+        height: DESKTOP_CAPTURE_PROFILE.height,
+        width: DESKTOP_CAPTURE_PROFILE.width,
+    }
     let previousSignature: Buffer | null = null
     let previousLayout = ''
     let stableSamples = 0
     let wipeHoldSamples = 0
+    let revealHoldSamples = 0
+    let decorativeHoldSamples = 0
     let latest: Buffer | null = null
     let latestHasWipe = false
+    let latestHasReveal = false
 
     while (Date.now() < deadline) {
         const hasCssMotion = await hasFiniteViewportAnimations(page)
         const layout = await readViewportLayoutState(page)
+        const incompleteReveal = await hasIncompleteReveal(page)
+        const decorativeMask = buildDecorativeMask(
+            await readDecorativeViewportRects(page),
+            viewport.width,
+            viewport.height,
+        )
         const screenshot = await screenshotViewport(page, 'allow')
         const signature = await createSettleSignature(screenshot)
         const hasWipe = looksLikeVerticalWipe(signature, SETTLE_SIGNATURE_WIDTH, SETTLE_SIGNATURE_HEIGHT)
         const visuallyStable = Boolean(
             previousSignature
-            && visualDifference(previousSignature, signature) <= VIEWPORT_SETTLE_THRESHOLD
-            && maxStripDifference(
+            && maskedVisualDifference(previousSignature, signature, decorativeMask) <= VIEWPORT_SETTLE_THRESHOLD
+            && maskedStripDifference(
                 previousSignature,
                 signature,
                 SETTLE_SIGNATURE_WIDTH,
                 SETTLE_SIGNATURE_HEIGHT,
+                decorativeMask,
             ) <= VIEWPORT_SETTLE_STRIP_THRESHOLD,
         )
         const layoutStable = previousLayout !== '' && previousLayout === layout
@@ -1041,21 +2629,54 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
 
         latest = screenshot
         latestHasWipe = hasWipe
+        latestHasReveal = incompleteReveal
         wipeHoldSamples = hasWipe && motionStopped ? wipeHoldSamples + 1 : 0
+        revealHoldSamples = incompleteReveal && motionStopped && !hasWipe ? revealHoldSamples + 1 : 0
+        decorativeHoldSamples = !hasCssMotion && layoutStable && !incompleteReveal && !hasWipe && !visuallyStable
+            ? decorativeHoldSamples + 1
+            : 0
         const wipeLooksLikeDesign = pageLevelWipe && wipeHoldSamples >= VIEWPORT_WIPE_HOLD_SAMPLES
         const wipeLooksLocked = hasWipe && !pageLevelWipe && motionStopped
             && wipeHoldSamples >= VIEWPORT_LOCKED_WIPE_SAMPLES
 
-        stableSamples = motionStopped && (!hasWipe || wipeLooksLikeDesign) ? stableSamples + 1 : 0
+        stableSamples = motionStopped && (!hasWipe || wipeLooksLikeDesign) && !incompleteReveal
+            ? stableSamples + 1
+            : 0
         previousSignature = signature
         previousLayout = layout
 
+        // 揭示沒結束就先交卷，會把縮放或淡入停在半路的畫面存下來。
+        // 有限次動畫仍要等到結束。畫面已經停住、卻仍像揭示時，那是跟捲動綁住的狀態。
         if (wipeLooksLocked) {
-            return { hasWipeArtifact: true, image: screenshot }
+            return {
+                hasRevealArtifact: incompleteReveal,
+                hasWipeArtifact: true,
+                image: screenshot,
+            }
+        }
+
+        if (revealHoldSamples >= VIEWPORT_REVEAL_HOLD_SAMPLES) {
+            return {
+                hasRevealArtifact: true,
+                hasWipeArtifact: false,
+                image: screenshot,
+            }
+        }
+
+        if (decorativeHoldSamples >= VIEWPORT_REVEAL_HOLD_SAMPLES) {
+            return {
+                hasRevealArtifact: false,
+                hasWipeArtifact: false,
+                image: screenshot,
+            }
         }
 
         if (stableSamples >= VIEWPORT_SETTLE_STABLE_SAMPLES) {
-            return { hasWipeArtifact: hasWipe && !wipeLooksLikeDesign, image: screenshot }
+            return {
+                hasRevealArtifact: false,
+                hasWipeArtifact: hasWipe && !wipeLooksLikeDesign,
+                image: screenshot,
+            }
         }
 
         await page.waitForTimeout(VIEWPORT_SETTLE_POLL_MS)
@@ -1063,7 +2684,11 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
 
     if (!latest) latest = await screenshotViewport(page, 'allow')
 
-    return { hasWipeArtifact: latestHasWipe, image: latest }
+    return {
+        hasRevealArtifact: latestHasReveal,
+        hasWipeArtifact: latestHasWipe,
+        image: latest,
+    }
 }
 
 /**
@@ -1077,7 +2702,7 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
 async function nudgeForCleanViewport(
     page: import('playwright').Page,
     target: number,
-): Promise<{ hasWipeArtifact: boolean, image: Buffer } | null>
+): Promise<{ hasRevealArtifact: boolean, hasWipeArtifact: boolean, image: Buffer } | null>
 {
     const limits = await page.evaluate(() => ({
         maxScroll: Math.max(
@@ -1092,7 +2717,7 @@ async function nudgeForCleanViewport(
 
         if (nextTop <= target) continue
 
-        await page.evaluate(scrollTop => window.scrollTo(0, scrollTop), nextTop)
+        await scrollPageTo(page, nextTop)
         await page.waitForTimeout(NUDGE_PEEK_MS)
         await page.evaluate(() => new Promise<void>(resolve => {
             requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
@@ -1100,9 +2725,10 @@ async function nudgeForCleanViewport(
 
         const image = await screenshotViewport(page, 'allow')
         const signature = await createSettleSignature(image)
+        const incompleteReveal = await hasIncompleteReveal(page)
 
-        if (!looksLikeVerticalWipe(signature, SETTLE_SIGNATURE_WIDTH, SETTLE_SIGNATURE_HEIGHT)) {
-            return { hasWipeArtifact: false, image }
+        if (!incompleteReveal && !looksLikeVerticalWipe(signature, SETTLE_SIGNATURE_WIDTH, SETTLE_SIGNATURE_HEIGHT)) {
+            return { hasRevealArtifact: false, hasWipeArtifact: false, image }
         }
     }
 
@@ -1140,6 +2766,144 @@ async function hasFiniteViewportAnimations(page: import('playwright').Page): Pro
 }
 
 /**
+ * 視窗裡是否還有沒播完的水平 clip、交叉淡化、分段淡入，或大元素停在中間縮放。
+ * 圓角 polygon 與單一設計用的半透明層不算，避免正常版面被空等。
+ * 三條以上的半透明帶，或蓋住約半個視窗、縮放還在 0.35 到 0.94 的元素，算還沒定影。
+ * canvas、video 與無限循環動畫是裝飾，不當成沒播完的揭示。
+ *
+ * @param page Playwright 頁面。
+ * @returns 仍像揭示或交叉淡化的中間幀時為 true。
+ */
+async function hasIncompleteReveal(page: import('playwright').Page): Promise<boolean>
+{
+    return page.evaluate(() => {
+        const viewportArea = window.innerWidth * window.innerHeight
+        const minArea = viewportArea * 0.08
+        const partials: DOMRect[] = []
+        let partialBands = 0
+        const decorative = decorativeMotionElements()
+
+        for (const element of document.body.querySelectorAll<HTMLElement>('*')) {
+            if (decorative.has(element)) continue
+
+            const style = getComputedStyle(element)
+
+            if (style.display === 'none' || style.visibility === 'hidden') continue
+
+            const opacity = Number(style.opacity)
+
+            if (opacity <= 0.05) continue
+
+            const bounds = element.getBoundingClientRect()
+
+            if (bounds.bottom <= 0 || bounds.top >= window.innerHeight) continue
+            if (bounds.right <= 0 || bounds.left >= window.innerWidth) continue
+            if (bounds.width < 64 || bounds.height < 48) continue
+
+            const area = bounds.width * bounds.height
+
+            if (scaleLooksLikeMidReveal(style.transform) && area >= minArea) return true
+            if (area < minArea) {
+                if (opacity < 0.92 && opacity > 0.08 && area >= viewportArea * 0.04) partialBands += 1
+
+                continue
+            }
+            if (clipLooksLikeMidReveal(style.clipPath, bounds.height)) return true
+            if (opacity < 0.9) partials.push(bounds)
+        }
+
+        if (partialBands >= 3) return true
+
+        for (let leftIndex = 0; leftIndex < partials.length; leftIndex += 1) {
+            for (let rightIndex = leftIndex + 1; rightIndex < partials.length; rightIndex += 1) {
+                const left = partials[leftIndex]
+                const right = partials[rightIndex]
+
+                if (!left || !right) continue
+
+                const overlapWidth = Math.min(left.right, right.right) - Math.max(left.left, right.left)
+                const overlapHeight = Math.min(left.bottom, right.bottom) - Math.max(left.top, right.top)
+
+                if (overlapWidth <= 0 || overlapHeight <= 0) continue
+
+                const overlap = overlapWidth * overlapHeight
+                const smaller = Math.min(left.width * left.height, right.width * right.height)
+
+                if (smaller > 0 && overlap / smaller > 0.6) return true
+            }
+        }
+
+        return false
+
+        function decorativeMotionElements(): Set<HTMLElement>
+        {
+            const elements = new Set<HTMLElement>()
+
+            for (const node of document.querySelectorAll<HTMLElement>('canvas, video')) elements.add(node)
+
+            for (const animation of document.getAnimations()) {
+                if (animation.playState !== 'running') continue
+
+                const effect = animation.effect
+
+                if (!(effect instanceof KeyframeEffect)) continue
+                if (effect.getComputedTiming().iterations !== Infinity) continue
+                if (effect.target instanceof HTMLElement) elements.add(effect.target)
+            }
+
+            return elements
+        }
+
+        function scaleLooksLikeMidReveal(transform: string): boolean
+        {
+            const match = transform.match(/matrix\(\s*([^)]+)\)/u)
+
+            if (!match?.[1]) return false
+
+            const parts = match[1].split(',').map(value => Number.parseFloat(value))
+            const a = parts[0]
+            const b = parts[1]
+            const c = parts[2]
+            const d = parts[3]
+
+            if (a === undefined || b === undefined || c === undefined || d === undefined) return false
+
+            const scaleX = Math.hypot(a, b)
+            const scaleY = Math.hypot(c, d)
+            const scale = Math.min(scaleX, scaleY)
+
+            return Math.abs(scaleX - scaleY) < 0.08 && scale > 0.35 && scale < 0.94
+        }
+
+        function clipLooksLikeMidReveal(clip: string, elementHeight: number): boolean
+        {
+            const match = clip.match(/inset\(\s*([^)]+)\)/iu)
+
+            if (!match?.[1]) return false
+
+            const lengths: string[] = []
+
+            for (const part of match[1].split(/[\s,]+/u)) {
+                if (!part || part === 'round' || part === '/') break
+
+                lengths.push(part)
+            }
+
+            if (lengths.length === 0) return false
+
+            const pixels = lengths.map(value => value.endsWith('%')
+                ? Number.parseFloat(value) / 100 * elementHeight
+                : Number.parseFloat(value))
+            const top = pixels[0] ?? 0
+            const bottom = pixels.length >= 3 ? pixels[2] ?? 0 : top
+            const vertical = Math.max(top, bottom ?? 0)
+
+            return vertical > elementHeight * 0.08 && vertical < elementHeight * 0.92
+        }
+    })
+}
+
+/**
  * 讀取視窗內大型元素的幾何與遮罩狀態。GSAP／JS 驅動的 clip-path、
  * transform、opacity 不會出現在 document.getAnimations()，但會改這些值。
  *
@@ -1149,19 +2913,42 @@ async function hasFiniteViewportAnimations(page: import('playwright').Page): Pro
 async function readViewportLayoutState(page: import('playwright').Page): Promise<string>
 {
     return page.evaluate(() => {
-        const minArea = window.innerWidth * window.innerHeight * 0.02
         const parts: string[] = []
+        const decorative = new Set<HTMLElement>()
+
+        for (const node of document.querySelectorAll<HTMLElement>('canvas, video')) decorative.add(node)
+
+        for (const animation of document.getAnimations()) {
+            if (animation.playState !== 'running') continue
+
+            const effect = animation.effect
+
+            if (!(effect instanceof KeyframeEffect)) continue
+            if (effect.getComputedTiming().iterations !== Infinity) continue
+            if (effect.target instanceof HTMLElement) decorative.add(effect.target)
+        }
 
         for (const element of document.body.querySelectorAll<HTMLElement>('*')) {
+            if (decorative.has(element)) continue
+
             const bounds = element.getBoundingClientRect()
 
-            if (bounds.width * bounds.height < minArea) continue
             if (bounds.bottom <= 0 || bounds.top >= window.innerHeight) continue
             if (bounds.right <= 0 || bounds.left >= window.innerWidth) continue
 
             const style = getComputedStyle(element)
+            const webkitMask = style.getPropertyValue('-webkit-mask-image')
+            const masked = style.clipPath !== 'none'
+                || (style.maskImage && style.maskImage !== 'none')
+                || (webkitMask && webkitMask !== 'none')
+            const opacity = Number(style.opacity)
+            const area = bounds.width * bounds.height
+            const minArea = (masked || (opacity > 0.04 && opacity < 0.96))
+                ? window.innerWidth * window.innerHeight * 0.004
+                : window.innerWidth * window.innerHeight * 0.02
 
             if (style.display === 'none' || style.visibility === 'hidden') continue
+            if (area < minArea) continue
 
             parts.push([
                 Math.round(bounds.x),
@@ -1172,7 +2959,9 @@ async function readViewportLayoutState(page: import('playwright').Page): Promise
                 style.transform,
                 style.clipPath,
                 style.maskImage,
-                style.getPropertyValue('-webkit-mask-image'),
+                webkitMask,
+                style.maskPosition,
+                style.getPropertyValue('-webkit-mask-position'),
             ].join(','))
         }
 
@@ -1520,12 +3309,14 @@ function listResidualWipeColumns(left: Buffer, right: Buffer, width: number): bo
 
             if (leftLuma > PHOTO_BELT_PAGE_LUMA && rightLuma > PHOTO_BELT_PAGE_LUMA) continue
 
-            totals[column] += (
+            const difference = (
                 Math.abs((left[index] ?? 0) - (right[index] ?? 0))
                 + Math.abs((left[index + 1] ?? 0) - (right[index + 1] ?? 0))
                 + Math.abs((left[index + 2] ?? 0) - (right[index + 2] ?? 0))
             ) / 3 / 255
-            counts[column] += 1
+
+            totals[column] = (totals[column] ?? 0) + difference
+            counts[column] = (counts[column] ?? 0) + 1
         }
     }
 
@@ -1598,6 +3389,1129 @@ function bandHasWipe(upperSlice: Buffer, lowerSlice: Buffer, width: number): boo
         || countBlendedWipeColumns(topUpper, width) >= WIPE_BAR_MIN_COUNT
 }
 
+type MediaBand = {
+    bottom: number
+    top: number
+}
+
+type RowIdentitySample = {
+    height: number
+    raw: Buffer
+    width: number
+}
+
+type RepeatCutGate = {
+    bands?: MediaBand[]
+    origin?: number
+    sample?: RowIdentitySample
+}
+
+/**
+ * 讀取視窗裡不該從中間剖開的圖片、影片、畫布與橫向輪播。
+ * 裁切若整段落在其中一個盒子裡，就不是整張複本，不能裁。
+ *
+ * @param page 已捲到此段的 Playwright 頁面。
+ * @returns 視窗座標裡的保護帶。
+ */
+async function readUncroppedMediaBands(page: import('playwright').Page): Promise<MediaBand[]>
+{
+    return page.evaluate(() => {
+        const bands: MediaBand[] = []
+
+        const consider = (element: Element) => {
+            let current: Element | null = element
+
+            while (current && current !== document.body) {
+                const style = getComputedStyle(current)
+
+                if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) < 0.8) return
+
+                current = current.parentElement
+            }
+
+            const bounds = element.getBoundingClientRect()
+
+            if (bounds.width < 160 || bounds.height < 100) return
+            if (bounds.bottom <= 0 || bounds.top >= window.innerHeight) return
+
+            const top = Math.max(0, bounds.top)
+            const bottom = Math.min(window.innerHeight, bounds.bottom)
+
+            if (bottom - top < 80) return
+
+            bands.push({ bottom, top })
+        }
+
+        for (const node of document.querySelectorAll('img, video, canvas, picture')) consider(node)
+
+        for (const node of document.querySelectorAll<HTMLElement>('div, section, ul, ol')) {
+            const style = getComputedStyle(node)
+            const bounds = node.getBoundingClientRect()
+            const scrolling = (style.overflowX === 'auto' || style.overflowX === 'scroll')
+                && node.scrollWidth > node.clientWidth + 24
+            const images = [...node.querySelectorAll<HTMLElement>('img, video')]
+            const row = images.length >= 2
+                && bounds.height >= 120
+                && bounds.height <= window.innerHeight * 0.95
+                && bounds.width >= window.innerWidth * 0.6
+            const imageBounds = images.map(image => image.getBoundingClientRect())
+            // 一排很小的 logo 不是照片帶。保護它會讓同一組 logo 的揭示各留一幀。
+            const logoGrid = imageBounds.length >= 4
+                && imageBounds.every(item => item.height > 0 && item.height < 96 && item.width < 320)
+
+            if ((scrolling || row) && !logoGrid) consider(node)
+        }
+
+        return bands
+    })
+}
+
+/**
+ * 把視窗座標的保護帶換成區段座標。
+ *
+ * @param bands 視窗座標。
+ * @param origin 區段頂端在視窗裡的 y。
+ * @param height 區段高度。
+ * @returns 落在區段內的保護帶。
+ */
+function viewportBandsToSegment(bands: MediaBand[], origin: number, height: number): MediaBand[]
+{
+    if (height <= 0) return []
+
+    return bands.flatMap(band => {
+        const top = Math.max(0, band.top - origin)
+        const bottom = Math.min(height, band.bottom - origin)
+
+        if (bottom - top < 24) return []
+
+        return [{ bottom, top }]
+    })
+}
+
+/**
+ * 裁切是否從圖片或輪播盒子的內部挖掉一截。貼齊盒子邊緣的整段複本仍可裁。
+ *
+ * @param cutStart 裁切起點。
+ * @param cutHeight 裁切高度。
+ * @param bands 保護帶。
+ * @param origin 裁切座標相對保護帶的位移。
+ * @returns 裁切嚴格落在某個盒子內部時為 true。
+ */
+function cutSplitsMedia(
+    cutStart: number,
+    cutHeight: number,
+    bands: MediaBand[] | undefined,
+    origin = 0,
+): boolean
+{
+    if (!bands || bands.length === 0 || cutHeight <= 0) return false
+
+    const top = origin + cutStart
+    const bottom = top + cutHeight
+
+    return bands.some(band => top > band.top + 12 && bottom < band.bottom - 12)
+}
+
+/**
+ * 裁掉中間一段之後，把保護帶的座標跟著往上移。
+ *
+ * @param bands 裁切前的保護帶。
+ * @param cutStart 裁切起點。
+ * @param cutHeight 裁切高度。
+ * @returns 裁切後的保護帶。
+ */
+function shiftBandsAfterCut(bands: MediaBand[], cutStart: number, cutHeight: number): MediaBand[]
+{
+    const cutEnd = cutStart + cutHeight
+    const next: MediaBand[] = []
+
+    for (const band of bands) {
+        if (band.bottom <= cutStart + 1) {
+            next.push(band)
+            continue
+        }
+
+        if (band.top >= cutEnd - 1) {
+            next.push({ bottom: band.bottom - cutHeight, top: band.top - cutHeight })
+            continue
+        }
+
+        if (band.top < cutStart) next.push({ bottom: cutStart, top: band.top })
+        if (band.bottom > cutEnd) next.push({ bottom: band.bottom - cutHeight, top: cutStart })
+    }
+
+    return next.filter(band => band.bottom - band.top >= 24)
+}
+
+/**
+ * 保留最近一個視窗高的已寫入畫面，用來辨認下一段是不是同一幀。
+ *
+ * @param previous 目前保留的尾端；第一段時為 null。
+ * @param segment 剛寫入的區段。
+ * @param width 頁面寬度。
+ * @param viewportHeight 視窗高度。
+ * @returns 不超過一個視窗高的尾端圖。
+ */
+async function rememberRecentScene(
+    previous: Buffer | null,
+    segment: Buffer,
+    width: number,
+    viewportHeight: number,
+): Promise<Buffer>
+{
+    if (!previous) return segment
+
+    const previousHeight = (await sharp(previous).metadata()).height ?? 0
+    const segmentHeight = (await sharp(segment).metadata()).height ?? 0
+    const combinedHeight = previousHeight + segmentHeight
+    const combined = await sharp({
+        create: {
+            background: '#ffffff',
+            channels: 3,
+            height: combinedHeight,
+            width,
+        },
+    })
+        .composite([
+            { input: previous, left: 0, top: 0 },
+            { input: segment, left: 0, top: previousHeight },
+        ])
+        .png()
+        .toBuffer()
+
+    if (combinedHeight <= viewportHeight) return combined
+
+    return sharp(combined)
+        .extract({
+            height: viewportHeight,
+            left: 0,
+            top: combinedHeight - viewportHeight,
+            width,
+        })
+        .png()
+        .toBuffer()
+}
+
+/**
+ * 新區段開頭有多少列是已經留下的同一幀。整段都是近白，或非白列都能在
+ * 最近畫面裡找到，就整段拿掉。否則只拿掉跟前一段尾端逐列對得上的前綴。
+ * 飽和純色的預留高度回 0，那種畫面要留住。
+ *
+ * @param segment 這次準備接上的區段。
+ * @param recent 最近已寫入的畫面。
+ * @param width 頁面寬度。
+ * @returns 應從區段頂端拿掉的像素高度。
+ */
+/**
+ * 蓋滿視窗的 sticky 裡，目前真正看得見的文字與小圖。
+ * 交叉淡化裡被壓到透明的那一層不算，避免兩個狀態疊在同一幀。
+ */
+export type StickySignature = {
+    images: number
+    texts: string
+}
+
+/**
+ * 判斷這一幀的 sticky 內容跟上一幀保留的狀態是什麼關係。
+ * 文字被換掉是新狀態；同一段文字又多了字或圖是同一塊的後續揭示。
+ *
+ * @param previous 上一張留下的簽名；還沒有時為 null。
+ * @param next 目前視窗的簽名。
+ * @returns empty 沒有可讀內容，drop-same 同一狀態，replace 同一塊更完整，keep 另一個狀態。
+ */
+export function relateStickySignatures(
+    previous: StickySignature | null,
+    next: StickySignature,
+): 'drop-same' | 'empty' | 'keep' | 'replace'
+{
+    if (next.texts === '' && next.images === 0) return 'empty'
+    if (!previous || (previous.texts === '' && previous.images === 0)) return 'keep'
+    if (next.texts === previous.texts && next.images <= previous.images) return 'drop-same'
+
+    const previousLines = previous.texts.split('\n').filter(line => line !== '')
+    const nextLines = next.texts.split('\n').filter(line => line !== '')
+    const nextLineSet = new Set(nextLines)
+    const previousLineSet = new Set(previousLines)
+    const previousContained = previousLines.every(line => nextLineSet.has(line))
+    const nextContained = nextLines.every(line => previousLineSet.has(line))
+
+    if (nextContained && next.images <= previous.images && (nextContained !== previousContained || next.texts === previous.texts)) {
+        return 'drop-same'
+    }
+
+    if (previousContained && (next.texts.length > previous.texts.length || next.images > previous.images)) return 'replace'
+
+    return 'keep'
+}
+
+/**
+ * 讀取蓋住視窗的 sticky 裡，透明度夠高的文字與沒有鋪滿視窗的圖片數。
+ *
+ * @param page Playwright 頁面。
+ * @returns 排序後的文字，以及可見圖片張數。
+ */
+async function readStickySignature(page: import('playwright').Page): Promise<StickySignature>
+{
+    return page.evaluate(() => {
+        const pin = coveringSticky()
+
+        if (!pin) return { images: 0, texts: '' }
+
+        const texts = new Set<string>()
+        const walker = document.createTreeWalker(pin, NodeFilter.SHOW_TEXT)
+        let node = walker.nextNode()
+
+        while (node) {
+            const parent = node.parentElement
+
+            if (parent && visuallyShown(parent)) {
+                const value = node.textContent?.replace(/\s+/g, ' ').trim() ?? ''
+
+                if (value.length >= 2) texts.add(value)
+            }
+
+            node = walker.nextNode()
+        }
+
+        let images = 0
+
+        for (const element of pin.querySelectorAll<HTMLElement>('img, video, canvas')) {
+            if (!visuallyShown(element)) continue
+
+            const bounds = element.getBoundingClientRect()
+            const area = bounds.width * bounds.height
+
+            if (bounds.width < 10 || bounds.height < 10) continue
+            if (bounds.bottom <= 0 || bounds.top >= window.innerHeight) continue
+            if (area < 200 || area > window.innerWidth * window.innerHeight * 0.7) continue
+
+            images += 1
+        }
+
+        return { images, texts: [...texts].sort().join('\n') }
+
+        function coveringSticky(): HTMLElement | null
+        {
+            for (const element of document.body.querySelectorAll<HTMLElement>('*')) {
+                const style = getComputedStyle(element)
+
+                if (style.position !== 'sticky') continue
+                if (style.visibility === 'hidden' || Number(style.opacity) < 0.2) continue
+
+                const bounds = element.getBoundingClientRect()
+
+                if (bounds.width < window.innerWidth * 0.85 || bounds.height < window.innerHeight * 0.85) continue
+                if (bounds.top > window.innerHeight * 0.45) continue
+                if (bounds.bottom < window.innerHeight * 0.7) continue
+
+                return element
+            }
+
+            return null
+        }
+
+        function visuallyShown(element: HTMLElement): boolean
+        {
+            const bounds = element.getBoundingClientRect()
+
+            if (bounds.bottom <= 4 || bounds.top >= window.innerHeight - 4) return false
+            if (bounds.width <= 2 || bounds.height <= 2) return false
+
+            let current: HTMLElement | null = element
+
+            while (current && current !== document.body) {
+                const style = getComputedStyle(current)
+
+                if (style.display === 'none' || style.visibility === 'hidden') return false
+                if (Number(style.opacity) < 0.8) return false
+
+                const blur = style.filter.match(/blur\(\s*([0-9.]+)px\s*\)/iu)
+                const amount = blur?.[1] ? Number.parseFloat(blur[1]) : 0
+
+                if (amount > 1.2) return false
+
+                current = current.parentElement
+            }
+
+            return true
+        }
+    })
+}
+
+/**
+ * 這段即將寫進區段起點，但區段裡的大標題還沒進畫面或還沒可讀。
+ * 這種標題若等下一個擷取步進，通常已經縮到重疊帶裡，長圖就會留下空白。
+ *
+ * @param page 停在目前擷取位置的頁面。
+ * @returns 應改從這裡重截的文件座標；沒有時為 null。
+ */
+async function readUnreadablePinnedSectionStart(page: import('playwright').Page): Promise<number | null>
+{
+    return page.evaluate(() => {
+        let best: number | null = null
+
+        for (const node of document.querySelectorAll<HTMLElement>('h1, h2')) {
+            const text = node.textContent?.replace(/\s+/g, ' ').trim() ?? ''
+
+            if (text.length < 2) continue
+
+            let pin: HTMLElement | null = node.parentElement
+
+            while (pin && pin !== document.body && getComputedStyle(pin).position !== 'sticky') {
+                pin = pin.parentElement
+            }
+
+            if (!pin || pin === document.body) continue
+
+            const style = getComputedStyle(node)
+            const bounds = node.getBoundingClientRect()
+            const opacity = Number(style.opacity)
+            const blurMatch = style.filter.match(/blur\(\s*([0-9.]+)px\s*\)/iu)
+            const blur = blurMatch?.[1] ? Number.parseFloat(blurMatch[1]) : 0
+            const matrix = style.transform.match(/matrix\(\s*([^)]+)\)/u)
+            const parts = matrix?.[1]?.split(',').map(value => Number.parseFloat(value)) ?? []
+            const scaleX = parts.length >= 2 ? Math.hypot(parts[0] ?? 1, parts[1] ?? 0) : 1
+            const onScreen = bounds.bottom > 8 && bounds.top < window.innerHeight - 8 && bounds.height > 8
+            const readable = onScreen && opacity >= 0.9 && blur <= 0.6 && scaleX >= 0.9
+
+            if (readable) continue
+
+            let section: HTMLElement | null = pin.parentElement
+
+            while (
+                section
+                && section !== document.body
+                && section.offsetHeight < window.innerHeight * 1.05
+            ) {
+                section = section.parentElement
+            }
+
+            const host = section && section !== document.body ? section : pin
+            const start = Math.round(host.getBoundingClientRect().top + window.scrollY)
+
+            if (start <= window.scrollY + 24) continue
+            if (start >= window.scrollY + window.innerHeight - 24) continue
+            if (best !== null && start >= best) continue
+
+            best = start
+        }
+
+        return best
+    })
+}
+
+type StackedFadeSection = {
+    count: number
+    end: number
+    start: number
+}
+
+/**
+ * 視窗裡互相重疊、用行內透明度輪流出現的大層。
+ * 區段要夠高，才把每一層清楚的那一幀留成獨立畫面；矮區段裡的是輪播，不走這條。
+ *
+ * @param page 已停在擷取位置的頁面。
+ * @returns 區段文件範圍與層數；不是這種堆疊時為 null。
+ */
+async function readStackedFadeSection(page: import('playwright').Page): Promise<StackedFadeSection | null>
+{
+    return page.evaluate(() => {
+        const viewportArea = window.innerHeight * window.innerWidth
+        const layers = [...document.body.querySelectorAll<HTMLElement>('*')].filter(element => {
+            if (element.style.opacity === '') return false
+
+            let pin: HTMLElement | null = element.parentElement
+
+            while (pin && pin !== document.body && getComputedStyle(pin).position !== 'sticky') pin = pin.parentElement
+
+            if (!pin || pin === document.body) return false
+
+            const bounds = element.getBoundingClientRect()
+
+            if (bounds.height < window.innerHeight * 0.45 || bounds.width < window.innerWidth * 0.35) return false
+            if (bounds.bottom < window.innerHeight * 0.2 || bounds.top > window.innerHeight * 0.85) return false
+            if (bounds.width * bounds.height < viewportArea * 0.2) return false
+
+            return true
+        })
+
+        const group: HTMLElement[] = []
+
+        for (const element of layers) {
+            const bounds = element.getBoundingClientRect()
+            const overlaps = group.length === 0 || group.some(other => {
+                const otherBounds = other.getBoundingClientRect()
+                const width = Math.min(bounds.right, otherBounds.right) - Math.max(bounds.left, otherBounds.left)
+                const height = Math.min(bounds.bottom, otherBounds.bottom) - Math.max(bounds.top, otherBounds.top)
+
+                if (width <= 0 || height <= 0) return false
+
+                const smaller = Math.min(bounds.width * bounds.height, otherBounds.width * otherBounds.height)
+
+                return smaller > 0 && (width * height) / smaller > 0.6
+            })
+
+            if (overlaps) group.push(element)
+        }
+
+        const pinOf = (element: HTMLElement): HTMLElement | null => {
+            let pin: HTMLElement | null = element.parentElement
+
+            while (pin && pin !== document.body && getComputedStyle(pin).position !== 'sticky') pin = pin.parentElement
+
+            return pin && pin !== document.body ? pin : null
+        }
+        const pin = pinOf(group[0] ?? document.body)
+        const samePin = pin ? group.filter(element => pinOf(element) === pin) : []
+        const leaves = samePin.filter(element => !samePin.some(other => other !== element && element.contains(other)))
+
+        if (leaves.length < 2) return null
+
+        let section: HTMLElement | null = leaves[0]?.parentElement ?? null
+
+        while (section && section !== document.body) {
+            if (section.offsetHeight >= leaves.length * window.innerHeight * 0.7) break
+
+            section = section.parentElement
+        }
+
+        if (!section || section === document.body) return null
+        if (section.offsetHeight < leaves.length * window.innerHeight * 0.7) return null
+
+        leaves.forEach((element, index) => {
+            element.setAttribute('data-sitesensory-fade-layer', String(index))
+        })
+
+        const start = section.getBoundingClientRect().top + window.scrollY
+
+        return {
+            count: leaves.length,
+            end: Math.round(start + section.offsetHeight),
+            start: Math.round(start),
+        }
+    })
+}
+
+type FadeLayerSample = {
+    opacity: number
+    readable: boolean
+}
+
+/**
+ * 讀取已經標好的堆疊層，這一捲動位置各層清不清楚。
+ *
+ * @param page Playwright 頁面。
+ * @returns 與標記順序相同的透明度與可讀狀態。
+ */
+async function readFadeLayerSamples(page: import('playwright').Page): Promise<FadeLayerSample[]>
+{
+    return page.evaluate(() => {
+        for (const node of document.querySelectorAll('[data-sitesensory-settled], [data-sitesensory-suppress-swap]')) {
+            node.removeAttribute('data-sitesensory-settled')
+            node.removeAttribute('data-sitesensory-suppress-swap')
+        }
+
+        const layers = [...document.querySelectorAll<HTMLElement>('[data-sitesensory-fade-layer]')]
+            .sort((left, right) => Number(left.getAttribute('data-sitesensory-fade-layer'))
+                - Number(right.getAttribute('data-sitesensory-fade-layer')))
+
+        return layers.map(element => {
+            let readable = true
+            let current: HTMLElement | null = element
+
+            while (current && current !== document.body) {
+                const style = getComputedStyle(current)
+
+                if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) < 0.8) readable = false
+
+                const blur = style.filter.match(/blur\(\s*([0-9.]+)px\s*\)/iu)
+
+                if (blur?.[1] && Number.parseFloat(blur[1]) > 1.2) readable = false
+
+                current = current.parentElement
+            }
+
+            const heading = element.querySelector('h1, h2, h3')
+
+            if (heading) {
+                const filter = getComputedStyle(heading).filter
+                const blur = filter.match(/blur\(\s*([0-9.]+)px\s*\)/iu)
+
+                if (blur?.[1] && Number.parseFloat(blur[1]) > 1.2) readable = false
+            }
+
+            return {
+                opacity: Number(getComputedStyle(element).opacity),
+                readable,
+            }
+        })
+    })
+}
+
+/**
+ * 在堆疊區段裡，為每一層找透明度夠高、字也清楚的捲動位置，各截一幀。
+ *
+ * @param page 目前頁面。
+ * @param section 堆疊區段的文件範圍。
+ * @param viewportHeight 視窗高度。
+ * @returns 依出現順序排列的視窗截圖。層數對不齊時可能少於區段層數。
+ */
+async function captureStackedFadeFrames(
+    page: import('playwright').Page,
+    section: StackedFadeSection,
+    viewportHeight: number,
+): Promise<Buffer[]>
+{
+    const step = 160
+    const chosen: Array<{ opacity: number, scroll: number } | null> = Array.from({ length: section.count }, () => null)
+    const last = Math.max(section.start, section.end - viewportHeight)
+
+    for (let scroll = section.start; scroll <= last; scroll += step) {
+        const landed = await scrollPageToAndHold(page, scroll)
+
+        if (landed < scroll - 48) break
+
+        const samples = await readFadeLayerSamples(page)
+
+        samples.forEach((sample, index) => {
+            if (!sample.readable || sample.opacity < 0.85) return
+
+            const othersDim = samples.every((other, otherIndex) => otherIndex === index || other.opacity <= 0.25)
+            const current = chosen[index]
+
+            if (!othersDim) return
+            if (current && current.opacity >= sample.opacity) return
+
+            chosen[index] = { opacity: sample.opacity, scroll: landed }
+        })
+    }
+
+    const picks = chosen.flatMap(pick => pick ? [pick] : [])
+
+    picks.sort((left, right) => left.scroll - right.scroll)
+
+    const frames: Buffer[] = []
+
+    for (const pick of picks) {
+        await scrollPageToAndHold(page, pick.scroll)
+        frames.push(await screenshotViewport(page, 'allow'))
+    }
+
+    return frames
+}
+
+/**
+ * 從目前簽名往後看，停在同一塊內容最完整的那一幀。
+ * 文字被換成另一句就停，避免把下一個專案或下一張卡吃進這一幀。
+ *
+ * @param page 停在擷取位置的頁面。
+ * @param signature 這一幀已經看得見的簽名。
+ * @param current 目前視窗截圖。
+ * @returns 更完整的視窗，以及那一幀的簽名。
+ */
+async function captureRicherStickyFrame(
+    page: import('playwright').Page,
+    signature: StickySignature,
+    current: Buffer,
+): Promise<{ image: Buffer, signature: StickySignature }>
+{
+    const origin = await readDocumentScroll(page)
+    let bestImage = current
+    let bestSignature = signature
+    let bestScore = stickySignatureScore(signature)
+
+    for (let step = 1; step <= 10; step += 1) {
+        const requested = origin + step * 220
+        const landed = await scrollPageToAndHold(page, requested)
+
+        if (landed < requested - 48) break
+        if (!await stickyPinCoversViewport(page)) break
+
+        await settleScrollScrubbedFrame(page)
+
+        const next = await readStickySignature(page)
+        const relation = relateStickySignatures(bestSignature, next)
+
+        if (relation === 'keep') break
+
+        const score = stickySignatureScore(next)
+
+        if (score > bestScore) {
+            bestScore = score
+            bestSignature = next
+            bestImage = await screenshotViewport(page, 'allow')
+        }
+    }
+
+    await scrollPageToAndHold(page, origin)
+
+    return { image: bestImage, signature: bestSignature }
+}
+
+/**
+ * 文字愈長、可見小圖愈多，這塊揭示就愈完整。
+ *
+ * @param signature sticky 簽名。
+ * @returns 用來比較前後幀的分數。
+ */
+function stickySignatureScore(signature: StickySignature): number
+{
+    return signature.texts.length + signature.images * 12
+}
+
+export async function stickyDuplicatePrefixLength(
+    segment: Buffer,
+    recent: Buffer,
+    width: number,
+): Promise<number>
+{
+    const segmentHeight = (await sharp(segment).metadata()).height ?? 0
+    const recentHeight = (await sharp(recent).metadata()).height ?? 0
+
+    if (segmentHeight < 24 || recentHeight < 24) return 0
+
+    const sampleWidth = Math.min(64, width)
+    const segmentRaw = await sharp(segment)
+        .resize(sampleWidth, segmentHeight, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+    const recentRaw = await sharp(recent)
+        .resize(sampleWidth, recentHeight, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+    const rowBytes = sampleWidth * 3
+    const recentKeys = new Set<string>()
+    let recentHasInk = false
+
+    for (let row = 0; row < recentHeight; row += 1) {
+        const slice = recentRaw.subarray(row * rowBytes, (row + 1) * rowBytes)
+
+        if (!isNearWhiteRow(slice)) recentHasInk = true
+
+        recentKeys.add(rowKey(slice))
+    }
+
+    if (!recentHasInk) return 0
+
+    let inkRows = 0
+    let matchedInk = 0
+    let lumaTotal = 0
+    let lumaSquares = 0
+
+    for (let row = 0; row < segmentHeight; row += 1) {
+        const slice = segmentRaw.subarray(row * rowBytes, (row + 1) * rowBytes)
+        const luma = rowLuma(slice)
+
+        lumaTotal += luma
+        lumaSquares += luma * luma
+
+        if (isNearWhiteRow(slice)) continue
+
+        inkRows += 1
+        if (recentKeys.has(rowKey(slice))) matchedInk += 1
+    }
+
+    const mean = lumaTotal / segmentHeight
+    const variance = Math.sqrt(Math.max(0, lumaSquares / segmentHeight - mean * mean)) / 255
+
+    if (variance < 0.02 && mean < 246) return 0
+    if (variance < 0.02 || inkRows === 0 || matchedInk === inkRows) return segmentHeight
+
+    let aligned = 0
+    const limit = Math.min(segmentHeight, recentHeight)
+
+    for (let length = 1; length <= limit; length += 1) {
+        let same = true
+
+        for (let row = 0; row < length; row += 1) {
+            const nextSlice = segmentRaw.subarray(row * rowBytes, (row + 1) * rowBytes)
+            const previousIndex = (recentHeight - length + row) * rowBytes
+            const previousSlice = recentRaw.subarray(previousIndex, previousIndex + rowBytes)
+
+            if (!rowsLookSame(nextSlice, previousSlice)) {
+                same = false
+                break
+            }
+        }
+
+        if (!same) break
+
+        aligned = length
+    }
+
+    return aligned >= 24 ? aligned : 0
+}
+
+/**
+ * 量一段裡頭尾連續近白，以及中間還有沒有文字或圖片。
+ * 蓋滿視窗的 sticky 常把標題夾在大片空白行程裡，那兩截不該留下。
+ *
+ * @param segment 區段 PNG。
+ * @param width 頁面寬度。
+ * @returns 頭尾近白列數，以及非白列數。
+ */
+export async function stickyBlankEdges(
+    segment: Buffer,
+    width: number,
+): Promise<{ ink: number, lead: number, tail: number }>
+{
+    const height = (await sharp(segment).metadata()).height ?? 0
+
+    if (height < 40) return { ink: 0, lead: 0, tail: 0 }
+
+    const sampleWidth = Math.min(64, width)
+    const raw = await sharp(segment)
+        .resize(sampleWidth, height, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+    const rowBytes = sampleWidth * 3
+    let lead = 0
+    let tail = 0
+    let ink = 0
+
+    for (let row = 0; row < height; row += 1) {
+        const slice = raw.subarray(row * rowBytes, (row + 1) * rowBytes)
+
+        if (!isNearWhiteRow(slice)) break
+
+        lead += 1
+    }
+
+    for (let row = height - 1; row >= lead; row -= 1) {
+        const slice = raw.subarray(row * rowBytes, (row + 1) * rowBytes)
+
+        if (!isNearWhiteRow(slice)) break
+
+        tail += 1
+    }
+
+    for (let row = lead; row < height - tail; row += 1) {
+        const slice = raw.subarray(row * rowBytes, (row + 1) * rowBytes)
+
+        if (!isNearWhiteRow(slice)) ink += 1
+    }
+
+    return { ink, lead, tail }
+}
+
+/**
+ * 一列是否近白。近白的 sticky 行程可以拿掉；飽和色列不行。
+ *
+ * @param slice 一列 RGB。
+ * @returns 平均亮度很高時為 true。
+ */
+/**
+ * 整幀 sticky 比文件行程多出來的高度，只從最長的純白縫收回。
+ * 至少留下 24px，避免把刻意留白刪光。沒有夠長的純白縫就保持失敗。
+ *
+ * @param image 已拼接的頁面。
+ * @param width 頁面寬度。
+ * @param excess 高出文件的像素。
+ * @param protectedBands 圖片與輪播盒子，純白縫若落在裡面就不砍。
+ * @returns 收回後的頁面；收不回來時為 null。
+ */
+export async function absorbStrictWhiteOvershoot(
+    image: Buffer,
+    width: number,
+    excess: number,
+    protectedBands: MediaBand[] = [],
+): Promise<Buffer | null>
+{
+    if (excess <= 0) return image
+
+    const height = (await sharp(image).metadata()).height ?? 0
+
+    if (height <= excess + 24) return null
+
+    const sampleWidth = Math.min(64, width)
+    const raw = await sharp(image)
+        .resize(sampleWidth, height, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+    const rowBytes = sampleWidth * 3
+    let bestStart = -1
+    let bestLength = 0
+    let runStart = 0
+    let runLength = 0
+
+    const blocked = (row: number): boolean => protectedBands.some(band => row >= band.top && row < band.bottom)
+
+    const closeRun = (end: number): void => {
+        if (runLength > bestLength && runLength >= excess + 24) {
+            bestStart = runStart
+            bestLength = runLength
+        }
+
+        runLength = 0
+        runStart = end
+    }
+
+    for (let row = 0; row < height; row += 1) {
+        const slice = raw.subarray(row * rowBytes, (row + 1) * rowBytes)
+        const open = isNearWhiteRow(slice) && !blocked(row)
+
+        if (open) {
+            if (runLength === 0) runStart = row
+            runLength += 1
+        }
+        else if (runLength > 0) closeRun(row)
+    }
+
+    if (runLength > 0) closeRun(height)
+
+    if (bestStart < 0 || bestLength < excess + 24) return null
+
+    const cutAt = bestStart + Math.floor((bestLength - excess) / 2)
+    const head = await sharp(image).extract({ height: cutAt, left: 0, top: 0, width }).png().toBuffer()
+    const tailHeight = height - (cutAt + excess)
+    const tail = await sharp(image)
+        .extract({ height: tailHeight, left: 0, top: cutAt + excess, width })
+        .png()
+        .toBuffer()
+
+    return sharp({
+        create: {
+            background: '#ffffff',
+            channels: 3,
+            height: cutAt + tailHeight,
+            width,
+        },
+    })
+        .composite([
+            { input: head, left: 0, top: 0 },
+            { input: tail, left: 0, top: cutAt },
+        ])
+        .png()
+        .toBuffer()
+}
+
+function isNearWhiteRow(slice: Buffer): boolean
+{
+    if (slice.length < 3) return true
+    if (rowLuma(slice) < 246) return false
+
+    let dark = 0
+    let count = 0
+
+    for (let index = 0; index < slice.length; index += 3) {
+        const luma = (slice[index] ?? 0) * 0.3
+            + (slice[index + 1] ?? 0) * 0.59
+            + (slice[index + 2] ?? 0) * 0.11
+
+        count += 1
+        if (luma < 236) dark += 1
+    }
+
+    return count === 0 || dark / count < 0.015
+}
+
+/**
+ * 一列的平均亮度。
+ *
+ * @param slice 一列 RGB。
+ * @returns 0 到 255。
+ */
+function rowLuma(slice: Buffer): number
+{
+    if (slice.length < 3) return 255
+
+    let total = 0
+    let count = 0
+
+    for (let index = 0; index < slice.length; index += 3) {
+        total += (slice[index] ?? 0) * 0.3 + (slice[index + 1] ?? 0) * 0.59 + (slice[index + 2] ?? 0) * 0.11
+        count += 1
+    }
+
+    return count > 0 ? total / count : 255
+}
+
+/**
+ * 把一列量化成可比對的鍵。相鄰 2 階視為同一列，避免抗鋸齒差 1 就被當成新內容。
+ *
+ * @param slice 一列 RGB。
+ * @returns 列鍵。
+ */
+function rowKey(slice: Buffer): string
+{
+    let key = ''
+
+    for (let index = 0; index < slice.length; index += 1) {
+        key += String.fromCharCode((slice[index] ?? 0) >> 2)
+    }
+
+    return key
+}
+
+/**
+ * 兩列是否接近到可以當成同一幀。門檻對齊接縫檢查，避免差 1 階就被留下、
+ * 最後又被接縫檢查判成重疊步進。
+ *
+ * @param left 第一列 RGB。
+ * @param right 第二列 RGB。
+ * @returns 平均通道差很小時為 true。
+ */
+function rowsLookSame(left: Buffer, right: Buffer): boolean
+{
+    const length = Math.min(left.length, right.length)
+
+    if (length < 3) return false
+
+    let total = 0
+
+    for (let index = 0; index < length; index += 1) {
+        total += Math.abs((left[index] ?? 0) - (right[index] ?? 0))
+    }
+
+    return total / length <= 4
+}
+
+/**
+ * 做一份用來核對兩段是否像素相同的縮圖。寬度壓到 480，高度維持原像素列。
+ *
+ * @param image PNG。
+ * @param width 原圖寬度。
+ * @param height 原圖高度。
+ * @returns 列對齊的 RGB 樣本。
+ */
+async function createRowIdentitySample(image: Buffer, width: number, height: number): Promise<RowIdentitySample>
+{
+    const sampleWidth = Math.min(480, width)
+    const raw = await sharp(image)
+        .resize(sampleWidth, height, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+
+    return { height, raw, width: sampleWidth }
+}
+
+/**
+ * 兩段列是否為同一份像素。白條對照片的欄略過，其餘平均差必須近乎 0。
+ *
+ * @param sample 同一張圖的列樣本。
+ * @param startA 第一段起點。
+ * @param startB 第二段起點。
+ * @param rows 列數。
+ * @returns 近乎像素相同時為 true。
+ */
+function sampledRowsMatch(sample: RowIdentitySample, startA: number, startB: number, rows: number): boolean
+{
+    const rowCount = Math.min(rows, sample.height - startA, sample.height - startB)
+
+    if (rowCount < 8 || startA < 0 || startB < 0) return false
+
+    for (let delta = -4; delta <= 4; delta += 1) {
+        const shifted = startB + delta
+
+        if (shifted < 0 || shifted + rowCount > sample.height) continue
+        if (rawRowsMatch(sample.raw, sample.raw, sample.width, startA, shifted, rowCount)) return true
+    }
+
+    return false
+}
+
+/**
+ * 兩張圖各取一段列，確認是像素相同的複本，而不是縮圖上看起來接近。
+ *
+ * @param previous 前一段。
+ * @param next 後一段。
+ * @param width 寬度。
+ * @param previousTop 前一段的列起點。
+ * @param nextTop 後一段的列起點。
+ * @param rows 列數。
+ * @returns 近乎像素相同時為 true。
+ */
+async function rowsMatchAcross(
+    previous: Buffer,
+    next: Buffer,
+    width: number,
+    previousTop: number,
+    nextTop: number,
+    rows: number,
+): Promise<boolean>
+{
+    if (rows < 8 || previousTop < 0 || nextTop < 0) return false
+
+    const sampleWidth = Math.min(480, width)
+    const left = await sharp(previous)
+        .extract({ height: rows, left: 0, top: previousTop, width })
+        .resize(sampleWidth, rows, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+    const right = await sharp(next)
+        .extract({ height: rows, left: 0, top: nextTop, width })
+        .resize(sampleWidth, rows, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+
+    return rawRowsMatch(left, right, sampleWidth, 0, 0, rows)
+}
+
+/**
+ * 比對兩份 RGB 列。略過近白頁面與 wipe 白條對照片的像素。
+ *
+ * @param left 第一份 RGB。
+ * @param right 第二份 RGB。
+ * @param width 樣本寬度。
+ * @param startA 第一份列起點。
+ * @param startB 第二份列起點。
+ * @param rows 列數。
+ * @returns 平均通道差不超過文件流身份門檻時為 true。
+ */
+function rawRowsMatch(
+    left: Buffer,
+    right: Buffer,
+    width: number,
+    startA: number,
+    startB: number,
+    rows: number,
+): boolean
+{
+    const rowBytes = width * 3
+    const step = width > 240 ? 2 : 1
+    let total = 0
+    let count = 0
+
+    for (let row = 0; row < rows; row += 1) {
+        const leftRow = (startA + row) * rowBytes
+        const rightRow = (startB + row) * rowBytes
+
+        for (let column = 0; column < width; column += step) {
+            const leftIndex = leftRow + column * 3
+            const rightIndex = rightRow + column * 3
+            const leftLuma = 0.299 * (left[leftIndex] ?? 0)
+                + 0.587 * (left[leftIndex + 1] ?? 0)
+                + 0.114 * (left[leftIndex + 2] ?? 0)
+            const rightLuma = 0.299 * (right[rightIndex] ?? 0)
+                + 0.587 * (right[rightIndex + 1] ?? 0)
+                + 0.114 * (right[rightIndex + 2] ?? 0)
+            const wipe = (leftLuma > PHOTO_WIPE_LUMA && rightLuma <= PHOTO_BELT_PAGE_LUMA)
+                || (rightLuma > PHOTO_WIPE_LUMA && leftLuma <= PHOTO_BELT_PAGE_LUMA)
+
+            if (wipe) continue
+            if (leftLuma > PHOTO_BELT_PAGE_LUMA && rightLuma > PHOTO_BELT_PAGE_LUMA) continue
+
+            total += Math.abs((left[leftIndex] ?? 0) - (right[rightIndex] ?? 0))
+            total += Math.abs((left[leftIndex + 1] ?? 0) - (right[rightIndex + 1] ?? 0))
+            total += Math.abs((left[leftIndex + 2] ?? 0) - (right[rightIndex + 2] ?? 0))
+            count += 3
+        }
+    }
+
+    const samples = rows * Math.ceil(width / step)
+
+    if (count < samples * 0.25) return false
+
+    return total / count / 255 <= DOCUMENT_ROW_IDENTITY
+}
+
 /**
  * 去掉後段開頭與前一段內容重複的捲動場景。sticky 面板停在視窗上方時，
  * 幾何裁切後仍會再寫入同一張照片。純色底不裁，以免把留白誤刪。後段幾乎
@@ -1610,7 +4524,16 @@ function bandHasWipe(upperSlice: Buffer, lowerSlice: Buffer, width: number): boo
  * @returns 去掉重複前綴後的區段；沒有重複則原樣返回；只剩同一張照片的
  * 邊角碎帶時為 null，呼叫端應略過該段。
  */
-export async function trimDuplicateScenePrefix(previous: Buffer, next: Buffer, width: number): Promise<Buffer | null>
+export async function trimDuplicateScenePrefix(
+    previous: Buffer,
+    next: Buffer,
+    width: number,
+    options: {
+        bandOrigin?: number
+        identicalRows?: boolean
+        protectedBands?: MediaBand[]
+    } = {},
+): Promise<Buffer | null>
 {
     const previousMeta = await sharp(previous).metadata()
     const nextMeta = await sharp(next).metadata()
@@ -1634,6 +4557,7 @@ export async function trimDuplicateScenePrefix(previous: Buffer, next: Buffer, w
         .toBuffer()
     const rowBytes = SETTLE_SIGNATURE_WIDTH * 3
     const windowRows = Math.min(8, previousRows, nextRows)
+    let alignment = -1
     let matchedRows = 0
 
     for (let start = 0; start <= nextRows - windowRows; start += 1) {
@@ -1641,7 +4565,7 @@ export async function trimDuplicateScenePrefix(previous: Buffer, next: Buffer, w
 
         if (rowSliceVariance(slice) < SCENE_TRIM_MIN_VARIANCE) break
 
-        let found = false
+        let foundAt = -1
 
         for (let previousStart = 0; previousStart <= previousRows - windowRows; previousStart += 1) {
             const previousSlice = previousSignature.subarray(previousStart * rowBytes, (previousStart + windowRows) * rowBytes)
@@ -1653,23 +4577,60 @@ export async function trimDuplicateScenePrefix(previous: Buffer, next: Buffer, w
                 : visualDifference(slice, previousSlice)
 
             if (difference <= SCENE_TRIM_THRESHOLD) {
-                found = true
+                foundAt = previousStart
                 break
             }
         }
 
-        if (!found) break
+        if (foundAt < 0) break
+
+        const aligned = foundAt - start
+
+        if (options.identicalRows) {
+            if (alignment < 0) alignment = aligned
+            else if (Math.abs(aligned - alignment) > 1) break
+        }
 
         matchedRows = start + windowRows
     }
 
+    const identicalPrefix = async (rows: number): Promise<boolean> => {
+        if (!options.identicalRows) return true
+
+        const trimPx = Math.round(rows / scale)
+        const previousTop = Math.round(Math.max(0, alignment) / scale)
+
+        return rowsMatchAcross(
+            previous,
+            next,
+            width,
+            previousTop,
+            0,
+            Math.min(trimPx, previousHeight - previousTop, nextHeight),
+        )
+    }
+
     if (nextRows > 0 && matchedRows / nextRows >= SCENE_TRIM_CONTINUE_RATIO) {
+        if (options.identicalRows) {
+            const identical = await identicalPrefix(matchedRows)
+            const splitsMedia = cutSplitsMedia(0, nextHeight, options.protectedBands, options.bandOrigin ?? 0)
+
+            if (!identical || splitsMedia) return next
+        }
+
         return isVerticallyUniformScene(nextSignature, nextRows) ? next : null
     }
 
     const trimPx = Math.min(Math.round(matchedRows / scale), Math.floor(nextHeight * SCENE_TRIM_MAX_RATIO))
 
     if (trimPx <= 8 || trimPx >= nextHeight) return next
+
+    if (options.identicalRows) {
+        const identical = await identicalPrefix(matchedRows)
+
+        if (!identical) return next
+        if (cutSplitsMedia(0, trimPx, options.protectedBands, options.bandOrigin ?? 0)) return next
+    }
 
     if (nextHeight - trimPx <= nextHeight * SCENE_TRIM_SCRAP_RATIO) return null
 
@@ -1717,23 +4678,47 @@ function isVerticallyUniformScene(signature: Buffer, rows: number): boolean
 export async function trimRepeatedTailBand(
     image: Buffer,
     width: number,
-    options: { viewportTiles?: boolean } = {},
+    options: {
+        identicalRows?: boolean
+        protectedBands?: MediaBand[]
+        viewportTiles?: boolean
+    } = {},
 ): Promise<Buffer>
 {
     let current = image
     let removedViewportTile = false
 
     for (let pass = 0; pass < 3; pass += 1) {
-        const next = await trimOnePhotoBelt(current, width, {
-            ...options,
+        const beltOptions: {
+            identicalRows?: boolean
+            protectedBands?: MediaBand[]
+            skipCardAndThick?: boolean
+            viewportTiles?: boolean
+        } = {
             skipCardAndThick: removedViewportTile,
-        })
+        }
+
+        if (options.identicalRows === true) beltOptions.identicalRows = true
+        if (options.protectedBands) beltOptions.protectedBands = options.protectedBands
+        if (options.viewportTiles === true) beltOptions.viewportTiles = true
+
+        const outcome = await trimOnePhotoBelt(current, width, beltOptions)
         const before = (await sharp(current).metadata()).height ?? 0
-        const after = (await sharp(next).metadata()).height ?? 0
+        const after = (await sharp(outcome.image).metadata()).height ?? 0
 
-        if (after >= before) return current
+        if (!outcome.cut || after >= before) return current
 
-        current = next
+        if (options.protectedBands && outcome.cut) {
+            const shifted = shiftBandsAfterCut(
+                options.protectedBands,
+                outcome.cut.cutStart,
+                outcome.cut.cutHeight,
+            )
+
+            options.protectedBands.splice(0, options.protectedBands.length, ...shifted)
+        }
+
+        current = outcome.image
         if (before - after >= 800) removedViewportTile = true
     }
 
@@ -1752,13 +4737,18 @@ export async function trimRepeatedTailBand(
 async function trimOnePhotoBelt(
     image: Buffer,
     width: number,
-    options: { skipCardAndThick?: boolean, viewportTiles?: boolean } = {},
-): Promise<Buffer>
+    options: {
+        identicalRows?: boolean
+        protectedBands?: MediaBand[]
+        skipCardAndThick?: boolean
+        viewportTiles?: boolean
+    } = {},
+): Promise<{ cut: { cutHeight: number, cutStart: number } | null, image: Buffer }>
 {
     const metadata = await sharp(image).metadata()
     const height = metadata.height ?? 0
 
-    if (height < 160) return image
+    if (height < 160) return { cut: null, image }
 
     const reference = Math.min(PHOTO_BELT_REFERENCE_HEIGHT, height)
     const coarseHeight = Math.max(16, Math.round(height * PHOTO_BELT_SIGNATURE_WIDTH / width))
@@ -1776,11 +4766,23 @@ async function trimOnePhotoBelt(
         signature: coarse,
         signatureHeight: coarseHeight,
     }
+    const gate: RepeatCutGate | undefined = options.identicalRows
+        ? {
+            origin: 0,
+            sample: await createRowIdentitySample(image, width, height),
+            ...(options.protectedBands ? { bands: options.protectedBands } : {}),
+        }
+        : undefined
     const tileCut = options.viewportTiles === true && options.skipCardAndThick !== true
         ? findViewportTileCut(coarseContext)
         : null
 
-    if (tileCut) return applyRepeatCut(image, width, height, tileCut)
+    if (tileCut) {
+        return {
+            cut: tileCut,
+            image: await applyRepeatCut(image, width, height, tileCut),
+        }
+    }
 
     if (options.skipCardAndThick !== true) {
         const cardCut = height > PHOTO_BELT_REFERENCE_HEIGHT
@@ -1788,15 +4790,22 @@ async function trimOnePhotoBelt(
                 coarseContext,
                 PHOTO_CARD_RATIOS.filter(ratio => options.viewportTiles === true || ratio < 0.95),
                 true,
+                gate,
             )
             : null
         const thickCut = cardCut ?? findRepeatCut(
             coarseContext,
             PHOTO_BELT_RATIOS.filter(ratio => ratio >= PHOTO_BELT_THICK_RATIO),
             false,
+            gate,
         )
 
-        if (thickCut) return applyRepeatCut(image, width, height, thickCut)
+        if (thickCut) {
+            return {
+                cut: thickCut,
+                image: await applyRepeatCut(image, width, height, thickCut),
+            }
+        }
     }
 
     const fineHeight = Math.max(coarseHeight, Math.round(height / PHOTO_BELT_FINE_PX))
@@ -1815,11 +4824,16 @@ async function trimOnePhotoBelt(
         signature: fine,
         signatureHeight: fineHeight,
     }
-    const thinCut = findThinBelt1D(fineContext)
-        ?? findThinBelt1D(fineContext, { columnEnd: 32, columnStart: 0 })
-        ?? findThinBelt1D(fineContext, { columnEnd: 64, columnStart: 32 })
+    const thinCut = findThinBelt1D(fineContext, undefined, gate)
+        ?? findThinBelt1D(fineContext, { columnEnd: 32, columnStart: 0 }, gate)
+        ?? findThinBelt1D(fineContext, { columnEnd: 64, columnStart: 32 }, gate)
 
-    return thinCut ? applyRepeatCut(image, width, height, thinCut) : image
+    if (!thinCut) return { cut: null, image }
+
+    return {
+        cut: thinCut,
+        image: await applyRepeatCut(image, width, height, thinCut),
+    }
 }
 
 /**
@@ -2267,6 +5281,7 @@ function findRepeatCut(
     context: RepeatScanContext,
     ratios: number[],
     cardScale: boolean,
+    gate?: RepeatCutGate,
 ): { cutHeight: number, cutStart: number } | null
 {
     const { reference, rowBytes, scale, signature, signatureHeight } = context
@@ -2437,6 +5452,17 @@ function findRepeatCut(
             const matchedPeriod = Math.max(periodRows, lower - bestUpper)
             const candidateStart = Math.round((cardScale || upperHasWipe ? bestUpper : lower) * scale)
             const candidateHeight = Math.round(matchedPeriod * scale)
+            const neighborStart = Math.round((cardScale || upperHasWipe ? lower : bestUpper) * scale)
+
+            if (
+                gate?.sample
+                && !sampledRowsMatch(gate.sample, neighborStart, candidateStart, candidateHeight)
+            ) {
+                continue
+            }
+
+            if (cutSplitsMedia(candidateStart, candidateHeight, gate?.bands, gate?.origin ?? 0)) continue
+
             const betterPage = cardScale && aboveIsPage && !cutFromPage
             const worsePage = cardScale && cutFromPage && !aboveIsPage
             const betterDiff = maskedPair < cutDifference - 0.002
@@ -2484,6 +5510,7 @@ function findRepeatCut(
 function findThinBelt1D(
     context: RepeatScanContext,
     columns: { columnEnd: number, columnStart: number } = { columnEnd: 64, columnStart: 0 },
+    gate?: RepeatCutGate,
 ): { cutHeight: number, cutStart: number } | null
 {
     const { height, rowBytes, scale, signature, signatureHeight } = context
@@ -2629,6 +5656,17 @@ function findThinBelt1D(
             if (candidateStart < 8) continue
 
             const candidateHeight = Math.round(period * scale)
+            const neighborStart = candidateStart - candidateHeight
+
+            if (
+                gate?.sample
+                && !sampledRowsMatch(gate.sample, neighborStart, candidateStart, candidateHeight)
+            ) {
+                continue
+            }
+
+            if (cutSplitsMedia(candidateStart, candidateHeight, gate?.bands, gate?.origin ?? 0)) continue
+
             const betterDiff = pairDifference < cutDifference - 0.002
             const similarLarger = Math.abs(pairDifference - cutDifference) <= 0.002
                 && candidateHeight > cutHeight
@@ -2979,6 +6017,36 @@ export async function isSamePinnedScene(previous: Buffer, next: Buffer, width: n
  * @param slice 連續列的 RGB 資料。
  * @returns 介於 0 與 1 的平均空間變異。
  */
+/**
+ * 幾乎純色的帶不算拼接重複。少數亮點會把變異數抬過門檻，但畫面仍是暗邊或留白。
+ *
+ * @param slice 一段 RGB 像素。
+ * @returns 有足夠多像素偏離平均亮度時為 true。
+ */
+function bandHasVisualStructure(slice: Buffer): boolean
+{
+    const pixels = Math.floor(slice.length / 3)
+
+    if (pixels === 0) return false
+
+    let mean = 0
+
+    for (let index = 0; index < pixels * 3; index += 3) {
+        mean += ((slice[index] ?? 0) + (slice[index + 1] ?? 0) + (slice[index + 2] ?? 0)) / 3
+    }
+
+    mean /= pixels
+    let outliers = 0
+
+    for (let index = 0; index < pixels * 3; index += 3) {
+        const luma = ((slice[index] ?? 0) + (slice[index + 1] ?? 0) + (slice[index + 2] ?? 0)) / 3
+
+        if (Math.abs(luma - mean) > 18) outliers += 1
+    }
+
+    return outliers / pixels >= 0.08
+}
+
 export function rowSliceVariance(slice: Buffer): number
 {
     if (slice.length < 3) return 0
@@ -3022,6 +6090,10 @@ async function screenshotViewport(
     animations: 'allow' | 'disabled',
 ): Promise<Buffer>
 {
+    await parkPointer(page)
+    await settleScrollScrubbedFrame(page)
+    await hideCustomCursorFollowers(page)
+
     return page.screenshot({
         animations,
         fullPage: false,
