@@ -87,8 +87,7 @@ const DOCUMENT_HEIGHT_TOLERANCE_PX = 8
 const VIRTUAL_CANVAS_SCENE_RATIO = 0.45
 const SCROLL_SHELL_HEIGHT_RATIO = 1.35
 const OVERLAP_SEAM_THRESHOLD = 0.012
-const REVEAL_HOLD_SAMPLES = 8
-
+const OVERLAP_SEAM_MIN_VARIANCE = 0.05
 export type CaptureOptions = {
     allowLocalNetwork?: boolean
     browser: Browser
@@ -127,6 +126,21 @@ export async function capturePage(options: CaptureOptions): Promise<CapturedPage
 
     try {
         const page = await context.newPage()
+
+        // tsx／esbuild 的 keepNames 會在送進瀏覽器的函式裡呼叫 __name。
+        // 頁面裡沒有這個 helper 時，逐段擷取會在 evaluate 直接失敗。
+        await page.addInitScript(() => {
+            const host = globalThis as typeof globalThis & {
+                __name?: (target: object, value: string) => object
+            }
+
+            if (typeof host.__name === 'function') return
+
+            host.__name = (target, value) => Object.defineProperty(target, 'name', {
+                configurable: true,
+                value,
+            })
+        })
 
         await page.route('**/*', async route => {
             const requestUrl = route.request().url()
@@ -417,6 +431,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
     }
 
     const hasVirtualCanvas = await markFixedElements(page)
+    const singleScreen = dimensions.height <= dimensions.viewportHeight + DOCUMENT_HEIGHT_TOLERANCE_PX
 
     const segments: OverlayOptions[] = []
     const keptSegments: Buffer[] = []
@@ -509,7 +524,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             }
         }
 
-        if (segment && !hasVirtualCanvas) {
+        if (segment && !hasVirtualCanvas && !singleScreen) {
             segment = await trimRepeatedTailBand(segment, dimensions.width)
         }
 
@@ -599,7 +614,9 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         throw new Error('完整頁面合成後的尺寸與穩定頁面尺寸不一致')
     }
 
-    const trimmed = await trimRepeatedTailBand(fullPage, dimensions.width, { viewportTiles: hasVirtualCanvas })
+    const trimmed = singleScreen
+        ? fullPage
+        : await trimRepeatedTailBand(fullPage, dimensions.width, { viewportTiles: hasVirtualCanvas })
     const trimmedMeta = await sharp(trimmed).metadata()
     const imageHeight = trimmedMeta.height ?? 0
 
@@ -724,7 +741,7 @@ export async function hasRepeatedOverlapSeam(
         ])
 
         if (before.length !== after.length || before.length === 0) continue
-        if (rowSliceVariance(before) < SCENE_TRIM_MIN_VARIANCE) continue
+        if (rowSliceVariance(before) < OVERLAP_SEAM_MIN_VARIANCE) continue
         if (visualDifference(before, after) > OVERLAP_SEAM_THRESHOLD) continue
 
         // 整段 sticky 場景會讓接縫前後都長一樣，而且再往下仍一樣。
@@ -1296,7 +1313,6 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
     let previousLayout = ''
     let stableSamples = 0
     let wipeHoldSamples = 0
-    let revealHoldSamples = 0
     let latest: Buffer | null = null
     let latestHasWipe = false
     let latestHasReveal = false
@@ -1326,12 +1342,9 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
         latestHasWipe = hasWipe
         latestHasReveal = incompleteReveal
         wipeHoldSamples = hasWipe && motionStopped ? wipeHoldSamples + 1 : 0
-        revealHoldSamples = incompleteReveal && motionStopped ? revealHoldSamples + 1 : 0
         const wipeLooksLikeDesign = pageLevelWipe && wipeHoldSamples >= VIEWPORT_WIPE_HOLD_SAMPLES
         const wipeLooksLocked = hasWipe && !pageLevelWipe && motionStopped
             && wipeHoldSamples >= VIEWPORT_LOCKED_WIPE_SAMPLES
-        const revealLooksLocked = incompleteReveal && motionStopped
-            && revealHoldSamples >= REVEAL_HOLD_SAMPLES
 
         stableSamples = motionStopped && (!hasWipe || wipeLooksLikeDesign) && !incompleteReveal
             ? stableSamples + 1
@@ -1339,10 +1352,12 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
         previousSignature = signature
         previousLayout = layout
 
-        if (wipeLooksLocked || revealLooksLocked) {
+        // 揭示沒結束就先交卷，會把縮放或淡入停在半路的畫面存下來。
+        // 等到揭示結束或到達等待上限；只有跟捲動綁死的 wipe 才提早結束。
+        if (wipeLooksLocked) {
             return {
                 hasRevealArtifact: incompleteReveal,
-                hasWipeArtifact: hasWipe && !wipeLooksLikeDesign,
+                hasWipeArtifact: true,
                 image: screenshot,
             }
         }
@@ -1442,9 +1457,9 @@ async function hasFiniteViewportAnimations(page: import('playwright').Page): Pro
 }
 
 /**
- * 視窗裡是否還有沒播完的水平 clip，或兩張大元素正在交叉淡化。
- * 只認 inset 切在元素中段，以及兩塊相近面積、彼此重疊且都不透明也不全隱的層。
+ * 視窗裡是否還有沒播完的水平 clip、交叉淡化、分段淡入，或大元素停在中間縮放。
  * 圓角 polygon 與單一設計用的半透明層不算，避免正常版面被空等。
+ * 三條以上的半透明帶，或蓋住約半個視窗、縮放還在 0.35 到 0.94 的元素，算還沒定影。
  *
  * @param page Playwright 頁面。
  * @returns 仍像揭示或交叉淡化的中間幀時為 true。
@@ -1452,8 +1467,10 @@ async function hasFiniteViewportAnimations(page: import('playwright').Page): Pro
 async function hasIncompleteReveal(page: import('playwright').Page): Promise<boolean>
 {
     return page.evaluate(() => {
-        const minArea = window.innerWidth * window.innerHeight * 0.08
+        const viewportArea = window.innerWidth * window.innerHeight
+        const minArea = viewportArea * 0.08
         const partials: DOMRect[] = []
+        let partialBands = 0
 
         for (const element of document.body.querySelectorAll<HTMLElement>('*')) {
             const style = getComputedStyle(element)
@@ -1472,10 +1489,17 @@ async function hasIncompleteReveal(page: import('playwright').Page): Promise<boo
 
             const area = bounds.width * bounds.height
 
-            if (area < minArea) continue
+            if (scaleLooksLikeMidReveal(style.transform) && area >= minArea) return true
+            if (area < minArea) {
+                if (opacity < 0.92 && opacity > 0.08 && area >= viewportArea * 0.04) partialBands += 1
+
+                continue
+            }
             if (clipLooksLikeMidReveal(style.clipPath, bounds.height)) return true
             if (opacity < 0.9) partials.push(bounds)
         }
+
+        if (partialBands >= 3) return true
 
         for (let leftIndex = 0; leftIndex < partials.length; leftIndex += 1) {
             for (let rightIndex = leftIndex + 1; rightIndex < partials.length; rightIndex += 1) {
@@ -1497,6 +1521,27 @@ async function hasIncompleteReveal(page: import('playwright').Page): Promise<boo
         }
 
         return false
+
+        function scaleLooksLikeMidReveal(transform: string): boolean
+        {
+            const match = transform.match(/matrix\(\s*([^)]+)\)/u)
+
+            if (!match?.[1]) return false
+
+            const parts = match[1].split(',').map(value => Number.parseFloat(value))
+            const a = parts[0]
+            const b = parts[1]
+            const c = parts[2]
+            const d = parts[3]
+
+            if (a === undefined || b === undefined || c === undefined || d === undefined) return false
+
+            const scaleX = Math.hypot(a, b)
+            const scaleY = Math.hypot(c, d)
+            const scale = Math.min(scaleX, scaleY)
+
+            return Math.abs(scaleX - scaleY) < 0.08 && scale > 0.35 && scale < 0.94
+        }
 
         function clipLooksLikeMidReveal(clip: string, elementHeight: number): boolean
         {
