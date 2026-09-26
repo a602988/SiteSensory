@@ -605,13 +605,33 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         let segmentBands = viewportBandsToSegment(mediaBands, sourceTop, segmentHeight)
 
         if (segment && !hasVirtualCanvas && recentTail && await stickyPinCoversViewport(page)) {
-            const repeatsKeptScene = segmentBands.every(band => band.bottom - band.top < 40)
-                && await stickySegmentRepeatsKeptScene(segment, recentTail, dimensions.width)
+            const safeToCollapse = segmentBands.every(band => band.bottom - band.top < 40)
+            const duplicatePrefix = safeToCollapse
+                ? await stickyDuplicatePrefixLength(segment, recentTail, dimensions.width)
+                : 0
 
-            if (repeatsKeptScene) {
+            if (duplicatePrefix >= segmentHeight - 2) {
                 trimmedPixels += Math.max(0, documentEnd - documentCoveredUntil)
                 documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
                 continue
+            }
+
+            if (duplicatePrefix >= 24) {
+                segment = await sharp(segment)
+                    .extract({
+                        height: segmentHeight - duplicatePrefix,
+                        left: 0,
+                        top: duplicatePrefix,
+                        width: dimensions.width,
+                    })
+                    .png()
+                    .toBuffer()
+                trimmedPixels += duplicatePrefix
+                segmentBands = viewportBandsToSegment(
+                    mediaBands,
+                    sourceTop + duplicatePrefix,
+                    segmentHeight - duplicatePrefix,
+                )
             }
         }
 
@@ -3134,24 +3154,25 @@ async function rememberRecentScene(
 }
 
 /**
- * 新區段是不是已經留下的同一幀。空白列，或是對得上既有列的少量文字，
- * 都算同一幀的捲動行程。飽和純色的預留高度不算，那種畫面要留住。
+ * 新區段開頭有多少列是已經留下的同一幀。整段都是近白，或非白列都能在
+ * 最近畫面裡找到，就整段拿掉。否則只拿掉跟前一段尾端逐列對得上的前綴。
+ * 飽和純色的預留高度回 0，那種畫面要留住。
  *
  * @param segment 這次準備接上的區段。
  * @param recent 最近已寫入的畫面。
  * @param width 頁面寬度。
- * @returns 可以當成像素複本拿掉時為 true。
+ * @returns 應從區段頂端拿掉的像素高度。
  */
-export async function stickySegmentRepeatsKeptScene(
+export async function stickyDuplicatePrefixLength(
     segment: Buffer,
     recent: Buffer,
     width: number,
-): Promise<boolean>
+): Promise<number>
 {
     const segmentHeight = (await sharp(segment).metadata()).height ?? 0
     const recentHeight = (await sharp(recent).metadata()).height ?? 0
 
-    if (segmentHeight < 80 || recentHeight < 40) return false
+    if (segmentHeight < 24 || recentHeight < 24) return 0
 
     const sampleWidth = Math.min(64, width)
     const segmentRaw = await sharp(segment)
@@ -3176,7 +3197,7 @@ export async function stickySegmentRepeatsKeptScene(
         recentKeys.add(rowKey(slice))
     }
 
-    if (!recentHasInk) return false
+    if (!recentHasInk) return 0
 
     let inkRows = 0
     let matchedInk = 0
@@ -3199,12 +3220,32 @@ export async function stickySegmentRepeatsKeptScene(
     const mean = lumaTotal / segmentHeight
     const variance = Math.sqrt(Math.max(0, lumaSquares / segmentHeight - mean * mean)) / 255
 
-    if (variance < 0.02) return mean >= 246
+    if (variance < 0.02 && mean < 246) return 0
+    if (variance < 0.02 || inkRows === 0 || matchedInk === inkRows) return segmentHeight
 
-    if (inkRows === 0) return true
-    if (matchedInk !== inkRows) return false
+    let aligned = 0
+    const limit = Math.min(segmentHeight, recentHeight)
 
-    return true
+    for (let length = 1; length <= limit; length += 1) {
+        let same = true
+
+        for (let row = 0; row < length; row += 1) {
+            const nextSlice = segmentRaw.subarray(row * rowBytes, (row + 1) * rowBytes)
+            const previousIndex = (recentHeight - length + row) * rowBytes
+            const previousSlice = recentRaw.subarray(previousIndex, previousIndex + rowBytes)
+
+            if (!rowsLookSame(nextSlice, previousSlice)) {
+                same = false
+                break
+            }
+        }
+
+        if (!same) break
+
+        aligned = length
+    }
+
+    return aligned >= 24 ? aligned : 0
 }
 
 /**
@@ -3250,10 +3291,33 @@ function rowKey(slice: Buffer): string
     let key = ''
 
     for (let index = 0; index < slice.length; index += 1) {
-        key += String.fromCharCode((slice[index] ?? 0) >> 1)
+        key += String.fromCharCode((slice[index] ?? 0) >> 2)
     }
 
     return key
+}
+
+/**
+ * 兩列是否接近到可以當成同一幀。門檻對齊接縫檢查，避免差 1 階就被留下、
+ * 最後又被接縫檢查判成重疊步進。
+ *
+ * @param left 第一列 RGB。
+ * @param right 第二列 RGB。
+ * @returns 平均通道差很小時為 true。
+ */
+function rowsLookSame(left: Buffer, right: Buffer): boolean
+{
+    const length = Math.min(left.length, right.length)
+
+    if (length < 3) return false
+
+    let total = 0
+
+    for (let index = 0; index < length; index += 1) {
+        total += Math.abs((left[index] ?? 0) - (right[index] ?? 0))
+    }
+
+    return total / length <= 4
 }
 
 /**

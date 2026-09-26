@@ -7,7 +7,7 @@ import {
     looksLikeFullColumnWipe,
     looksLikeVerticalWipe,
     rowSliceVariance,
-    stickySegmentRepeatsKeptScene,
+    stickyDuplicatePrefixLength,
     trimDuplicateScenePrefix,
     trimRepeatedTailBand,
 } from '../../apps/capture-worker/src/capture.js'
@@ -599,10 +599,10 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
             await solidPng('#ffffff', 484),
         ])
 
-        await expect(stickySegmentRepeatsKeptScene(repeatedHeading, kept, WIDTH)).resolves.toBe(true)
-        await expect(stickySegmentRepeatsKeptScene(blank, kept, WIDTH)).resolves.toBe(true)
-        await expect(stickySegmentRepeatsKeptScene(blue, kept, WIDTH)).resolves.toBe(false)
-        await expect(stickySegmentRepeatsKeptScene(fresh, kept, WIDTH)).resolves.toBe(false)
+        await expect(stickyDuplicatePrefixLength(repeatedHeading, kept, WIDTH)).resolves.toBe(880)
+        await expect(stickyDuplicatePrefixLength(blank, kept, WIDTH)).resolves.toBe(864)
+        await expect(stickyDuplicatePrefixLength(blue, kept, WIDTH)).resolves.toBe(0)
+        await expect(stickyDuplicatePrefixLength(fresh, kept, WIDTH)).resolves.toBe(200)
     })
 })
 
