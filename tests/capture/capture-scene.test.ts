@@ -7,6 +7,7 @@ import {
     looksLikeFullColumnWipe,
     looksLikeVerticalWipe,
     rowSliceVariance,
+    relateStickySignatures,
     stickyDuplicatePrefixLength,
     trimDuplicateScenePrefix,
     trimRepeatedTailBand,
@@ -599,6 +600,32 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
             await solidPng('#ffffff', 484),
         ])
 
+        expect(relateStickySignatures(null, { images: 0, texts: '' })).toBe('empty')
+        expect(relateStickySignatures(null, { images: 0, texts: 'Beyond UX' })).toBe('keep')
+        expect(relateStickySignatures(
+            { images: 0, texts: 'Beyond UX\nThe AX Creator' },
+            { images: 0, texts: '내일의 설렘' },
+        )).toBe('keep')
+        expect(relateStickySignatures(
+            { images: 0, texts: 'Our Partners' },
+            { images: 0, texts: 'Our Partners\nsubtitle' },
+        )).toBe('replace')
+        expect(relateStickySignatures(
+            { images: 2, texts: 'Our Partners' },
+            { images: 8, texts: 'Our Partners' },
+        )).toBe('replace')
+        expect(relateStickySignatures(
+            { images: 8, texts: 'Our Partners' },
+            { images: 8, texts: 'Our Partners' },
+        )).toBe('drop-same')
+        expect(relateStickySignatures(
+            { images: 0, texts: 'Our Partners\nsubtitle\nLogo Row' },
+            { images: 0, texts: 'Our Partners\nsubtitle' },
+        )).toBe('drop-same')
+        expect(relateStickySignatures(
+            { images: 0, texts: 'Our Projects\nLG CNS' },
+            { images: 0, texts: 'Our Projects\nSecond' },
+        )).toBe('keep')
         await expect(stickyDuplicatePrefixLength(repeatedHeading, kept, WIDTH)).resolves.toBe(880)
         await expect(stickyDuplicatePrefixLength(blank, kept, WIDTH)).resolves.toBe(864)
         await expect(stickyDuplicatePrefixLength(blue, kept, WIDTH)).resolves.toBe(0)

@@ -788,7 +788,42 @@ describe('capture worker', { timeout: 60_000 }, () => {
 
         expect(await samplePixel(fullPage, 50, 50)).toEqual([248, 245, 239])
         expect(await samplePixel(fullPage, 50, 50)).not.toEqual([255, 0, 170])
+        expect(await samplePixel(fullPage, 420, 420)).toEqual([248, 245, 239])
+        expect(await samplePixel(fullPage, 420, 420)).not.toEqual([17, 24, 39])
     })
+
+    it('keeps each readable sticky state instead of stacking them', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?stickyStates=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(height).toBeGreaterThan(1700)
+        expect(height).toBeLessThan(3200)
+        expect(await samplePixel(fullPage, 200, 200)).toEqual([220, 38, 38])
+        expect(await samplePixel(fullPage, 200, 1300)).toEqual([34, 197, 94])
+    }, 120_000)
+
+    it('keeps one settled frame when a sticky block reveals in stages', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?stickyReveal=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(height).toBeGreaterThan(900)
+        expect(height).toBeLessThan(1800)
+        expect(await countPixels(fullPage, [17, 24, 39])).toBeGreaterThan(8_000)
+    }, 120_000)
 })
 
 /**
@@ -886,12 +921,71 @@ paint()
             return
         }
 
-        if (customCursor) {
+        if (parameters.has('stickyStates')) {
             const html = `<!doctype html>
 <html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Sticky States Fixture</title></head>
+<body style="margin:0;background:#ffffff">
+<section style="height:3600px">
+<div style="position:sticky;top:0;height:1080px">
+<div id="alpha" style="position:absolute;inset:0;background:#dc2626;color:#fff;font-size:64px;padding:80px;opacity:1">Alpha State</div>
+<div id="beta" style="position:absolute;inset:0;background:#22c55e;color:#fff;font-size:64px;padding:80px;opacity:0">Beta State</div>
+</div>
+</section>
+<script>
+const alpha = document.querySelector('#alpha')
+const beta = document.querySelector('#beta')
+const paint = () => {
+  const showBeta = window.scrollY >= 1400
+  alpha.style.opacity = showBeta ? '0' : '1'
+  beta.style.opacity = showBeta ? '1' : '0'
+}
+addEventListener('scroll', paint)
+paint()
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (parameters.has('stickyReveal')) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Sticky Reveal Fixture</title></head>
+<body style="margin:0;background:#ffffff;font-family:Arial,sans-serif">
+<section style="height:3240px">
+<div style="position:sticky;top:0;height:1080px;background:#ffffff">
+<h2 style="margin:48px 0 0 80px;font-size:72px">Partners</h2>
+<p id="desc" style="margin:24px 0 0 80px;font-size:32px;opacity:0">Settled copy</p>
+<div id="logos" style="position:absolute;left:80px;top:520px;width:640px;height:80px;background:#111827;color:#fff;font-size:28px;opacity:0">Logo Row</div>
+</div>
+</section>
+<script>
+const desc = document.querySelector('#desc')
+const logos = document.querySelector('#logos')
+const paint = () => {
+  desc.style.opacity = window.scrollY > 500 ? '1' : '0'
+  logos.style.opacity = window.scrollY > 1200 ? '1' : '0'
+}
+addEventListener('scroll', paint)
+paint()
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (customCursor) {
+            const html = `<!doctype html>
+<html lang="zh-Hant" style="cursor:none">
 <head><meta charset="utf-8"><title>Custom Cursor Fixture</title></head>
-<body style="margin:0;background:#f8f5ef">
+<body style="margin:0;background:#f8f5ef;cursor:none">
 <div style="position:fixed;left:40px;top:40px;width:32px;height:32px;border-radius:50%;background:#ff00aa;pointer-events:none;z-index:5"></div>
+<div style="position:fixed;left:360px;top:360px;width:120px;height:120px;border-radius:50%;background:#111827;color:#fff;pointer-events:none;display:grid;place-items:center;z-index:6">View Project</div>
 <section style="height:1800px;background:#f8f5ef"></section>
 </body></html>`
 
@@ -1908,6 +2002,18 @@ function readPngSize(image: Buffer): { height: number, width: number }
  * @param top 垂直座標。
  * @returns 該點的 RGB 值。
  */
+async function countPixels(image: Buffer, color: [number, number, number]): Promise<number>
+{
+    const { data } = await sharp(image).removeAlpha().raw().toBuffer({ resolveWithObject: true })
+    let count = 0
+
+    for (let index = 0; index < data.length; index += 3) {
+        if (data[index] === color[0] && data[index + 1] === color[1] && data[index + 2] === color[2]) count += 1
+    }
+
+    return count
+}
+
 async function samplePixel(image: Buffer, left: number, top: number): Promise<number[]>
 {
     const pixel = await sharp(image)

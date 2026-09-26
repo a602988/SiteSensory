@@ -526,6 +526,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
     let outputHeight = 0
     let previousSignature: Buffer | null = null
     let recentTail: Buffer | null = null
+    let stickyHold: StickySignature | null = null
     let trimmedPixels = 0
     const protectedBands: MediaBand[] = []
 
@@ -579,8 +580,8 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
 
         const documentStart = hasVirtualCanvas ? actualScroll : Math.max(actualScroll, documentCoveredUntil)
         const documentEnd = Math.min(actualScroll + dimensions.viewportHeight, dimensions.height)
-        const sourceTop = hasVirtualCanvas ? 0 : documentStart - actualScroll
-        const segmentHeight = hasVirtualCanvas ? dimensions.viewportHeight : documentEnd - documentStart
+        let sourceTop = hasVirtualCanvas ? 0 : documentStart - actualScroll
+        let segmentHeight = hasVirtualCanvas ? dimensions.viewportHeight : documentEnd - documentStart
 
         if (segmentHeight <= 0) {
             const uncovered = dimensions.height - documentCoveredUntil
@@ -604,8 +605,98 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             .toBuffer()
         let segmentBands = viewportBandsToSegment(mediaBands, sourceTop, segmentHeight)
 
-        if (segment && !hasVirtualCanvas && recentTail && await stickyPinCoversViewport(page)) {
-            const safeToCollapse = segmentBands.every(band => band.bottom - band.top < 40)
+        let preserveStickyFrame = false
+        let pendingSticky: StickySignature | null = null
+
+        if (segment && !hasVirtualCanvas && await stickyPinCoversViewport(page)) {
+            const safeToCollapse = segmentBands.every(band => {
+                const bandHeight = band.bottom - band.top
+
+                return bandHeight < 40 || bandHeight > dimensions.viewportHeight * 0.7
+            })
+
+            if (safeToCollapse) {
+                const signature = await readStickySignature(page)
+                const relation = relateStickySignatures(stickyHold, signature)
+
+                if (relation === 'drop-same') {
+                    const sameText = stickyHold?.texts === signature.texts
+                    const samePixels = !sameText || (recentTail
+                        ? visualDifference(
+                            await createVisualSignature(viewport),
+                            await createVisualSignature(recentTail),
+                        ) <= 0.06
+                        : true)
+
+                    if (samePixels) {
+                        trimmedPixels += Math.max(0, documentEnd - documentCoveredUntil)
+                        documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
+                        continue
+                    }
+                }
+
+                if (relation === 'empty') {
+                    const duplicatePrefix = recentTail
+                        ? await stickyDuplicatePrefixLength(segment, recentTail, dimensions.width)
+                        : 0
+
+                    if (duplicatePrefix >= segmentHeight - 2) {
+                        trimmedPixels += Math.max(0, documentEnd - documentCoveredUntil)
+                        documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
+                        continue
+                    }
+                }
+                else if (relation === 'replace' && stickyHold && keptSegments.length > 0) {
+                    const richer = await captureRicherStickyFrame(page, signature, viewport)
+                    const lastIndex = keptSegments.length - 1
+                    const previousBuffer = keptSegments[lastIndex] ?? richer.image
+                    const previousHeight = (await sharp(previousBuffer).metadata()).height ?? 0
+                    const nextHeight = (await sharp(richer.image).metadata()).height ?? 0
+                    const lastTop = Number(segments[lastIndex]?.top ?? 0)
+
+                    segments[lastIndex] = { input: richer.image, left: 0, top: lastTop }
+                    keptSegments[lastIndex] = richer.image
+                    outputHeight += nextHeight - previousHeight
+
+                    const advance = Math.max(0, documentEnd - documentCoveredUntil)
+
+                    trimmedPixels += Math.max(0, advance - (nextHeight - previousHeight))
+                    documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
+                    stickyHold = richer.signature
+                    recentTail = richer.image
+
+                    for (let bandIndex = protectedBands.length - 1; bandIndex >= 0; bandIndex -= 1) {
+                        if ((protectedBands[bandIndex]?.top ?? 0) >= lastTop) protectedBands.splice(bandIndex, 1)
+                    }
+
+                    continue
+                }
+                else if (relation === 'keep' || relation === 'drop-same') {
+                    const richer = await captureRicherStickyFrame(page, signature, viewport)
+                    const richerHeight = (await sharp(richer.image).metadata()).height ?? segmentHeight
+
+                    segment = richer.image
+                    segmentHeight = richerHeight
+                    sourceTop = 0
+                    segmentBands = viewportBandsToSegment(mediaBands, 0, richerHeight)
+                    preserveStickyFrame = true
+                    pendingSticky = richer.signature
+                }
+            }
+            else {
+                stickyHold = null
+            }
+        }
+        else if (!hasVirtualCanvas) {
+            stickyHold = null
+        }
+
+        if (!preserveStickyFrame && segment && !hasVirtualCanvas && recentTail && await stickyPinCoversViewport(page)) {
+            const safeToCollapse = segmentBands.every(band => {
+                const bandHeight = band.bottom - band.top
+
+                return bandHeight < 40 || bandHeight > dimensions.viewportHeight * 0.7
+            })
             const duplicatePrefix = safeToCollapse
                 ? await stickyDuplicatePrefixLength(segment, recentTail, dimensions.width)
                 : 0
@@ -735,6 +826,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
 
         segments.push({ input: segment, left: 0, top: outputHeight })
         keptSegments.push(segment)
+        stickyHold = pendingSticky ?? (hasVirtualCanvas ? stickyHold : null)
 
         if (!hasVirtualCanvas) {
             recentTail = await rememberRecentScene(recentTail, segment, dimensions.width, dimensions.viewportHeight)
@@ -1287,8 +1379,19 @@ async function markFixedElements(page: import('playwright').Page): Promise<boole
 }
 
 /**
- * 藏起跟著指標走的小圓點。只認固定定位、不接收指標、接近圓形、
- * 而且幾乎沒有文字的小元素，避免把按鈕或返回頂端圓鈕一起藏掉。
+ * 把指標移出視窗，避免停在連結上時把「View Project」這類跟隨游標畫進截圖。
+ *
+ * @param page Playwright 頁面。
+ * @returns 移動完成後結束。
+ */
+async function parkPointer(page: import('playwright').Page): Promise<void>
+{
+    await page.mouse.move(-80, -80).catch(() => undefined)
+}
+
+/**
+ * 藏起跟著指標走的圓形游標。包含小圓點，以及寫著短標籤的較大圓泡。
+ * 按鈕、連結與返回頂端不藏。
  *
  * @param page Playwright 頁面。
  * @returns 標記完成後結束。
@@ -1300,27 +1403,36 @@ async function hideCustomCursorFollowers(page: import('playwright').Page): Promi
             element.removeAttribute(attribute)
         }
 
+        const rootCursor = getComputedStyle(document.documentElement).cursor
+        const bodyCursor = getComputedStyle(document.body).cursor
+        const systemCursorHidden = rootCursor === 'none' || bodyCursor === 'none'
+
         for (const element of document.body.querySelectorAll<HTMLElement>('*')) {
             const style = getComputedStyle(element)
 
-            if (style.position !== 'fixed' || style.pointerEvents !== 'none') continue
+            if (style.position !== 'fixed') continue
             if (style.visibility === 'hidden' || Number(style.opacity) === 0) continue
 
             const bounds = element.getBoundingClientRect()
             const size = Math.max(bounds.width, bounds.height)
 
-            if (bounds.width < 4 || bounds.height < 4 || size > 48) continue
+            if (bounds.width < 4 || bounds.height < 4 || size > 200) continue
+            if (bounds.bottom < 0 || bounds.right < 0) continue
             if (element.closest('a, button, input, textarea, select, [role="button"]')) continue
 
-            const text = element.textContent?.replace(/\s+/g, '').trim() ?? ''
+            const text = element.textContent?.replace(/\s+/g, ' ').trim() ?? ''
 
-            if (text.length > 1) continue
+            if (text.length > 24) continue
 
             const radius = Number.parseFloat(style.borderTopLeftRadius)
             const round = style.borderRadius.includes('%')
                 || (Number.isFinite(radius) && radius >= Math.min(bounds.width, bounds.height) * 0.4)
 
             if (!round) continue
+
+            const decorative = style.pointerEvents === 'none' || style.mixBlendMode === 'difference'
+
+            if (!decorative && !systemCursorHidden) continue
 
             element.setAttribute(attribute, '')
         }
@@ -1404,14 +1516,18 @@ async function freezeExpandingBoxes(page: import('playwright').Page): Promise<vo
 
     if (!candidate) return
 
+    await page.evaluate(id => {
+        document.querySelector(`[data-sitesensory-freeze-for="${id}"]`)?.remove()
+    }, candidate)
+
     let saved: FrozenBox | null = null
     let stable = 0
 
-    for (let step = 1; step <= 5; step += 1) {
-        const landed = await scrollPageToAndHold(page, original + step * 160)
+    for (let step = 1; step <= 14; step += 1) {
+        const landed = await scrollPageToAndHold(page, original + step * 180)
         const box = await readFrozenBox(page, candidate)
 
-        if (!box || Math.abs(landed - (original + step * 160)) > DOCUMENT_HEIGHT_TOLERANCE_PX * 4) break
+        if (!box || Math.abs(landed - (original + step * 180)) > DOCUMENT_HEIGHT_TOLERANCE_PX * 4) break
 
         const grew = saved === null
             || box.width > saved.width + 4
@@ -1439,6 +1555,7 @@ async function freezeExpandingBoxes(page: import('playwright').Page): Promise<vo
 
         const style = document.createElement('style')
 
+        style.setAttribute('data-sitesensory-freeze-for', id)
         style.textContent = `[data-sitesensory-box-id="${id}"]{width:${box.width}px !important;height:${box.height}px !important;top:${box.top}px !important;left:${box.left}px !important;border-radius:${box.radius}px !important;}`
         document.head.appendChild(style)
     }, { box: finalBox, id: candidate })
@@ -1603,6 +1720,15 @@ async function settleScrollScrubbedFrame(page: import('playwright').Page): Promi
                 || winner.midScale
 
             if (cluster.length < 2) {
+                if (seed.opacity < 0.5) {
+                    const text = seed.element.textContent?.replace(/\s+/g, ' ').trim() ?? ''
+
+                    if (shouldForceHiddenText(seed)) seed.element.setAttribute(options.settled, '')
+                    else if (text.length >= 2) seed.element.setAttribute(options.suppressed, '')
+
+                    continue
+                }
+
                 if (winnerNeedsSettle) seed.element.setAttribute(options.settled, '')
 
                 continue
@@ -1696,6 +1822,46 @@ async function settleScrollScrubbedFrame(page: import('playwright').Page): Promi
             const smaller = Math.min(left.width * left.height, right.width * right.height)
 
             return smaller > 0 ? (width * height) / smaller : 0
+        }
+
+        function shouldForceHiddenText(target: ScrubTarget): boolean
+        {
+            const text = target.element.textContent?.replace(/\s+/g, ' ').trim() ?? ''
+
+            if (text.length < 2) return false
+
+            let pin: HTMLElement | null = target.element
+
+            while (pin && getComputedStyle(pin).position !== 'sticky') pin = pin.parentElement
+
+            const scope = pin ?? target.element
+            const peers = fades.filter(other => {
+                if (other.element === target.element) return false
+                if (!scope.contains(other.element)) return false
+
+                const otherText = other.element.textContent?.replace(/\s+/g, ' ').trim() ?? ''
+
+                return otherText.length >= 2
+            })
+
+            if (peers.some(other => other.opacity > target.opacity + 0.04)) return false
+
+            const tied = peers.filter(other => Math.abs(other.opacity - target.opacity) <= 0.04)
+
+            if (tied.length > 0 && target.opacity < 0.5) {
+                const ordered = [target, ...tied].sort((left, right) => {
+                    const position = left.element.compareDocumentPosition(right.element)
+
+                    if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1
+                    if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1
+
+                    return 0
+                })
+
+                return ordered[0] === target && target.opacity >= 0.08
+            }
+
+            return true
         }
     }, {
         settled: SETTLED_REVEAL_ATTRIBUTE,
@@ -3183,6 +3349,194 @@ async function rememberRecentScene(
  * @param width 頁面寬度。
  * @returns 應從區段頂端拿掉的像素高度。
  */
+/**
+ * 蓋滿視窗的 sticky 裡，目前真正看得見的文字與小圖。
+ * 交叉淡化裡被壓到透明的那一層不算，避免兩個狀態疊在同一幀。
+ */
+export type StickySignature = {
+    images: number
+    texts: string
+}
+
+/**
+ * 判斷這一幀的 sticky 內容跟上一幀保留的狀態是什麼關係。
+ * 文字被換掉是新狀態；同一段文字又多了字或圖是同一塊的後續揭示。
+ *
+ * @param previous 上一張留下的簽名；還沒有時為 null。
+ * @param next 目前視窗的簽名。
+ * @returns empty 沒有可讀內容，drop-same 同一狀態，replace 同一塊更完整，keep 另一個狀態。
+ */
+export function relateStickySignatures(
+    previous: StickySignature | null,
+    next: StickySignature,
+): 'drop-same' | 'empty' | 'keep' | 'replace'
+{
+    if (next.texts === '' && next.images === 0) return 'empty'
+    if (!previous || (previous.texts === '' && previous.images === 0)) return 'keep'
+    if (next.texts === previous.texts && next.images <= previous.images) return 'drop-same'
+
+    const previousLines = previous.texts.split('\n').filter(line => line !== '')
+    const nextLines = next.texts.split('\n').filter(line => line !== '')
+    const nextLineSet = new Set(nextLines)
+    const previousLineSet = new Set(previousLines)
+    const previousContained = previousLines.every(line => nextLineSet.has(line))
+    const nextContained = nextLines.every(line => previousLineSet.has(line))
+
+    if (nextContained && next.images <= previous.images && (nextContained !== previousContained || next.texts === previous.texts)) {
+        return 'drop-same'
+    }
+
+    if (previousContained && (next.texts.length > previous.texts.length || next.images > previous.images)) return 'replace'
+
+    return 'keep'
+}
+
+/**
+ * 讀取蓋住視窗的 sticky 裡，透明度夠高的文字與沒有鋪滿視窗的圖片數。
+ *
+ * @param page Playwright 頁面。
+ * @returns 排序後的文字，以及可見圖片張數。
+ */
+async function readStickySignature(page: import('playwright').Page): Promise<StickySignature>
+{
+    return page.evaluate(() => {
+        const pin = coveringSticky()
+
+        if (!pin) return { images: 0, texts: '' }
+
+        const texts = new Set<string>()
+        const walker = document.createTreeWalker(pin, NodeFilter.SHOW_TEXT)
+        let node = walker.nextNode()
+
+        while (node) {
+            const parent = node.parentElement
+
+            if (parent && readableText(parent)) {
+                const value = node.textContent?.replace(/\s+/g, ' ').trim() ?? ''
+
+                if (value.length >= 2) texts.add(value)
+            }
+
+            node = walker.nextNode()
+        }
+
+        let images = 0
+
+        for (const element of pin.querySelectorAll<HTMLElement>('img, video, canvas')) {
+            const style = getComputedStyle(element)
+
+            if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) < 0.72) continue
+
+            const bounds = element.getBoundingClientRect()
+            const area = bounds.width * bounds.height
+
+            if (bounds.width < 10 || bounds.height < 10) continue
+            if (bounds.bottom <= 0 || bounds.top >= window.innerHeight) continue
+            if (area < 200 || area > window.innerWidth * window.innerHeight * 0.7) continue
+
+            images += 1
+        }
+
+        return { images, texts: [...texts].sort().join('\n') }
+
+        function coveringSticky(): HTMLElement | null
+        {
+            for (const element of document.body.querySelectorAll<HTMLElement>('*')) {
+                const style = getComputedStyle(element)
+
+                if (style.position !== 'sticky') continue
+                if (style.visibility === 'hidden' || Number(style.opacity) < 0.2) continue
+
+                const bounds = element.getBoundingClientRect()
+
+                if (bounds.width < window.innerWidth * 0.85 || bounds.height < window.innerHeight * 0.85) continue
+                if (bounds.top > window.innerHeight * 0.45) continue
+                if (bounds.bottom < window.innerHeight * 0.7) continue
+
+                return element
+            }
+
+            return null
+        }
+
+        function readableText(element: HTMLElement): boolean
+        {
+            const style = getComputedStyle(element)
+
+            if (style.display === 'none' || style.visibility === 'hidden') return false
+            if (Number(style.opacity) < 0.8) return false
+
+            const blur = style.filter.match(/blur\(\s*([0-9.]+)px\s*\)/iu)
+            const amount = blur?.[1] ? Number.parseFloat(blur[1]) : 0
+
+            if (amount > 1.2) return false
+
+            const bounds = element.getBoundingClientRect()
+
+            return bounds.bottom > 4 && bounds.top < window.innerHeight - 4 && bounds.width > 2 && bounds.height > 2
+        }
+    })
+}
+
+/**
+ * 從目前簽名往後看，停在同一塊內容最完整的那一幀。
+ * 文字被換成另一句就停，避免把下一個專案或下一張卡吃進這一幀。
+ *
+ * @param page 停在擷取位置的頁面。
+ * @param signature 這一幀已經看得見的簽名。
+ * @param current 目前視窗截圖。
+ * @returns 更完整的視窗，以及那一幀的簽名。
+ */
+async function captureRicherStickyFrame(
+    page: import('playwright').Page,
+    signature: StickySignature,
+    current: Buffer,
+): Promise<{ image: Buffer, signature: StickySignature }>
+{
+    const origin = await readDocumentScroll(page)
+    let bestImage = current
+    let bestSignature = signature
+    let bestScore = stickySignatureScore(signature)
+
+    for (let step = 1; step <= 10; step += 1) {
+        const requested = origin + step * 220
+        const landed = await scrollPageToAndHold(page, requested)
+
+        if (landed < requested - 48) break
+        if (!await stickyPinCoversViewport(page)) break
+
+        await settleScrollScrubbedFrame(page)
+
+        const next = await readStickySignature(page)
+        const relation = relateStickySignatures(bestSignature, next)
+
+        if (relation === 'keep') break
+
+        const score = stickySignatureScore(next)
+
+        if (score > bestScore) {
+            bestScore = score
+            bestSignature = next
+            bestImage = await screenshotViewport(page, 'allow')
+        }
+    }
+
+    await scrollPageToAndHold(page, origin)
+
+    return { image: bestImage, signature: bestSignature }
+}
+
+/**
+ * 文字愈長、可見小圖愈多，這塊揭示就愈完整。
+ *
+ * @param signature sticky 簽名。
+ * @returns 用來比較前後幀的分數。
+ */
+function stickySignatureScore(signature: StickySignature): number
+{
+    return signature.texts.length + signature.images * 12
+}
+
 export async function stickyDuplicatePrefixLength(
     segment: Buffer,
     recent: Buffer,
@@ -3329,7 +3683,22 @@ export async function stickyBlankEdges(
  */
 function isNearWhiteRow(slice: Buffer): boolean
 {
-    return rowLuma(slice) >= 246
+    if (slice.length < 3) return true
+    if (rowLuma(slice) < 246) return false
+
+    let dark = 0
+    let count = 0
+
+    for (let index = 0; index < slice.length; index += 3) {
+        const luma = (slice[index] ?? 0) * 0.3
+            + (slice[index + 1] ?? 0) * 0.59
+            + (slice[index + 2] ?? 0) * 0.11
+
+        count += 1
+        if (luma < 236) dark += 1
+    }
+
+    return count === 0 || dark / count < 0.015
 }
 
 /**
@@ -5083,6 +5452,7 @@ async function screenshotViewport(
     animations: 'allow' | 'disabled',
 ): Promise<Buffer>
 {
+    await parkPointer(page)
     await hideCustomCursorFollowers(page)
     await settleScrollScrubbedFrame(page)
 
