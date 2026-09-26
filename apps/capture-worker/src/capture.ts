@@ -747,7 +747,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             }
         }
 
-        if (!hasVirtualCanvas && !preserveStickyFrame) {
+        if (!hasVirtualCanvas) {
             const previous = keptSegments.at(-1)
 
             if (previous) {
