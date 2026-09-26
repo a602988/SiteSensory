@@ -609,8 +609,8 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         let pendingSticky: StickySignature | null = null
 
         if (segment && !hasVirtualCanvas && await stickyPinCoversViewport(page)) {
-            const safeToCollapse = segmentBands.every(band => {
-                const bandHeight = band.bottom - band.top
+            const safeToCollapse = mediaBands.every(band => {
+                const bandHeight = band.span ?? (band.bottom - band.top)
 
                 return bandHeight < 40 || bandHeight > dimensions.viewportHeight * 0.7
             })
@@ -692,8 +692,8 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         }
 
         if (!preserveStickyFrame && segment && !hasVirtualCanvas && recentTail && await stickyPinCoversViewport(page)) {
-            const safeToCollapse = segmentBands.every(band => {
-                const bandHeight = band.bottom - band.top
+            const safeToCollapse = mediaBands.every(band => {
+                const bandHeight = band.span ?? (band.bottom - band.top)
 
                 return bandHeight < 40 || bandHeight > dimensions.viewportHeight * 0.7
             })
@@ -747,7 +747,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             }
         }
 
-        if (!hasVirtualCanvas) {
+        if (!hasVirtualCanvas && !preserveStickyFrame) {
             const previous = keptSegments.at(-1)
 
             if (previous) {
@@ -767,7 +767,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             }
         }
 
-        if (segment && !hasVirtualCanvas && !singleScreen) {
+        if (segment && !hasVirtualCanvas && !singleScreen && !preserveStickyFrame) {
             segment = await trimRepeatedTailBand(segment, dimensions.width, {
                 identicalRows: true,
                 protectedBands: segmentBands,
@@ -3197,6 +3197,7 @@ function bandHasWipe(upperSlice: Buffer, lowerSlice: Buffer, width: number): boo
 
 type MediaBand = {
     bottom: number
+    span?: number
     top: number
 }
 
@@ -3245,7 +3246,7 @@ async function readUncroppedMediaBands(page: import('playwright').Page): Promise
 
             if (bottom - top < 80) return
 
-            bands.push({ bottom, top })
+            bands.push({ bottom, span: bounds.height, top })
         }
 
         for (const node of document.querySelectorAll('img, video, canvas, picture')) consider(node)
