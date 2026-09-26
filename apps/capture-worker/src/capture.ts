@@ -633,6 +633,27 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
                     segmentHeight - duplicatePrefix,
                 )
             }
+
+            if (segment && safeToCollapse) {
+                const edges = await stickyBlankEdges(segment, dimensions.width)
+                const heightNow = (await sharp(segment).metadata()).height ?? 0
+                const lead = edges.lead >= 200 && edges.lead < heightNow ? edges.lead : 0
+                const tail = edges.tail >= 200 && lead + edges.tail < heightNow ? edges.tail : 0
+
+                if (lead + tail >= 200 && edges.ink > 0) {
+                    segment = await sharp(segment)
+                        .extract({
+                            height: heightNow - lead - tail,
+                            left: 0,
+                            top: lead,
+                            width: dimensions.width,
+                        })
+                        .png()
+                        .toBuffer()
+                    trimmedPixels += lead + tail
+                    segmentBands = viewportBandsToSegment(mediaBands, sourceTop + duplicatePrefix + lead, heightNow - lead - tail)
+                }
+            }
         }
 
         if (!hasVirtualCanvas) {
@@ -3246,6 +3267,59 @@ export async function stickyDuplicatePrefixLength(
     }
 
     return aligned >= 24 ? aligned : 0
+}
+
+/**
+ * 量一段裡頭尾連續近白，以及中間還有沒有文字或圖片。
+ * 蓋滿視窗的 sticky 常把標題夾在大片空白行程裡，那兩截不該留下。
+ *
+ * @param segment 區段 PNG。
+ * @param width 頁面寬度。
+ * @returns 頭尾近白列數，以及非白列數。
+ */
+export async function stickyBlankEdges(
+    segment: Buffer,
+    width: number,
+): Promise<{ ink: number, lead: number, tail: number }>
+{
+    const height = (await sharp(segment).metadata()).height ?? 0
+
+    if (height < 40) return { ink: 0, lead: 0, tail: 0 }
+
+    const sampleWidth = Math.min(64, width)
+    const raw = await sharp(segment)
+        .resize(sampleWidth, height, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+    const rowBytes = sampleWidth * 3
+    let lead = 0
+    let tail = 0
+    let ink = 0
+
+    for (let row = 0; row < height; row += 1) {
+        const slice = raw.subarray(row * rowBytes, (row + 1) * rowBytes)
+
+        if (!isNearWhiteRow(slice)) break
+
+        lead += 1
+    }
+
+    for (let row = height - 1; row >= lead; row -= 1) {
+        const slice = raw.subarray(row * rowBytes, (row + 1) * rowBytes)
+
+        if (!isNearWhiteRow(slice)) break
+
+        tail += 1
+    }
+
+    for (let row = lead; row < height - tail; row += 1) {
+        const slice = raw.subarray(row * rowBytes, (row + 1) * rowBytes)
+
+        if (!isNearWhiteRow(slice)) ink += 1
+    }
+
+    return { ink, lead, tail }
 }
 
 /**
