@@ -747,6 +747,28 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             }
         }
 
+        if (preserveStickyFrame && segment) {
+            const advance = Math.max(0, documentEnd - documentCoveredUntil)
+            const frameHeight = (await sharp(segment).metadata()).height ?? 0
+            const overlap = frameHeight - advance
+
+            // 整幀比這次文件行程高出的那一截，是和前一幀重疊的步進。
+            // 留著會被接縫檢查當成重複帶。字與數字在畫面中段，拿掉頂端重疊仍讀得到。
+            if (overlap > 8 && advance >= 24) {
+                segment = await sharp(segment)
+                    .extract({
+                        height: advance,
+                        left: 0,
+                        top: overlap,
+                        width: dimensions.width,
+                    })
+                    .png()
+                    .toBuffer()
+                segmentHeight = advance
+                segmentBands = viewportBandsToSegment(mediaBands, overlap, advance)
+            }
+        }
+
         if (!hasVirtualCanvas) {
             const previous = keptSegments.at(-1)
 
