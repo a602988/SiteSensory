@@ -1346,8 +1346,8 @@ async function stickyPinCoversViewport(page: import('playwright').Page): Promise
             const bounds = element.getBoundingClientRect()
 
             if (bounds.width < window.innerWidth * 0.85 || bounds.height < window.innerHeight * 0.85) continue
-            if (bounds.top > window.innerHeight * 0.15) continue
-            if (bounds.bottom < window.innerHeight * 0.85) continue
+            if (bounds.top > window.innerHeight * 0.45) continue
+            if (bounds.bottom < window.innerHeight * 0.7) continue
 
             return true
         }
