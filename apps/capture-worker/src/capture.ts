@@ -29,7 +29,7 @@ const STICKY_CHROME_MIN_WIDTH_RATIO = 0.5
 const STICKY_CHROME_TOP_MAX_PX = 80
 const STICKY_SIDE_MAX_WIDTH_RATIO = 0.4
 const STICKY_SIDE_MIN_HEIGHT_RATIO = 0.2
-const STICKY_PIN_LABEL_MAX_WIDTH_RATIO = 0.45
+const STICKY_PIN_LABEL_MAX_WIDTH_RATIO = 0.4
 const STICKY_PIN_LABEL_MAX_HEIGHT_RATIO = 0.55
 const STICKY_PIN_LABEL_SIDE_RATIO = 0.22
 const STICKY_CHROME_SIDE_MAX_PX = 80
@@ -529,8 +529,11 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
     let stickyHold: StickySignature | null = null
     let trimmedPixels = 0
     const protectedBands: MediaBand[] = []
+    const emittedFadeSections = new Set<number>()
 
     for (const target of capturePositions) {
+        if (target + dimensions.viewportHeight <= documentCoveredUntil + DOCUMENT_HEIGHT_TOLERANCE_PX) continue
+
         await page.evaluate(({ hideFixedAttribute, scrollTop }) => {
             document.documentElement.toggleAttribute(hideFixedAttribute, scrollTop > 0)
         }, { hideFixedAttribute: HIDE_FIXED_ATTRIBUTE, scrollTop: target })
@@ -594,6 +597,79 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         }
 
         const viewport = settled.image
+
+        if (!hasVirtualCanvas && !singleScreen) {
+            const stacked = await readStackedFadeSection(page)
+
+            if (
+                stacked
+                && !emittedFadeSections.has(stacked.start)
+                && documentCoveredUntil <= stacked.start + DOCUMENT_HEIGHT_TOLERANCE_PX
+                && actualScroll < stacked.end
+            ) {
+                const gap = stacked.start - documentCoveredUntil
+                const gapSourceTop = documentCoveredUntil - actualScroll
+                const gapFits = gap <= 8 || (gapSourceTop >= 0 && gapSourceTop + gap <= dimensions.viewportHeight)
+
+                if (gapFits) {
+                    const frames = await captureStackedFadeFrames(page, stacked, dimensions.viewportHeight)
+
+                    if (frames.length < stacked.count) {
+                        emittedFadeSections.add(stacked.start)
+                        await scrollPageToAndHold(page, actualScroll)
+                    }
+                    else {
+                        if (gap > 8 && viewport) {
+                            const gapImage = await sharp(viewport)
+                                .extract({
+                                    height: gap,
+                                    left: 0,
+                                    top: gapSourceTop,
+                                    width: dimensions.width,
+                                })
+                                .png()
+                                .toBuffer()
+
+                            segments.push({ input: gapImage, left: 0, top: outputHeight })
+                            keptSegments.push(gapImage)
+                            outputHeight += gap
+                            recentTail = gapImage
+                        }
+
+                        const span = stacked.end - stacked.start
+                        const overflow = Math.max(0, frames.length * dimensions.viewportHeight - span)
+                        const crop = Math.min(160, overflow > 8 ? Math.ceil(overflow / frames.length) : 0)
+                        const frameHeight = dimensions.viewportHeight - crop
+
+                        for (const frame of frames) {
+                            const image = crop > 0
+                                ? await sharp(frame)
+                                    .extract({
+                                        height: frameHeight,
+                                        left: 0,
+                                        top: crop,
+                                        width: dimensions.width,
+                                    })
+                                    .png()
+                                    .toBuffer()
+                                : frame
+
+                            segments.push({ input: image, left: 0, top: outputHeight })
+                            keptSegments.push(image)
+                            outputHeight += frameHeight
+                            recentTail = image
+                        }
+
+                        trimmedPixels += Math.max(0, span - frames.length * frameHeight)
+                        documentCoveredUntil = stacked.end
+                        emittedFadeSections.add(stacked.start)
+                        stickyHold = null
+                        continue
+                    }
+                }
+            }
+        }
+
         const mediaBands = hasVirtualCanvas ? [] : await readUncroppedMediaBands(page)
         let segment: Buffer | null = await sharp(viewport)
             .extract({
@@ -756,7 +832,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
                 segment = await trimDuplicateScenePrefix(previous, segment, dimensions.width, {
                     bandOrigin: sourceTop,
                     identicalRows: true,
-                    protectedBands: mediaBands,
+                    protectedBands: preserveStickyFrame ? [] : mediaBands,
                 })
 
                 const afterPrefix = segment
@@ -1433,9 +1509,11 @@ async function hideCustomCursorFollowers(page: import('playwright').Page): Promi
 
             if (bounds.width < 4 || bounds.height < 4 || size > 200) continue
             if (bounds.bottom < 0 || bounds.right < 0) continue
-            if (element.closest('a, button, input, textarea, select, [role="button"]')) continue
-
             const text = element.textContent?.replace(/\s+/g, ' ').trim() ?? ''
+            const followsPointer = style.pointerEvents === 'none'
+            const insideControl = element.closest('a, button, input, textarea, select, [role="button"]')
+
+            if (insideControl && !followsPointer) continue
 
             if (text.length > 24) continue
 
@@ -1742,6 +1820,14 @@ async function settleScrollScrubbedFrame(page: import('playwright').Page): Promi
                 for (const other of fades) {
                     if (visited.has(other.element)) continue
                     if (overlapRatio(current.bounds, other.bounds) <= 0.55) continue
+
+                    const largerCoverage = Math.min(
+                        coverageOf(current.bounds, other.bounds),
+                        coverageOf(other.bounds, current.bounds),
+                    )
+
+                    // 小標籤只蓋住大標題的一角時，不是同一組交叉淡化。
+                    if (largerCoverage <= 0.3) continue
 
                     visited.add(other.element)
                     queue.push(other)
@@ -3538,6 +3624,206 @@ async function readStickySignature(page: import('playwright').Page): Promise<Sti
             return true
         }
     })
+}
+
+type StackedFadeSection = {
+    count: number
+    end: number
+    start: number
+}
+
+/**
+ * 視窗裡互相重疊、用行內透明度輪流出現的大層。
+ * 區段要夠高，才把每一層清楚的那一幀留成獨立畫面；矮區段裡的是輪播，不走這條。
+ *
+ * @param page 已停在擷取位置的頁面。
+ * @returns 區段文件範圍與層數；不是這種堆疊時為 null。
+ */
+async function readStackedFadeSection(page: import('playwright').Page): Promise<StackedFadeSection | null>
+{
+    return page.evaluate(() => {
+        const viewportArea = window.innerHeight * window.innerWidth
+        const layers = [...document.body.querySelectorAll<HTMLElement>('*')].filter(element => {
+            if (element.style.opacity === '') return false
+
+            let pin: HTMLElement | null = element.parentElement
+
+            while (pin && pin !== document.body && getComputedStyle(pin).position !== 'sticky') pin = pin.parentElement
+
+            if (!pin || pin === document.body) return false
+
+            const bounds = element.getBoundingClientRect()
+
+            if (bounds.height < window.innerHeight * 0.45 || bounds.width < window.innerWidth * 0.35) return false
+            if (bounds.bottom < window.innerHeight * 0.2 || bounds.top > window.innerHeight * 0.85) return false
+            if (bounds.width * bounds.height < viewportArea * 0.2) return false
+
+            return true
+        })
+
+        const group: HTMLElement[] = []
+
+        for (const element of layers) {
+            const bounds = element.getBoundingClientRect()
+            const overlaps = group.length === 0 || group.some(other => {
+                const otherBounds = other.getBoundingClientRect()
+                const width = Math.min(bounds.right, otherBounds.right) - Math.max(bounds.left, otherBounds.left)
+                const height = Math.min(bounds.bottom, otherBounds.bottom) - Math.max(bounds.top, otherBounds.top)
+
+                if (width <= 0 || height <= 0) return false
+
+                const smaller = Math.min(bounds.width * bounds.height, otherBounds.width * otherBounds.height)
+
+                return smaller > 0 && (width * height) / smaller > 0.6
+            })
+
+            if (overlaps) group.push(element)
+        }
+
+        const pinOf = (element: HTMLElement): HTMLElement | null => {
+            let pin: HTMLElement | null = element.parentElement
+
+            while (pin && pin !== document.body && getComputedStyle(pin).position !== 'sticky') pin = pin.parentElement
+
+            return pin && pin !== document.body ? pin : null
+        }
+        const pin = pinOf(group[0] ?? document.body)
+        const samePin = pin ? group.filter(element => pinOf(element) === pin) : []
+        const leaves = samePin.filter(element => !samePin.some(other => other !== element && element.contains(other)))
+
+        if (leaves.length < 2) return null
+
+        let section: HTMLElement | null = leaves[0]?.parentElement ?? null
+
+        while (section && section !== document.body) {
+            if (section.offsetHeight >= leaves.length * window.innerHeight * 0.7) break
+
+            section = section.parentElement
+        }
+
+        if (!section || section === document.body) return null
+        if (section.offsetHeight < leaves.length * window.innerHeight * 0.7) return null
+
+        leaves.forEach((element, index) => {
+            element.setAttribute('data-sitesensory-fade-layer', String(index))
+        })
+
+        const start = section.getBoundingClientRect().top + window.scrollY
+
+        return {
+            count: leaves.length,
+            end: Math.round(start + section.offsetHeight),
+            start: Math.round(start),
+        }
+    })
+}
+
+type FadeLayerSample = {
+    opacity: number
+    readable: boolean
+}
+
+/**
+ * 讀取已經標好的堆疊層，這一捲動位置各層清不清楚。
+ *
+ * @param page Playwright 頁面。
+ * @returns 與標記順序相同的透明度與可讀狀態。
+ */
+async function readFadeLayerSamples(page: import('playwright').Page): Promise<FadeLayerSample[]>
+{
+    return page.evaluate(() => {
+        for (const node of document.querySelectorAll('[data-sitesensory-settled], [data-sitesensory-suppress-swap]')) {
+            node.removeAttribute('data-sitesensory-settled')
+            node.removeAttribute('data-sitesensory-suppress-swap')
+        }
+
+        const layers = [...document.querySelectorAll<HTMLElement>('[data-sitesensory-fade-layer]')]
+            .sort((left, right) => Number(left.getAttribute('data-sitesensory-fade-layer'))
+                - Number(right.getAttribute('data-sitesensory-fade-layer')))
+
+        return layers.map(element => {
+            let readable = true
+            let current: HTMLElement | null = element
+
+            while (current && current !== document.body) {
+                const style = getComputedStyle(current)
+
+                if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) < 0.8) readable = false
+
+                const blur = style.filter.match(/blur\(\s*([0-9.]+)px\s*\)/iu)
+
+                if (blur?.[1] && Number.parseFloat(blur[1]) > 1.2) readable = false
+
+                current = current.parentElement
+            }
+
+            const heading = element.querySelector('h1, h2, h3')
+
+            if (heading) {
+                const filter = getComputedStyle(heading).filter
+                const blur = filter.match(/blur\(\s*([0-9.]+)px\s*\)/iu)
+
+                if (blur?.[1] && Number.parseFloat(blur[1]) > 1.2) readable = false
+            }
+
+            return {
+                opacity: Number(getComputedStyle(element).opacity),
+                readable,
+            }
+        })
+    })
+}
+
+/**
+ * 在堆疊區段裡，為每一層找透明度夠高、字也清楚的捲動位置，各截一幀。
+ *
+ * @param page 目前頁面。
+ * @param section 堆疊區段的文件範圍。
+ * @param viewportHeight 視窗高度。
+ * @returns 依出現順序排列的視窗截圖。層數對不齊時可能少於區段層數。
+ */
+async function captureStackedFadeFrames(
+    page: import('playwright').Page,
+    section: StackedFadeSection,
+    viewportHeight: number,
+): Promise<Buffer[]>
+{
+    const step = 160
+    const chosen: Array<{ opacity: number, scroll: number } | null> = Array.from({ length: section.count }, () => null)
+    const last = Math.max(section.start, section.end - viewportHeight)
+
+    for (let scroll = section.start; scroll <= last; scroll += step) {
+        const landed = await scrollPageToAndHold(page, scroll)
+
+        if (landed < scroll - 48) break
+
+        const samples = await readFadeLayerSamples(page)
+
+        samples.forEach((sample, index) => {
+            if (!sample.readable || sample.opacity < 0.85) return
+
+            const othersDim = samples.every((other, otherIndex) => otherIndex === index || other.opacity <= 0.25)
+            const current = chosen[index]
+
+            if (!othersDim) return
+            if (current && current.opacity >= sample.opacity) return
+
+            chosen[index] = { opacity: sample.opacity, scroll: landed }
+        })
+    }
+
+    const picks = chosen.flatMap(pick => pick ? [pick] : [])
+
+    picks.sort((left, right) => left.scroll - right.scroll)
+
+    const frames: Buffer[] = []
+
+    for (const pick of picks) {
+        await scrollPageToAndHold(page, pick.scroll)
+        frames.push(await screenshotViewport(page, 'allow'))
+    }
+
+    return frames
 }
 
 /**
@@ -5601,8 +5887,8 @@ async function screenshotViewport(
 ): Promise<Buffer>
 {
     await parkPointer(page)
-    await hideCustomCursorFollowers(page)
     await settleScrollScrubbedFrame(page)
+    await hideCustomCursorFollowers(page)
 
     return page.screenshot({
         animations,

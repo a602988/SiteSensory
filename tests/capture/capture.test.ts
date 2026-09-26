@@ -809,6 +809,24 @@ describe('capture worker', { timeout: 60_000 }, () => {
         expect(await samplePixel(fullPage, 200, 1300)).toEqual([34, 197, 94])
     }, 120_000)
 
+    it('keeps one full frame for each stacked fade state', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?stackedFade=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(height).toBeGreaterThan(2800)
+        expect(height).toBeLessThan(3600)
+        expect(await samplePixel(fullPage, 200, 400)).toEqual([220, 38, 38])
+        expect(await samplePixel(fullPage, 200, 1500)).toEqual([34, 197, 94])
+        expect(await samplePixel(fullPage, 200, 2600)).toEqual([49, 92, 235])
+    }, 120_000)
+
     it('keeps one settled frame when a sticky block reveals in stages', async () => {
         const storage = createLocalObjectStorage(storageRoot)
         const result = await capturePage({
@@ -870,6 +888,7 @@ function createFixtureServer(): Server
         const scrubHeading = parameters.has('scrubHeading')
         const scaleScene = parameters.has('scaleScene')
         const customCursor = parameters.has('customCursor')
+        const stackedFade = parameters.has('stackedFade')
 
         if (scrubHeading) {
             const html = `<!doctype html>
@@ -910,6 +929,38 @@ const card = document.querySelector('#card')
 const paint = () => {
   const progress = Math.min(1, (window.scrollY || 0) / 2000)
   card.style.transform = 'scale(' + (0.55 + 0.45 * progress).toFixed(3) + ')'
+}
+addEventListener('scroll', paint)
+paint()
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (stackedFade) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Stacked Fade Fixture</title></head>
+<body style="margin:0;background:#ffffff">
+<section style="height:3240px">
+<div style="position:sticky;top:0;height:1080px">
+<div id="one" style="position:absolute;inset:0;background:#dc2626;opacity:0">One</div>
+<div id="two" style="position:absolute;inset:0;background:#22c55e;opacity:0">Two</div>
+<div id="three" style="position:absolute;inset:0;background:#315ceb;opacity:0">Three</div>
+</div>
+</section>
+<script>
+const one = document.querySelector('#one')
+const two = document.querySelector('#two')
+const three = document.querySelector('#three')
+const paint = () => {
+  const scroll = window.scrollY || 0
+  one.style.opacity = scroll >= 200 && scroll < 700 ? '1' : '0'
+  two.style.opacity = scroll >= 1100 && scroll < 1600 ? '1' : '0'
+  three.style.opacity = scroll >= 1900 && scroll < 2500 ? '1' : '0'
 }
 addEventListener('scroll', paint)
 paint()
