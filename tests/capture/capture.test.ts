@@ -604,6 +604,84 @@ describe('capture worker', { timeout: 60_000 }, () => {
         expect(await samplePixel(fullPage, 20, 40)).toEqual([34, 197, 94])
         expect(await samplePixel(fullPage, 60, 40)).toEqual([21, 128, 61])
     })
+
+    it('does not treat a transparent fixed shell as a virtual canvas', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?transparentShell=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(readPngSize(fullPage).width).toBe(1920)
+        expect(height).toBeGreaterThan(2380)
+        expect(height).toBeLessThan(2420)
+        expect(await samplePixel(fullPage, 1856, 40)).toEqual([220, 38, 38])
+        expect(await samplePixel(fullPage, 1856, 1120)).not.toEqual([220, 38, 38])
+        expect(await samplePixel(fullPage, 960, 1500)).toEqual([49, 92, 235])
+    })
+
+    it('captures a scroll-locked single screen instead of failing on the leftover pixels', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?scrollLocked=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(readPngSize(fullPage).width).toBe(1920)
+        expect(height).toBeGreaterThan(1070)
+        expect(height).toBeLessThanOrEqual(1084)
+        expect(await samplePixel(fullPage, 960, 540)).toEqual([34, 197, 94])
+    })
+
+    it('waits for a horizontal clip reveal before saving the hero', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?clipReveal=1`,
+        })
+        const viewport = await storage.get(result.viewport.objectKey)
+
+        expect(await samplePixel(viewport, 960, 80)).toEqual([34, 197, 94])
+        expect(await samplePixel(viewport, 960, 80)).not.toEqual([220, 38, 38])
+    })
+
+    it('waits for a crossfade to finish before saving the hero', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?crossfade=1`,
+        })
+        const viewport = await storage.get(result.viewport.objectKey)
+
+        expect(await samplePixel(viewport, 960, 200)).toEqual([34, 197, 94])
+        expect(await samplePixel(viewport, 960, 200)).not.toEqual([220, 38, 38])
+    })
+
+    it('omits hidden menu text from the capture summary', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?hiddenMenu=1`,
+        })
+
+        expect(result.textSummary).toContain('可見標題')
+        expect(result.textSummary).not.toContain('隱藏選單新聞稿')
+        expect(result.textSummary).not.toContain('另一則隱藏消息')
+    })
 })
 
 /**
@@ -638,6 +716,11 @@ function createFixtureServer(): Server
         const canvasWipeStack = parameters.has('canvasWipeStack')
         const midCanvasWipeStack = parameters.has('midCanvasWipeStack')
         const venetianCanvasWipe = parameters.has('venetianCanvasWipe')
+        const transparentShell = parameters.has('transparentShell')
+        const scrollLocked = parameters.has('scrollLocked')
+        const clipReveal = parameters.has('clipReveal')
+        const crossfade = parameters.has('crossfade')
+        const hiddenMenu = parameters.has('hiddenMenu')
 
         if (cookies) {
             const html = `<!doctype html>
@@ -1379,6 +1462,96 @@ addEventListener('scroll',()=>{
 <div id="canvas" style="position:fixed;inset:0;background:#315ceb"></div>
 <div style="height:3240px"></div>
 <script>addEventListener('scroll',()=>{document.querySelector('#canvas').style.background=scrollY>=1080?'#22c55e':'#315ceb'})</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (transparentShell) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Transparent Shell Fixture</title></head>
+<body style="margin:0;background:#315ceb">
+<header style="position:fixed;top:0;left:0;width:1920px;height:1120px;pointer-events:none;background:transparent;z-index:5">
+<div style="position:fixed;top:24px;right:24px;width:80px;height:40px;background:#dc2626"></div>
+</header>
+<main style="height:2400px;background:#315ceb"></main>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (scrollLocked) {
+            const html = `<!doctype html>
+<html lang="zh-Hant" style="overflow:hidden">
+<head><meta charset="utf-8"><title>Scroll Locked Fixture</title></head>
+<body style="margin:0;overflow:hidden;height:1084px;background:#22c55e">
+<div style="height:1084px;background:#22c55e"></div>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (clipReveal) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Clip Reveal Fixture</title></head>
+<body style="margin:0;background:#dc2626">
+<section id="hero" style="height:2200px;background:#22c55e;clip-path:inset(45% 0 0 0)"></section>
+<script>
+setTimeout(() => {
+  const hero = document.querySelector('#hero')
+  hero.style.transition = 'clip-path 900ms linear'
+  hero.style.clipPath = 'inset(0% 0 0 0)'
+}, 100)
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (crossfade) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Crossfade Fixture</title></head>
+<body style="margin:0;background:#111111">
+<div style="position:relative;height:2200px">
+<div id="from" style="position:absolute;left:0;top:0;width:1920px;height:1080px;background:#dc2626;opacity:1"></div>
+<div id="to" style="position:absolute;left:0;top:0;width:1920px;height:1080px;background:#22c55e;opacity:0.25"></div>
+</div>
+<script>
+setTimeout(() => {
+  const from = document.querySelector('#from')
+  const to = document.querySelector('#to')
+  from.style.transition = 'opacity 1s linear'
+  to.style.transition = 'opacity 1s linear'
+  from.style.opacity = '0'
+  to.style.opacity = '1'
+}, 80)
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (hiddenMenu) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Hidden Menu Fixture</title></head>
+<body style="margin:0;background:#f8f5ef">
+<main style="height:2200px;padding:80px;font-size:48px">可見標題</main>
+<nav style="position:fixed;left:-3000px;top:0;width:400px;height:200px">隱藏選單新聞稿</nav>
+<div aria-hidden="true" style="position:absolute;top:200px;left:80px">另一則隱藏消息</div>
 </body></html>`
 
             response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })

@@ -1,7 +1,8 @@
-import sharp from 'sharp'
+import sharp, { type OverlayOptions } from 'sharp'
 import { describe, expect, it } from 'vitest'
 
 import {
+    hasRepeatedOverlapSeam,
     isSamePinnedScene,
     looksLikeFullColumnWipe,
     looksLikeVerticalWipe,
@@ -15,6 +16,16 @@ const SETTLE_WIDTH = 192
 const SETTLE_HEIGHT = 108
 
 describe('capture scene heuristics', { timeout: 15_000 }, () => {
+    it('rejects a stitch whose overlap band repeats at every viewport seam', async () => {
+        const repeated = await hasRepeatedOverlapSeam(await seamImage(true), WIDTH, 1080)
+        const distinct = await hasRepeatedOverlapSeam(await seamImage(false), WIDTH, 1080)
+        const flat = await hasRepeatedOverlapSeam(await solidPng('#22c55e', 1080 + 216), WIDTH, 1080)
+
+        expect(repeated).toBe(true)
+        expect(distinct).toBe(false)
+        expect(flat).toBe(false)
+    })
+
     it('treats a saturated solid color as zero spatial variance', () => {
         const slice = Buffer.alloc(SETTLE_WIDTH * 8 * 3)
 
@@ -32,7 +43,10 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
         const previous = await solidPng('#22c55e', 1080)
         const next = await solidPng('#22c55e', 864)
         const trimmed = await trimDuplicateScenePrefix(previous, next, WIDTH)
-        const metadata = await sharp(trimmed).metadata()
+
+        expect(trimmed).not.toBeNull()
+
+        const metadata = await sharp(trimmed ?? next).metadata()
 
         expect(metadata.height).toBe(864)
         expect(channelSpreadVariance(await rawWindow(next, 864))).toBeGreaterThan(0.2)
@@ -45,7 +59,10 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
             scene,
         ])
         const trimmed = await trimDuplicateScenePrefix(previous, scene, WIDTH)
-        const metadata = await sharp(trimmed).metadata()
+
+        expect(trimmed).not.toBeNull()
+
+        const metadata = await sharp(trimmed ?? scene).metadata()
 
         expect(metadata.height).toBe(864)
     })
@@ -412,8 +429,12 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
             await solidPng('#f8f5ef', 464),
         ])
         const trimmed = await trimDuplicateScenePrefix(previous, next, WIDTH)
-        const metadata = await sharp(trimmed).metadata()
-        const top = await sampleRgb(trimmed, 20, 10)
+
+        expect(trimmed).not.toBeNull()
+
+        const kept = trimmed ?? next
+        const metadata = await sharp(kept).metadata()
+        const top = await sampleRgb(kept, 20, 10)
 
         expect(metadata.height).toBeLessThan(500)
         expect(top).toEqual([248, 245, 239])
@@ -524,6 +545,26 @@ function channelSpreadVariance(slice: Buffer): number
     return Math.sqrt(total / slice.length) / 255
 }
 
+async function seamImage(repeat: boolean): Promise<Buffer>
+{
+    const height = 1080 + 216
+    const raw = Buffer.alloc(WIDTH * height * 3)
+
+    for (let row = 0; row < height; row += 1) {
+        for (let column = 0; column < WIDTH; column += 1) {
+            const index = (row * WIDTH + column) * 3
+            const sourceRow = row >= 1080 && repeat ? row - 216 : row
+            const value = (sourceRow * 13 + column * 3) % 180
+
+            raw[index] = value
+            raw[index + 1] = (value * 2) % 220
+            raw[index + 2] = 40 + (column % 50)
+        }
+    }
+
+    return sharp(raw, { raw: { channels: 3, height, width: WIDTH } }).png().toBuffer()
+}
+
 async function solidPng(color: string, height: number): Promise<Buffer>
 {
     return sharp({
@@ -539,16 +580,16 @@ async function solidPng(color: string, height: number): Promise<Buffer>
 async function panelPng(color: string, height: number): Promise<Buffer>
 {
     const raw = Buffer.alloc(WIDTH * height * 3)
-    const fill = color === '#315ceb' ? [49, 92, 235] : [34, 197, 94]
+    const [red = 0, green = 0, blue = 0] = color === '#315ceb' ? [49, 92, 235] : [34, 197, 94]
 
     for (let row = 0; row < height; row += 1) {
         for (let column = 0; column < WIDTH; column += 1) {
             const index = (row * WIDTH + column) * 3
             const inset = column >= 120 && column < WIDTH - 120
 
-            raw[index] = inset ? fill[0] : 242
-            raw[index + 1] = inset ? fill[1] : 239
-            raw[index + 2] = inset ? fill[2] : 232
+            raw[index] = inset ? red : 242
+            raw[index + 1] = inset ? green : 239
+            raw[index + 2] = inset ? blue : 232
         }
     }
 
@@ -774,7 +815,7 @@ async function lightGridPng(): Promise<Buffer>
 async function stackPngs(parts: Buffer[]): Promise<Buffer>
 {
     let height = 0
-    const overlays: sharp.OverlayOptions[] = []
+    const overlays: OverlayOptions[] = []
 
     for (const part of parts) {
         const metadata = await sharp(part).metadata()

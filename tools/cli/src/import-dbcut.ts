@@ -19,8 +19,26 @@ import { createLocalObjectStorage } from '@sitesensory/image'
 import { normalizeUrl } from '@sitesensory/ingestion'
 
 const DBCUT_URL = 'https://www.dbcut.com/'
-const COUNT = 6
-const PAGES_PER_SITE = Math.max(1, Number.parseInt(process.env.PAGES_PER_SITE ?? '6', 10))
+const PAGES_PER_SITE = readPositiveInt(process.env.PAGES_PER_SITE, 6)
+const SITE_COUNT = readPositiveInt(process.env.SITE_COUNT, 6)
+
+/**
+ * 讀取正整數環境變數。缺值或不是正整數時用預設，避免把 0 或文字當成上限。
+ *
+ * @param value 環境變數原文。
+ * @param fallback 無法解析時的預設值。
+ * @returns 至少為 1 的整數。
+ */
+export function readPositiveInt(value: string | undefined, fallback: number): number
+{
+    if (value === undefined || value.trim() === '') return fallback
+
+    const parsed = Number.parseInt(value, 10)
+
+    if (!Number.isFinite(parsed) || parsed < 1) return fallback
+
+    return parsed
+}
 
 type DbcutEntry = {
     name: string
@@ -62,12 +80,12 @@ async function main(): Promise<void>
 
     try {
         for (const entry of entries) {
-            if (importedSites >= COUNT) break
+            if (importedSites >= SITE_COUNT) break
 
             const externalUrl = await resolveExternalUrl(entry)
 
             if (!externalUrl) {
-                results.push({
+                await recordResult({
                     ...entry,
                     capturedUrl: '',
                     externalUrl: '',
@@ -87,7 +105,7 @@ async function main(): Promise<void>
                     storage,
                     url: externalUrl,
                 })
-                results.push({
+                await recordResult({
                     ...entry,
                     capturedUrl: home.captured.finalUrl,
                     externalUrl,
@@ -109,7 +127,7 @@ async function main(): Promise<void>
                             storage,
                             url: link,
                         })
-                        results.push({
+                        await recordResult({
                             ...entry,
                             capturedUrl: inner.captured.finalUrl,
                             externalUrl,
@@ -119,7 +137,7 @@ async function main(): Promise<void>
                         })
                     }
                     catch (error) {
-                        results.push({
+                        await recordResult({
                             ...entry,
                             capturedUrl: link,
                             externalUrl,
@@ -131,7 +149,7 @@ async function main(): Promise<void>
                 }
             }
             catch (error) {
-                results.push({
+                await recordResult({
                     ...entry,
                     capturedUrl: externalUrl,
                     externalUrl,
@@ -146,8 +164,14 @@ async function main(): Promise<void>
         await browser.close()
     }
 
-    await writeEvidence(results)
+    await writeEvidence(results, true)
     process.stdout.write(`${JSON.stringify(results, null, 2)}\n`)
+
+    async function recordResult(result: ImportResult): Promise<void>
+    {
+        results.push(result)
+        await writeEvidence(results, false)
+    }
 }
 
 type CaptureRequest = {
@@ -295,7 +319,7 @@ async function imageSize(
     }
 }
 
-async function writeEvidence(results: ImportResult[]): Promise<void>
+async function writeEvidence(results: ImportResult[], completed: boolean): Promise<void>
 {
     const workspaceRoot = process.env.INIT_CWD ?? process.cwd()
     const directory = join(workspaceRoot, 'artifacts/verification/p5')
@@ -303,9 +327,11 @@ async function writeEvidence(results: ImportResult[]): Promise<void>
 
     await mkdir(directory, { recursive: true })
     await writeFile(target, `${JSON.stringify({
-        createdAt: new Date().toISOString(),
+        completed,
         results,
+        siteCount: SITE_COUNT,
         source: DBCUT_URL,
+        updatedAt: new Date().toISOString(),
     }, null, 2)}\n`, 'utf8')
 }
 

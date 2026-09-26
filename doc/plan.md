@@ -201,7 +201,7 @@ Codex 不負責直接產生可比較的圖片向量。Embedding worker 對完整
 | `auth_identities` | `user_id`、`provider`、`provider_subject`，組合唯一 | 第一版使用 `local`；未來第三方登入不用改收藏資料 |
 | `sites` | `registrable_domain` 唯一、`name`、`industry_id` | 一個品牌或網站 |
 | `site_languages` | `site_id`、`language_code`、`role`、`source`、`confidence` | 網站主要與支援語言 |
-| `pages` | `site_id`、`canonical_url`、`normalized_url_hash`、`current_version_id`、`page_type_id`、`status` | 穩定的頁面身分 |
+| `pages` | `site_id`、`canonical_url`、`normalized_url_hash`、`discovery_source_url`、`current_version_id`、`page_type_id`、`status` | 穩定的頁面身分。`discovery_source_url` 是收錄來源（例如 DBCut 文章網址），不是頁面最終網址 |
 | `page_urls` | `page_id`、`normalized_url` 唯一、`kind` | 保存 canonical、redirect 與舊網址別名 |
 | `page_versions` | `page_id`、`version_number`、`final_url`、`captured_at`、`status`、`content_fingerprint` | 保存每次明顯改版的畫面與證據 |
 | `page_languages` | `page_version_id`、`language_code`、`role`、`source`、`confidence` | 頁面實際顯示語言 |
@@ -243,6 +243,7 @@ user 1 ── * saved_view * ── 1 page_version
 - `visual_embeddings(visual_region_id, model_id)` 唯一；模型重跑建立新的 model record，不覆蓋舊向量。
 - `saved_view_tags(saved_view_id, tag_id)` 唯一，重複加標籤不產生兩筆資料。
 - 發布頁面版本時，必要資產、有效分析結果與主要頁面類型必須同時存在，否則整筆發布失敗。
+- 擷取寫入的頁面與版本維持 `draft`，不得建立只有語言與來源的假 `succeeded` 分析。公開搜尋只看 `published`。開發時先 `POST /internal/v1/captured-pages` 取得頁面 id，再以符合 `analysisResultSchema` 的 JSON `POST /internal/v1/pages/:pageId/analysis`；驗證通過後才把頁面與版本標成 `published`。
 
 ## 工作狀態與失敗處理
 

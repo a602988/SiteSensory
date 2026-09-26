@@ -365,7 +365,7 @@ export async function registerRoutes(
             viewportAsset: { ...asset, ...size },
         })
 
-        return reply.status(201).send(await options.pageStore.getPage(page.id))
+        return reply.status(201).send(page)
     })
 
     app.post('/internal/v1/ingestion-jobs', {
@@ -450,7 +450,7 @@ export async function registerRoutes(
         const input = capturedPageInputSchema.parse(request.body)
         const page = await options.pageStore.createCapturedPage(input)
 
-        return reply.status(201).send(await options.pageStore.getPage(page.id))
+        return reply.status(201).send(page)
     })
 
     app.post('/internal/v1/pages/:pageId/analysis', {

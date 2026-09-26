@@ -69,13 +69,24 @@ pnpm web:dev
 
 API 預設監聽 `127.0.0.1:4100`。前端預設使用 `127.0.0.1:3000`；若連接埠被占用，Vite 會自動改用下一個可用連接埠。
 
-從 DBCut 最新清單匯入 6 個網站設計樣本：
+從 DBCut 最新清單匯入網站設計樣本。預設最多 6 個網站；`SITE_COUNT` 可改上限，`PAGES_PER_SITE` 可改每個網站的頁數（含首頁）：
 
 ```sh
-pnpm import:dbcut
+SITE_COUNT=3 PAGES_PER_SITE=2 pnpm import:dbcut
 ```
 
-匯入工具會解析 DBCut 最新列表中的外部網站連結，使用固定 `1920 × 1080` 桌面設定擷取首屏與完整頁面，再透過內部 API 寫入正式資料表。需要先啟動 API，並設定 `INTERNAL_API_KEY`、`DATABASE_URL` 與 `ASSET_ROOT`。
+匯入工具會解析 DBCut 最新列表中的外部網站連結，使用固定 `1920 × 1080` 桌面設定擷取首屏與完整頁面，再透過內部 API 寫入資料表。需要先啟動 API，並設定 `INTERNAL_API_KEY`、`DATABASE_URL` 與 `ASSET_ROOT`。DBCut 文章網址寫進 `pages.discovery_source_url`。每處理完一頁就更新 `artifacts/verification/p5/dbcut-import.json`，中途停止仍看得到已完成的結果。
+
+寫入的頁面是草稿，不會出現在公開搜尋。要發布時，對該頁面 id 送出通過 `analysisResultSchema` 的分析：
+
+```sh
+curl -X POST "http://127.0.0.1:4100/internal/v1/pages/<pageId>/analysis" \
+  -H "content-type: application/json" \
+  -H "x-sitesensory-key: $INTERNAL_API_KEY" \
+  -d @analysis.json
+```
+
+`analysis.json` 必須包含產業／風格標籤、色彩、頁面類型證據、`motionLevel`、`aestheticScores` 與 `analysisSummary`。缺少這些欄位時 API 會拒絕，頁面維持未發布。
 
 ## 目錄
 

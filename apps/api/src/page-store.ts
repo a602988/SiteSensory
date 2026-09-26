@@ -41,7 +41,7 @@ export interface PageStore {
      * @param input 由內部擷取流程送入的頁面證據。
      * @returns 可供前端顯示的頁面摘要。
      */
-    createCapturedPage(input: CapturedPageInput): Promise<PageSummary>
+    createCapturedPage(input: CapturedPageInput): Promise<PageDetail>
 
     /**
      * 讀取單一已發布頁面。
@@ -105,10 +105,29 @@ export function createPageStore(database: Kysely<DB>): PageStore
 
                 const pageTypeId = await getPageTypeId(transaction, analysis.pageType.key)
 
+                const version = await transaction
+                    .selectFrom('page_versions')
+                    .select(['full_page_asset_id', 'viewport_asset_id'])
+                    .where('id', '=', page.pageVersionId)
+                    .executeTakeFirst()
+
+                if (!version?.full_page_asset_id || !version.viewport_asset_id) return false
+
+                await transaction
+                    .updateTable('page_versions')
+                    .set({
+                        published_at: sql<Date>`now()`,
+                        status: 'published',
+                        updated_at: sql<Date>`now()`,
+                    })
+                    .where('id', '=', page.pageVersionId)
+                    .executeTakeFirstOrThrow()
+
                 await transaction
                     .updateTable('pages')
                     .set({
                         page_type_id: pageTypeId,
+                        status: 'published',
                         updated_at: sql<Date>`now()`,
                     })
                     .where('id', '=', page.id)
@@ -163,7 +182,7 @@ export function createPageStore(database: Kysely<DB>): PageStore
                     .set({
                         current_version_id: version.id,
                         last_checked_at: sql<Date>`now()`,
-                        status: 'published',
+                        status: 'draft',
                         updated_at: sql<Date>`now()`,
                     })
                     .where('id', '=', page.id)
@@ -181,39 +200,11 @@ export function createPageStore(database: Kysely<DB>): PageStore
                     .onConflict(conflict => conflict.columns(['page_version_id', 'language_code']).doNothing())
                     .execute()
 
-                const run = await transaction
-                    .insertInto('analysis_runs')
-                    .values({
-                        completed_at: sql<Date>`now()`,
-                        model_name: 'manual-dbcut-import',
-                        model_version: 'dev',
-                        page_version_id: version.id,
-                        prompt_version: 'dev-import-v1',
-                        runner: 'internal-api',
-                        schema_version: 'analysis-v1',
-                        started_at: sql<Date>`now()`,
-                        status: 'succeeded',
-                    })
-                    .returning('id')
-                    .executeTakeFirstOrThrow()
-
-                await transaction
-                    .insertInto('analysis_results')
-                    .values({
-                        analysis_run_id: run.id,
-                        result: {
-                            language: input.language,
-                            source: input.sourceUrl,
-                        },
-                        summary: input.summary ?? '',
-                    })
-                    .execute()
-
-                const row = await selectPage(transaction)
+                const row = await selectPage(transaction, false)
                     .where('pages.id', '=', page.id)
                     .executeTakeFirstOrThrow()
 
-                return toPageSummary(row)
+                return toPageDetail(row, [])
             })
         },
         async getPage(pageId)
@@ -448,7 +439,7 @@ async function insertPendingTag(
         .execute()
 }
 
-function selectPage(database: Kysely<DB> | Transaction<DB>)
+function selectPage(database: Kysely<DB> | Transaction<DB>, publishedOnly = true)
 {
     const latestAnalysis = database
         .selectFrom('analysis_runs')
@@ -459,7 +450,7 @@ function selectPage(database: Kysely<DB> | Transaction<DB>)
         .orderBy('analysis_runs.created_at', 'desc')
         .as('latest_analysis')
 
-    return database
+    let query = database
         .selectFrom('pages')
         .innerJoin('sites', 'sites.id', 'pages.site_id')
         .innerJoin('page_versions', 'page_versions.id', 'pages.current_version_id')
@@ -488,8 +479,14 @@ function selectPage(database: Kysely<DB> | Transaction<DB>)
             'analysis_results.summary',
             'viewport_assets.object_key as viewportObjectKey',
         ])
-        .where('pages.status', '=', 'published')
-        .where('page_versions.status', '=', 'published')
+
+    if (publishedOnly) {
+        query = query
+            .where('pages.status', '=', 'published')
+            .where('page_versions.status', '=', 'published')
+    }
+
+    return query
 }
 
 async function getPageTypeId(transaction: Transaction<DB>, key: string): Promise<string>
@@ -528,6 +525,7 @@ async function upsertPage(
         .insertInto('pages')
         .values({
             canonical_url: normalizedUrl,
+            discovery_source_url: input.sourceUrl,
             normalized_url_hash: normalizedHash,
             page_type_id: pageTypeId,
             site_id: site.id,
@@ -535,6 +533,7 @@ async function upsertPage(
         })
         .onConflict(conflict => conflict.column('normalized_url_hash').doUpdateSet({
             canonical_url: sql<string>`excluded.canonical_url`,
+            discovery_source_url: input.sourceUrl,
             page_type_id: pageTypeId,
             site_id: site.id,
             updated_at: sql<Date>`now()`,
@@ -607,8 +606,8 @@ async function insertVersion(
             final_url: normalizeUrl(input.finalUrl),
             full_page_asset_id: fullPageAssetId,
             page_id: pageId,
-            published_at: sql<Date>`now()`,
-            status: 'published',
+            published_at: null,
+            status: 'draft',
             title: input.title,
             version_number: versionNumber,
             viewport_asset_id: viewportAssetId,
@@ -616,8 +615,8 @@ async function insertVersion(
         .onConflict(conflict => conflict.columns(['page_id', 'content_fingerprint']).doUpdateSet({
             captured_at: sql<Date>`now()`,
             full_page_asset_id: fullPageAssetId,
-            published_at: sql<Date>`now()`,
-            status: 'published',
+            published_at: null,
+            status: 'draft',
             title: input.title,
             updated_at: sql<Date>`now()`,
             viewport_asset_id: viewportAssetId,

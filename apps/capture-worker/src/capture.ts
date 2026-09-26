@@ -83,6 +83,11 @@ const VIEWPORT_SETTLE_STRIP_THRESHOLD = 0.025
 const SETTLE_SIGNATURE_HEIGHT = 108
 const SETTLE_SIGNATURE_WIDTH = 192
 const SCREENSHOT_TIMEOUT_MS = 120_000
+const DOCUMENT_HEIGHT_TOLERANCE_PX = 8
+const VIRTUAL_CANVAS_SCENE_RATIO = 0.45
+const SCROLL_SHELL_HEIGHT_RATIO = 1.35
+const OVERLAP_SEAM_THRESHOLD = 0.012
+const REVEAL_HOLD_SAMPLES = 8
 
 export type CaptureOptions = {
     allowLocalNetwork?: boolean
@@ -168,19 +173,76 @@ export async function capturePage(options: CaptureOptions): Promise<CapturedPage
         await dismissBlockingOverlays(page)
         await page.evaluate(async () => document.fonts.ready)
 
-        const evidence = await page.evaluate(() => ({
-            language: document.documentElement.lang || null,
-            links: [...document.querySelectorAll('a[href]')].map(link => (link as HTMLAnchorElement).href),
-            text: document.body.innerText.replace(/\s+/g, ' ').trim().slice(0, 20_000),
-            title: document.title.trim(),
-        }))
+        const evidence = await page.evaluate(() => {
+            /**
+             * 只收集畫面上真正看得見的文字。innerText 會帶進螢幕外選單、
+             * aria-hidden 與透明度為 0 的消息，那些不該進分析摘要。
+             */
+            function readVisiblePageText(): string
+            {
+                const chunks: string[] = []
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
+                let node = walker.nextNode()
+
+                while (node) {
+                    const parent = node.parentElement
+
+                    if (parent && isVisibleTextElement(parent)) {
+                        const value = node.textContent?.replace(/\s+/g, ' ').trim()
+
+                        if (value) chunks.push(value)
+                    }
+
+                    node = walker.nextNode()
+                }
+
+                return chunks.join(' ').replace(/\s+/g, ' ').trim().slice(0, 20_000)
+            }
+
+            function isVisibleTextElement(element: HTMLElement): boolean
+            {
+                let current: HTMLElement | null = element
+
+                while (current && current !== document.documentElement) {
+                    if (current.hidden || current.getAttribute('aria-hidden') === 'true' || current.inert) return false
+                    if (current instanceof HTMLDialogElement && !current.open) return false
+
+                    const style = getComputedStyle(current)
+
+                    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false
+
+                    current = current.parentElement
+                }
+
+                const bounds = element.getBoundingClientRect()
+
+                if (bounds.width < 1 || bounds.height < 1) return false
+
+                const top = bounds.top + window.scrollY
+                const left = bounds.left + window.scrollX
+                const scrollHeight = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)
+                const scrollWidth = Math.max(document.body.scrollWidth, document.documentElement.scrollWidth)
+
+                if (top + bounds.height < -1 || top > scrollHeight + 1) return false
+                if (left + bounds.width < -1 || left > scrollWidth + 1) return false
+
+                return true
+            }
+
+            return {
+                language: document.documentElement.lang || null,
+                links: [...document.querySelectorAll('a[href]')].map(link => (link as HTMLAnchorElement).href),
+                text: readVisiblePageText(),
+                title: document.title.trim(),
+            }
+        })
 
         if (isAccessInterstitial(evidence.title, evidence.text)) {
             throw new Error('目標網站回傳存取驗證頁，未取得可分析的網站內容')
         }
 
         const hero = await settleVisibleViewport(page)
-        const viewportBuffer = hero.hasWipeArtifact
+        const viewportBuffer = hero.hasWipeArtifact || hero.hasRevealArtifact
             ? (await nudgeForCleanViewport(page, 0))?.image ?? hero.image
             : hero.image
         const fullPageBuffer = await captureFullPage(page)
@@ -234,6 +296,33 @@ export function isAccessInterstitial(title: string, text: string): boolean
 }
 
 /**
+ * 把視窗與平滑捲動控制器一起跳到指定位置。Lenis 這類函式庫會用自己的
+ * scroll 值蓋掉 window.scrollTo；有立即捲動 API 時先叫它，再同步
+ * ScrollTrigger。這不是針對特定網域，只認頁面上的控制器。
+ *
+ * @param page Playwright 頁面。
+ * @param scrollTop 文件座標。
+ * @returns 完成捲動後結束。
+ */
+async function scrollPageTo(page: import('playwright').Page, scrollTop: number): Promise<void>
+{
+    await page.evaluate(top => {
+        const host = window as Window & {
+            ScrollTrigger?: { update?: () => void }
+            lenis?: { scrollTo?: (target: number, options?: { force?: boolean, immediate?: boolean }) => void }
+        }
+
+        if (typeof host.lenis?.scrollTo === 'function') {
+            host.lenis.scrollTo(top, { force: true, immediate: true })
+        }
+
+        window.scrollTo(0, top)
+
+        host.ScrollTrigger?.update?.()
+    }, scrollTop)
+}
+
+/**
  * 先瀏覽完整頁面，讓依賴捲動或 IntersectionObserver 的內容完成載入。
  *
  * @param page Playwright 頁面。
@@ -254,8 +343,17 @@ async function preparePageForCapture(page: import('playwright').Page): Promise<v
             )
             const bottom = Math.max(pageHeight - viewportHeight, 0)
             const next = Math.min(window.scrollY + step, bottom)
+            const host = window as Window & {
+                ScrollTrigger?: { update?: () => void }
+                lenis?: { scrollTo?: (target: number, options?: { force?: boolean, immediate?: boolean }) => void }
+            }
+
+            if (typeof host.lenis?.scrollTo === 'function') {
+                host.lenis.scrollTo(next, { force: true, immediate: true })
+            }
 
             window.scrollTo(0, next)
+            host.ScrollTrigger?.update?.()
 
             return { pageHeight, reachedBottom: next >= bottom }
         }, SCROLL_STEP_RATIO)
@@ -291,7 +389,7 @@ async function preparePageForCapture(page: import('playwright').Page): Promise<v
         undefined,
         { timeout: IMAGE_SETTLE_TIMEOUT_MS },
     ).catch(() => undefined)
-    await page.evaluate(() => window.scrollTo(0, 0))
+    await scrollPageTo(page, 0)
     await page.waitForTimeout(CONTENT_SETTLE_MS)
 }
 
@@ -318,28 +416,39 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         throw new Error(`頁面高度 ${dimensions.height}px 超過單次擷取上限 ${MAX_CAPTURE_HEIGHT}px`)
     }
 
-    await markFixedElements(page)
+    const hasVirtualCanvas = await markFixedElements(page)
 
     const segments: OverlayOptions[] = []
     const keptSegments: Buffer[] = []
-    const hasVirtualCanvas = await detectsVirtualCanvas(page)
     const capturePositions = createCapturePositions(dimensions.height, dimensions.viewportHeight)
     let documentCoveredUntil = 0
     let outputHeight = 0
     let previousSignature: Buffer | null = null
+    let trimmedPixels = 0
 
     for (const target of capturePositions) {
         await page.evaluate(({ hideFixedAttribute, scrollTop }) => {
             document.documentElement.toggleAttribute(hideFixedAttribute, scrollTop > 0)
-            window.scrollTo(0, scrollTop)
         }, { hideFixedAttribute: HIDE_FIXED_ATTRIBUTE, scrollTop: target })
+        await scrollPageTo(page, target)
         let settled = await settleVisibleViewport(page)
+        let acceptedNudge = false
 
-        if (settled.hasWipeArtifact) {
+        if (settled.hasWipeArtifact || settled.hasRevealArtifact) {
             const clean = await nudgeForCleanViewport(page, target)
 
-            if (clean && hasVirtualCanvas) {
-                settled = clean
+            if (clean && (hasVirtualCanvas || settled.hasRevealArtifact)) {
+                const nudged = await page.evaluate(() => Math.round(window.scrollY))
+                const opensGap = !hasVirtualCanvas && nudged > documentCoveredUntil + DOCUMENT_HEIGHT_TOLERANCE_PX
+
+                if (!opensGap) {
+                    settled = clean
+                    acceptedNudge = true
+                }
+                else {
+                    await scrollPageTo(page, target)
+                    continue
+                }
             }
             else {
                 continue
@@ -348,8 +457,8 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
 
         let actualScroll = await page.evaluate(() => Math.round(window.scrollY))
 
-        if (actualScroll > target) {
-            await page.evaluate(scrollTop => window.scrollTo(0, scrollTop), target)
+        if (actualScroll > target && !acceptedNudge) {
+            await scrollPageTo(page, target)
             await page.waitForTimeout(SCROLL_DELAY_MS)
             actualScroll = await page.evaluate(() => Math.round(window.scrollY))
         }
@@ -364,6 +473,12 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         const segmentHeight = hasVirtualCanvas ? dimensions.viewportHeight : documentEnd - documentStart
 
         if (segmentHeight <= 0) {
+            const uncovered = dimensions.height - documentCoveredUntil
+
+            // 文件只比一個視窗高幾個像素，而且捲動被鎖住時，第二段切不出新像素。
+            // 單屏成品就是目前視窗，不能把這 4px 級的尾巴當成擷取失敗。
+            if (keptSegments.length > 0 && uncovered <= DOCUMENT_HEIGHT_TOLERANCE_PX) break
+
             throw new Error(`無法擷取頁面 ${target}px 到 ${target + dimensions.viewportHeight}px 的區段`)
         }
 
@@ -390,6 +505,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         }
 
         if (!segment) {
+            trimmedPixels += Math.max(0, documentEnd - documentCoveredUntil)
             documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
             continue
         }
@@ -398,9 +514,12 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         const keptHeight = trimmedMeta.height ?? 0
 
         if (keptHeight <= 0) {
+            trimmedPixels += Math.max(0, documentEnd - documentCoveredUntil)
             documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
             continue
         }
+
+        if (!hasVirtualCanvas) trimmedPixels += Math.max(0, segmentHeight - keptHeight)
 
         const signature = hasVirtualCanvas
             ? await createVisualSignature(segment)
@@ -442,6 +561,10 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         previousSignature = signature
     }
 
+    if (outputHeight <= 0 || segments.length === 0) {
+        throw new Error('沒有可拼接的視窗，無法產生完整頁面')
+    }
+
     const fullPage = await sharp({
         create: {
             background: '#ffffff',
@@ -462,12 +585,37 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
     if (
         metadata.width !== dimensions.width
         || metadata.height !== outputHeight
-        || finalHeight !== dimensions.height
+        || Math.abs(finalHeight - dimensions.height) > DOCUMENT_HEIGHT_TOLERANCE_PX
     ) {
         throw new Error('完整頁面合成後的尺寸與穩定頁面尺寸不一致')
     }
 
-    return trimRepeatedTailBand(fullPage, dimensions.width, { viewportTiles: hasVirtualCanvas })
+    const trimmed = await trimRepeatedTailBand(fullPage, dimensions.width, { viewportTiles: hasVirtualCanvas })
+    const trimmedMeta = await sharp(trimmed).metadata()
+    const imageHeight = trimmedMeta.height ?? 0
+
+    if (trimmedMeta.width !== dimensions.width) {
+        throw new Error('完整頁面合成後的尺寸與穩定頁面尺寸不一致')
+    }
+
+    if (!hasVirtualCanvas) {
+        const removedByTail = Math.max(0, outputHeight - imageHeight)
+        const accounted = trimmedPixels + removedByTail
+
+        if (imageHeight > finalHeight + DOCUMENT_HEIGHT_TOLERANCE_PX) {
+            throw new Error(`完整頁面高度 ${imageHeight}px 高於文件高度 ${finalHeight}px`)
+        }
+
+        if (imageHeight + accounted + DOCUMENT_HEIGHT_TOLERANCE_PX < finalHeight) {
+            throw new Error(`完整頁面高度 ${imageHeight}px 低於文件高度 ${finalHeight}px，且沒有對應的去重`)
+        }
+    }
+
+    if (await hasRepeatedOverlapSeam(trimmed, dimensions.width, dimensions.viewportHeight)) {
+        throw new Error('拼接接縫以重疊步進重複同一段內容，拒絕保存')
+    }
+
+    return trimmed
 }
 
 /**
@@ -490,32 +638,6 @@ function createCapturePositions(pageHeight: number, viewportHeight: number): num
     if (positions.at(-1) !== maximumScroll) positions.push(maximumScroll)
 
     return positions
-}
-
-/**
- * 判斷目前頁面是否以覆蓋大部分 viewport 的 fixed 元素呈現捲動內容。
- * 接近整段 viewport 的 sticky 區塊是文件流裡的捲動場景，要保留預留高度，
- * 不可當成可壓縮的虛擬畫布。
- *
- * @param page Playwright 頁面。
- * @returns 存在可見的虛擬捲動畫布時為 true。
- */
-async function detectsVirtualCanvas(page: import('playwright').Page): Promise<boolean>
-{
-    return page.evaluate(canvasCoverageRatio => [...document.body.querySelectorAll<HTMLElement>('*')]
-        .some(element => {
-            const style = getComputedStyle(element)
-
-            if (style.position !== 'fixed') return false
-            if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false
-
-            const bounds = element.getBoundingClientRect()
-
-            return bounds.width >= window.innerWidth * canvasCoverageRatio
-                && bounds.height >= window.innerHeight * canvasCoverageRatio
-                && bounds.bottom > 0
-                && bounds.top < window.innerHeight
-        }), FIXED_CANVAS_COVERAGE_RATIO)
 }
 
 /**
@@ -554,26 +676,131 @@ function visualDifference(left: Buffer, right: Buffer): number
 }
 
 /**
- * 標記頁首已存在的小型固定介面、頂部 sticky 導覽列，以及貼齊左右的
- * sticky 側欄，避免這些 chrome 在每段重複出現。覆蓋大部分 viewport 的
- * 固定畫布，與接近整段 viewport 高且接近全寬的 sticky 捲動場景不在此列。
+ * 檢查長圖是否在每個 viewport 接縫重複了 20% 重疊帶。
+ * 文件流正確拼接時，接縫前後是相鄰的文件內容；虛擬畫布誤判會把整張
+ * 1080 視窗以 864 步進疊上去，接縫兩側的 216px 就會是同一段畫面。
+ * 純色帶不算，避免留白長頁被誤殺。
+ *
+ * @param image 拼接後的完整頁面。
+ * @param width 圖片寬度。
+ * @param viewportHeight 擷取視窗高度。
+ * @returns 有內容的接縫重複時為 true。
+ */
+export async function hasRepeatedOverlapSeam(
+    image: Buffer,
+    width: number,
+    viewportHeight: number,
+): Promise<boolean>
+{
+    const metadata = await sharp(image).metadata()
+    const height = metadata.height ?? 0
+    const overlap = Math.max(Math.round(viewportHeight * (1 - CAPTURE_STEP_RATIO)), 1)
+
+    if (height < viewportHeight + overlap || width <= 0) return false
+
+    for (let seam = viewportHeight; seam + overlap <= height; seam += viewportHeight) {
+        const [before, after] = await Promise.all([
+            sharp(image).extract({
+                height: overlap,
+                left: 0,
+                top: seam - overlap,
+                width,
+            }).removeAlpha().raw().toBuffer(),
+            sharp(image).extract({
+                height: overlap,
+                left: 0,
+                top: seam,
+                width,
+            }).removeAlpha().raw().toBuffer(),
+        ])
+
+        if (before.length !== after.length || before.length === 0) continue
+        if (rowSliceVariance(before) < SCENE_TRIM_MIN_VARIANCE) continue
+        if (visualDifference(before, after) <= OVERLAP_SEAM_THRESHOLD) return true
+    }
+
+    return false
+}
+
+/**
+ * 標記頁首已存在的小型固定介面、透明的固定殼、頂部 sticky 導覽列，
+ * 以及貼齊左右的 sticky 側欄，避免這些 chrome 在每段重複出現。
+ * 真正的虛擬畫布（不透明舞台，或裡頭有蓋住約半個視窗的 canvas／影片）
+ * 與接近整段 viewport 高且接近全寬的 sticky 捲動場景不在此列。
+ * 透明且 pointer-events:none、又沒有大型畫面的 fixed 殼不是虛擬畫布，
+ * 後段要藏起來，否則導覽鈕與裝飾圓會跟著每一段出現。
  *
  * @param page Playwright 頁面。
- * @returns 完成 DOM 標記後結束。
+ * @returns 頁面上存在虛擬捲動畫布時為 true。
  */
-async function markFixedElements(page: import('playwright').Page): Promise<void>
+async function markFixedElements(page: import('playwright').Page): Promise<boolean>
 {
-    await page.evaluate(({
-        attribute,
-        canvasCoverageRatio,
-        chromeMaxHeightRatio,
-        chromeMinWidthRatio,
-        chromeSideMaxPx,
-        chromeTopMaxPx,
-        sideMaxWidthRatio,
-        sideMinHeightRatio,
-    }) => {
+    return page.evaluate(options => {
+        const backgroundAlpha = (style: CSSStyleDeclaration): number => {
+            const color = style.backgroundColor
+
+            if (!color || color === 'transparent') return 0
+
+            const slash = color.match(/\/\s*([\d.]+%?)\s*\)/u)
+
+            if (slash?.[1]) {
+                return slash[1].endsWith('%') ? Number(slash[1].slice(0, -1)) / 100 : Number(slash[1])
+            }
+
+            const rgba = color.match(/rgba\(\s*[\d.]+\s*,\s*[\d.]+\s*,\s*[\d.]+\s*,\s*([\d.]+)\s*\)/u)
+
+            if (rgba?.[1]) return Number(rgba[1])
+
+            return 1
+        }
+        const coversViewport = (bounds: DOMRect): boolean => bounds.width >= window.innerWidth * options.canvasCoverageRatio
+            && bounds.height >= window.innerHeight * options.canvasCoverageRatio
+            && bounds.bottom > 0
+            && bounds.top < window.innerHeight
+        const isVirtualCanvas = (element: HTMLElement): boolean => {
+            const style = getComputedStyle(element)
+
+            if (style.position !== 'fixed') return false
+            if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false
+            if (!coversViewport(element.getBoundingClientRect())) return false
+            if (element.scrollHeight > window.innerHeight * options.shellRatio) return false
+
+            for (const child of element.children) {
+                if (child instanceof HTMLElement && child.scrollHeight > window.innerHeight * options.shellRatio) return false
+            }
+
+            const coversScene = (target: Element): boolean => {
+                const targetBounds = target.getBoundingClientRect()
+
+                return targetBounds.width >= window.innerWidth * options.sceneRatio
+                    && targetBounds.height >= window.innerHeight * options.sceneRatio
+            }
+            const paintsScene = (target: HTMLElement): boolean => {
+                const targetStyle = getComputedStyle(target)
+
+                if (targetStyle.display === 'none' || targetStyle.visibility === 'hidden' || Number(targetStyle.opacity) === 0) {
+                    return false
+                }
+
+                if (!coversScene(target)) return false
+                if (target instanceof HTMLCanvasElement || target instanceof HTMLVideoElement) return true
+                if (targetStyle.backgroundImage && targetStyle.backgroundImage !== 'none') return true
+
+                return backgroundAlpha(targetStyle) >= 0.2
+            }
+
+            if (paintsScene(element)) return true
+            if ([...element.querySelectorAll('canvas, video')].some(node => coversScene(node))) return true
+
+            const transparent = backgroundAlpha(style) < 0.04
+                && (!style.backgroundImage || style.backgroundImage === 'none')
+
+            if (transparent && style.pointerEvents === 'none') return false
+
+            return [...element.querySelectorAll<HTMLElement>('*')].some(node => paintsScene(node))
+        }
         const elements = [...document.body.querySelectorAll<HTMLElement>('*')]
+        let hasVirtualCanvas = false
 
         for (const element of elements) {
             const style = getComputedStyle(element)
@@ -587,13 +814,23 @@ async function markFixedElements(page: import('playwright').Page): Promise<void>
             }
 
             const bounds = element.getBoundingClientRect()
-            const coversViewport = bounds.width >= window.innerWidth * canvasCoverageRatio
-                && bounds.height >= window.innerHeight * canvasCoverageRatio
 
-            if (coversViewport) continue
+            if (position === 'fixed' && coversViewport(bounds)) {
+                if (isVirtualCanvas(element)) {
+                    hasVirtualCanvas = true
+                    continue
+                }
+
+                if (element.scrollHeight > window.innerHeight * options.shellRatio) continue
+
+                element.setAttribute(options.attribute, '')
+                continue
+            }
+
+            if (coversViewport(bounds)) continue
 
             if (position === 'fixed') {
-                element.setAttribute(attribute, '')
+                element.setAttribute(options.attribute, '')
                 continue
             }
 
@@ -602,24 +839,26 @@ async function markFixedElements(page: import('playwright').Page): Promise<void>
             const right = Number.parseFloat(style.right)
             const inFirstViewport = bounds.bottom > 0 && bounds.top < window.innerHeight
             const isTopChrome = Number.isFinite(top)
-                && top <= chromeTopMaxPx
+                && top <= options.chromeTopMaxPx
                 && bounds.height > 0
-                && bounds.height < window.innerHeight * chromeMaxHeightRatio
-                && bounds.width >= window.innerWidth * chromeMinWidthRatio
+                && bounds.height < window.innerHeight * options.chromeMaxHeightRatio
+                && bounds.width >= window.innerWidth * options.chromeMinWidthRatio
                 && inFirstViewport
             const isSideChrome = inFirstViewport
                 && bounds.width > 0
-                && bounds.width < window.innerWidth * sideMaxWidthRatio
-                && bounds.height >= window.innerHeight * sideMinHeightRatio
+                && bounds.width < window.innerWidth * options.sideMaxWidthRatio
+                && bounds.height >= window.innerHeight * options.sideMinHeightRatio
                 && (
-                    Number.isFinite(left) && left <= chromeSideMaxPx
-                    || Number.isFinite(right) && right <= chromeSideMaxPx
+                    Number.isFinite(left) && left <= options.chromeSideMaxPx
+                    || Number.isFinite(right) && right <= options.chromeSideMaxPx
                     || bounds.left <= 8
                     || bounds.right >= window.innerWidth - 8
                 )
 
-            if (isTopChrome || isSideChrome) element.setAttribute(attribute, '')
+            if (isTopChrome || isSideChrome) element.setAttribute(options.attribute, '')
         }
+
+        return hasVirtualCanvas
     }, {
         attribute: FIXED_ELEMENT_ATTRIBUTE,
         canvasCoverageRatio: FIXED_CANVAS_COVERAGE_RATIO,
@@ -627,6 +866,8 @@ async function markFixedElements(page: import('playwright').Page): Promise<void>
         chromeMinWidthRatio: STICKY_CHROME_MIN_WIDTH_RATIO,
         chromeSideMaxPx: STICKY_CHROME_SIDE_MAX_PX,
         chromeTopMaxPx: STICKY_CHROME_TOP_MAX_PX,
+        sceneRatio: VIRTUAL_CANVAS_SCENE_RATIO,
+        shellRatio: SCROLL_SHELL_HEIGHT_RATIO,
         sideMaxWidthRatio: STICKY_SIDE_MAX_WIDTH_RATIO,
         sideMinHeightRatio: STICKY_SIDE_MIN_HEIGHT_RATIO,
     })
@@ -639,13 +880,14 @@ async function markFixedElements(page: import('playwright').Page): Promise<void>
  * @returns 最後一張視窗截圖，以及是否仍偵測到 wipe 條紋。
  */
 async function settleVisibleViewport(page: import('playwright').Page): Promise<{
+    hasRevealArtifact: boolean
     hasWipeArtifact: boolean
     image: Buffer
 }>
 {
     const first = await waitForVisibleViewportToSettle(page)
 
-    if (!first.hasWipeArtifact) return first
+    if (!first.hasWipeArtifact && !first.hasRevealArtifact) return first
 
     return waitForVisibleViewportToSettle(page)
 }
@@ -1001,6 +1243,7 @@ async function dismissAndHideOverlaysInPage(options: {
  * @returns 最後一張視窗截圖，以及該幀是否仍像 wipe。
  */
 async function waitForVisibleViewportToSettle(page: import('playwright').Page): Promise<{
+    hasRevealArtifact: boolean
     hasWipeArtifact: boolean
     image: Buffer
 }>
@@ -1016,12 +1259,15 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
     let previousLayout = ''
     let stableSamples = 0
     let wipeHoldSamples = 0
+    let revealHoldSamples = 0
     let latest: Buffer | null = null
     let latestHasWipe = false
+    let latestHasReveal = false
 
     while (Date.now() < deadline) {
         const hasCssMotion = await hasFiniteViewportAnimations(page)
         const layout = await readViewportLayoutState(page)
+        const incompleteReveal = await hasIncompleteReveal(page)
         const screenshot = await screenshotViewport(page, 'allow')
         const signature = await createSettleSignature(screenshot)
         const hasWipe = looksLikeVerticalWipe(signature, SETTLE_SIGNATURE_WIDTH, SETTLE_SIGNATURE_HEIGHT)
@@ -1041,21 +1287,35 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
 
         latest = screenshot
         latestHasWipe = hasWipe
+        latestHasReveal = incompleteReveal
         wipeHoldSamples = hasWipe && motionStopped ? wipeHoldSamples + 1 : 0
+        revealHoldSamples = incompleteReveal && motionStopped ? revealHoldSamples + 1 : 0
         const wipeLooksLikeDesign = pageLevelWipe && wipeHoldSamples >= VIEWPORT_WIPE_HOLD_SAMPLES
         const wipeLooksLocked = hasWipe && !pageLevelWipe && motionStopped
             && wipeHoldSamples >= VIEWPORT_LOCKED_WIPE_SAMPLES
+        const revealLooksLocked = incompleteReveal && motionStopped
+            && revealHoldSamples >= REVEAL_HOLD_SAMPLES
 
-        stableSamples = motionStopped && (!hasWipe || wipeLooksLikeDesign) ? stableSamples + 1 : 0
+        stableSamples = motionStopped && (!hasWipe || wipeLooksLikeDesign) && !incompleteReveal
+            ? stableSamples + 1
+            : 0
         previousSignature = signature
         previousLayout = layout
 
-        if (wipeLooksLocked) {
-            return { hasWipeArtifact: true, image: screenshot }
+        if (wipeLooksLocked || revealLooksLocked) {
+            return {
+                hasRevealArtifact: incompleteReveal,
+                hasWipeArtifact: hasWipe && !wipeLooksLikeDesign,
+                image: screenshot,
+            }
         }
 
         if (stableSamples >= VIEWPORT_SETTLE_STABLE_SAMPLES) {
-            return { hasWipeArtifact: hasWipe && !wipeLooksLikeDesign, image: screenshot }
+            return {
+                hasRevealArtifact: false,
+                hasWipeArtifact: hasWipe && !wipeLooksLikeDesign,
+                image: screenshot,
+            }
         }
 
         await page.waitForTimeout(VIEWPORT_SETTLE_POLL_MS)
@@ -1063,7 +1323,11 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
 
     if (!latest) latest = await screenshotViewport(page, 'allow')
 
-    return { hasWipeArtifact: latestHasWipe, image: latest }
+    return {
+        hasRevealArtifact: latestHasReveal,
+        hasWipeArtifact: latestHasWipe,
+        image: latest,
+    }
 }
 
 /**
@@ -1077,7 +1341,7 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
 async function nudgeForCleanViewport(
     page: import('playwright').Page,
     target: number,
-): Promise<{ hasWipeArtifact: boolean, image: Buffer } | null>
+): Promise<{ hasRevealArtifact: boolean, hasWipeArtifact: boolean, image: Buffer } | null>
 {
     const limits = await page.evaluate(() => ({
         maxScroll: Math.max(
@@ -1092,7 +1356,7 @@ async function nudgeForCleanViewport(
 
         if (nextTop <= target) continue
 
-        await page.evaluate(scrollTop => window.scrollTo(0, scrollTop), nextTop)
+        await scrollPageTo(page, nextTop)
         await page.waitForTimeout(NUDGE_PEEK_MS)
         await page.evaluate(() => new Promise<void>(resolve => {
             requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
@@ -1100,9 +1364,10 @@ async function nudgeForCleanViewport(
 
         const image = await screenshotViewport(page, 'allow')
         const signature = await createSettleSignature(image)
+        const incompleteReveal = await hasIncompleteReveal(page)
 
-        if (!looksLikeVerticalWipe(signature, SETTLE_SIGNATURE_WIDTH, SETTLE_SIGNATURE_HEIGHT)) {
-            return { hasWipeArtifact: false, image }
+        if (!incompleteReveal && !looksLikeVerticalWipe(signature, SETTLE_SIGNATURE_WIDTH, SETTLE_SIGNATURE_HEIGHT)) {
+            return { hasRevealArtifact: false, hasWipeArtifact: false, image }
         }
     }
 
@@ -1140,6 +1405,91 @@ async function hasFiniteViewportAnimations(page: import('playwright').Page): Pro
 }
 
 /**
+ * 視窗裡是否還有沒播完的水平 clip，或兩張大元素正在交叉淡化。
+ * 只認 inset 切在元素中段，以及兩塊相近面積、彼此重疊且都不透明也不全隱的層。
+ * 圓角 polygon 與單一設計用的半透明層不算，避免正常版面被空等。
+ *
+ * @param page Playwright 頁面。
+ * @returns 仍像揭示或交叉淡化的中間幀時為 true。
+ */
+async function hasIncompleteReveal(page: import('playwright').Page): Promise<boolean>
+{
+    return page.evaluate(() => {
+        const minArea = window.innerWidth * window.innerHeight * 0.08
+        const partials: DOMRect[] = []
+
+        for (const element of document.body.querySelectorAll<HTMLElement>('*')) {
+            const style = getComputedStyle(element)
+
+            if (style.display === 'none' || style.visibility === 'hidden') continue
+
+            const opacity = Number(style.opacity)
+
+            if (opacity <= 0.05) continue
+
+            const bounds = element.getBoundingClientRect()
+
+            if (bounds.bottom <= 0 || bounds.top >= window.innerHeight) continue
+            if (bounds.right <= 0 || bounds.left >= window.innerWidth) continue
+            if (bounds.width < 64 || bounds.height < 48) continue
+
+            const area = bounds.width * bounds.height
+
+            if (area < minArea) continue
+            if (clipLooksLikeMidReveal(style.clipPath, bounds.height)) return true
+            if (opacity < 0.9) partials.push(bounds)
+        }
+
+        for (let leftIndex = 0; leftIndex < partials.length; leftIndex += 1) {
+            for (let rightIndex = leftIndex + 1; rightIndex < partials.length; rightIndex += 1) {
+                const left = partials[leftIndex]
+                const right = partials[rightIndex]
+
+                if (!left || !right) continue
+
+                const overlapWidth = Math.min(left.right, right.right) - Math.max(left.left, right.left)
+                const overlapHeight = Math.min(left.bottom, right.bottom) - Math.max(left.top, right.top)
+
+                if (overlapWidth <= 0 || overlapHeight <= 0) continue
+
+                const overlap = overlapWidth * overlapHeight
+                const smaller = Math.min(left.width * left.height, right.width * right.height)
+
+                if (smaller > 0 && overlap / smaller > 0.6) return true
+            }
+        }
+
+        return false
+
+        function clipLooksLikeMidReveal(clip: string, elementHeight: number): boolean
+        {
+            const match = clip.match(/inset\(\s*([^)]+)\)/iu)
+
+            if (!match?.[1]) return false
+
+            const lengths: string[] = []
+
+            for (const part of match[1].split(/[\s,]+/u)) {
+                if (!part || part === 'round' || part === '/') break
+
+                lengths.push(part)
+            }
+
+            if (lengths.length === 0) return false
+
+            const pixels = lengths.map(value => value.endsWith('%')
+                ? Number.parseFloat(value) / 100 * elementHeight
+                : Number.parseFloat(value))
+            const top = pixels[0] ?? 0
+            const bottom = pixels.length >= 3 ? pixels[2] ?? 0 : top
+            const vertical = Math.max(top, bottom ?? 0)
+
+            return vertical > elementHeight * 0.08 && vertical < elementHeight * 0.92
+        }
+    })
+}
+
+/**
  * 讀取視窗內大型元素的幾何與遮罩狀態。GSAP／JS 驅動的 clip-path、
  * transform、opacity 不會出現在 document.getAnimations()，但會改這些值。
  *
@@ -1149,19 +1499,27 @@ async function hasFiniteViewportAnimations(page: import('playwright').Page): Pro
 async function readViewportLayoutState(page: import('playwright').Page): Promise<string>
 {
     return page.evaluate(() => {
-        const minArea = window.innerWidth * window.innerHeight * 0.02
         const parts: string[] = []
 
         for (const element of document.body.querySelectorAll<HTMLElement>('*')) {
             const bounds = element.getBoundingClientRect()
 
-            if (bounds.width * bounds.height < minArea) continue
             if (bounds.bottom <= 0 || bounds.top >= window.innerHeight) continue
             if (bounds.right <= 0 || bounds.left >= window.innerWidth) continue
 
             const style = getComputedStyle(element)
+            const webkitMask = style.getPropertyValue('-webkit-mask-image')
+            const masked = style.clipPath !== 'none'
+                || (style.maskImage && style.maskImage !== 'none')
+                || (webkitMask && webkitMask !== 'none')
+            const opacity = Number(style.opacity)
+            const area = bounds.width * bounds.height
+            const minArea = (masked || (opacity > 0.04 && opacity < 0.96))
+                ? window.innerWidth * window.innerHeight * 0.004
+                : window.innerWidth * window.innerHeight * 0.02
 
             if (style.display === 'none' || style.visibility === 'hidden') continue
+            if (area < minArea) continue
 
             parts.push([
                 Math.round(bounds.x),
@@ -1172,7 +1530,9 @@ async function readViewportLayoutState(page: import('playwright').Page): Promise
                 style.transform,
                 style.clipPath,
                 style.maskImage,
-                style.getPropertyValue('-webkit-mask-image'),
+                webkitMask,
+                style.maskPosition,
+                style.getPropertyValue('-webkit-mask-position'),
             ].join(','))
         }
 
@@ -1520,12 +1880,14 @@ function listResidualWipeColumns(left: Buffer, right: Buffer, width: number): bo
 
             if (leftLuma > PHOTO_BELT_PAGE_LUMA && rightLuma > PHOTO_BELT_PAGE_LUMA) continue
 
-            totals[column] += (
+            const difference = (
                 Math.abs((left[index] ?? 0) - (right[index] ?? 0))
                 + Math.abs((left[index + 1] ?? 0) - (right[index + 1] ?? 0))
                 + Math.abs((left[index + 2] ?? 0) - (right[index + 2] ?? 0))
             ) / 3 / 255
-            counts[column] += 1
+
+            totals[column] = (totals[column] ?? 0) + difference
+            counts[column] = (counts[column] ?? 0) + 1
         }
     }
 
