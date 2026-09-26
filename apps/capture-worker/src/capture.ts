@@ -1492,6 +1492,11 @@ async function stickyPinCoversViewport(page: import('playwright').Page): Promise
 async function freezeExpandingBoxes(page: import('playwright').Page): Promise<void>
 {
     const original = await readDocumentScroll(page)
+
+    await page.evaluate(() => {
+        for (const node of document.querySelectorAll('[data-sitesensory-freeze-for]')) node.remove()
+    })
+
     const candidate = await page.evaluate(() => {
         let bestId = ''
         let bestArea = 0
@@ -1510,7 +1515,14 @@ async function freezeExpandingBoxes(page: import('playwright').Page): Promise<vo
             if (area < viewportArea * 0.28 || area <= bestArea) continue
             if (bounds.bottom < window.innerHeight * 0.45 || bounds.top > window.innerHeight * 0.92) continue
 
-            const radius = Number.parseFloat(style.borderTopLeftRadius)
+            const radiusText = style.borderTopLeftRadius
+            const radius = Number.parseFloat(radiusText)
+            const shorter = Math.min(bounds.width, bounds.height)
+            const circle = (radiusText.includes('%') && radius >= 40)
+                || (Number.isFinite(radius) && radius >= shorter * 0.45)
+
+            if (circle) continue
+
             const fullBleed = bounds.width >= window.innerWidth - 8
                 && bounds.height >= window.innerHeight - 8
                 && (!Number.isFinite(radius) || radius < 1)
@@ -1529,6 +1541,8 @@ async function freezeExpandingBoxes(page: import('playwright').Page): Promise<vo
     })
 
     if (!candidate) return
+
+    const initial = await readFrozenBox(page, candidate)
 
     await page.evaluate(id => {
         document.querySelector(`[data-sitesensory-freeze-for="${id}"]`)?.remove()
@@ -1558,11 +1572,18 @@ async function freezeExpandingBoxes(page: import('playwright').Page): Promise<vo
 
     await scrollPageToAndHold(page, original)
 
-    if (!saved) return
+    if (!saved || !initial) return
+
+    const grew = saved.width > initial.width + 4
+        || saved.height > initial.height + 4
+        || saved.radius < initial.radius - 1
+
+    if (!grew) return
 
     const finalBox = saved
+    const top = initial.top > 160 ? initial.top : finalBox.top
 
-    await page.evaluate(({ box, id }) => {
+    await page.evaluate(({ box, id, top: lockedTop }) => {
         const element = document.querySelector<HTMLElement>(`[data-sitesensory-box-id="${id}"]`)
 
         if (!element) return
@@ -1570,9 +1591,9 @@ async function freezeExpandingBoxes(page: import('playwright').Page): Promise<vo
         const style = document.createElement('style')
 
         style.setAttribute('data-sitesensory-freeze-for', id)
-        style.textContent = `[data-sitesensory-box-id="${id}"]{width:${box.width}px !important;height:${box.height}px !important;top:${box.top}px !important;left:${box.left}px !important;border-radius:${box.radius}px !important;}`
+        style.textContent = `[data-sitesensory-box-id="${id}"]{width:${box.width}px !important;height:${box.height}px !important;top:${lockedTop}px !important;left:${box.left}px !important;border-radius:${box.radius}px !important;}`
         document.head.appendChild(style)
-    }, { box: finalBox, id: candidate })
+    }, { box: finalBox, id: candidate, top })
 }
 
 type FrozenBox = {
