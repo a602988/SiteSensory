@@ -593,6 +593,14 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             // 單屏成品就是目前視窗，不能把這 4px 級的尾巴當成擷取失敗。
             if (keptSegments.length > 0 && uncovered <= DOCUMENT_HEIGHT_TOLERANCE_PX) break
 
+            // 網站把這一步彈回已經寫過的釘住區段。後面還有能伸出已覆蓋範圍的位置就先跳過。
+            const laterCanPass = capturePositions.some(position => position > target
+                && position + dimensions.viewportHeight > documentCoveredUntil + DOCUMENT_HEIGHT_TOLERANCE_PX)
+            const windowAlreadyCovered = actualScroll + dimensions.viewportHeight
+                <= documentCoveredUntil + DOCUMENT_HEIGHT_TOLERANCE_PX
+
+            if (laterCanPass && windowAlreadyCovered) continue
+
             throw new Error(`無法擷取頁面 ${target}px 到 ${target + dimensions.viewportHeight}px 的區段`)
         }
 
