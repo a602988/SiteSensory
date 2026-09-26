@@ -1427,11 +1427,10 @@ async function hideCustomCursorFollowers(page: import('playwright').Page): Promi
             const radius = Number.parseFloat(style.borderTopLeftRadius)
             const round = style.borderRadius.includes('%')
                 || (Number.isFinite(radius) && radius >= Math.min(bounds.width, bounds.height) * 0.4)
-
-            if (!round) continue
-
             const decorative = style.pointerEvents === 'none' || style.mixBlendMode === 'difference'
+            const tinyTracker = size <= 18 && text.length === 0 && style.pointerEvents === 'none'
 
+            if (!round && !tinyTracker) continue
             if (!decorative && !systemCursorHidden) continue
 
             element.setAttribute(attribute, '')
@@ -1720,7 +1719,7 @@ async function settleScrollScrubbedFrame(page: import('playwright').Page): Promi
                 || winner.midScale
 
             if (cluster.length < 2) {
-                if (seed.opacity < 0.5) {
+                if (seed.opacity < 0.2) {
                     const text = seed.element.textContent?.replace(/\s+/g, ' ').trim() ?? ''
 
                     if (shouldForceHiddenText(seed)) seed.element.setAttribute(options.settled, '')
@@ -1838,6 +1837,7 @@ async function settleScrollScrubbedFrame(page: import('playwright').Page): Promi
             const peers = fades.filter(other => {
                 if (other.element === target.element) return false
                 if (!scope.contains(other.element)) return false
+                if (overlapRatio(target.bounds, other.bounds) <= 0.3) return false
 
                 const otherText = other.element.textContent?.replace(/\s+/g, ' ').trim() ?? ''
 
@@ -3411,7 +3411,7 @@ async function readStickySignature(page: import('playwright').Page): Promise<Sti
         while (node) {
             const parent = node.parentElement
 
-            if (parent && readableText(parent)) {
+            if (parent && visuallyShown(parent)) {
                 const value = node.textContent?.replace(/\s+/g, ' ').trim() ?? ''
 
                 if (value.length >= 2) texts.add(value)
@@ -3423,9 +3423,7 @@ async function readStickySignature(page: import('playwright').Page): Promise<Sti
         let images = 0
 
         for (const element of pin.querySelectorAll<HTMLElement>('img, video, canvas')) {
-            const style = getComputedStyle(element)
-
-            if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) < 0.72) continue
+            if (!visuallyShown(element)) continue
 
             const bounds = element.getBoundingClientRect()
             const area = bounds.width * bounds.height
@@ -3459,21 +3457,30 @@ async function readStickySignature(page: import('playwright').Page): Promise<Sti
             return null
         }
 
-        function readableText(element: HTMLElement): boolean
+        function visuallyShown(element: HTMLElement): boolean
         {
-            const style = getComputedStyle(element)
-
-            if (style.display === 'none' || style.visibility === 'hidden') return false
-            if (Number(style.opacity) < 0.8) return false
-
-            const blur = style.filter.match(/blur\(\s*([0-9.]+)px\s*\)/iu)
-            const amount = blur?.[1] ? Number.parseFloat(blur[1]) : 0
-
-            if (amount > 1.2) return false
-
             const bounds = element.getBoundingClientRect()
 
-            return bounds.bottom > 4 && bounds.top < window.innerHeight - 4 && bounds.width > 2 && bounds.height > 2
+            if (bounds.bottom <= 4 || bounds.top >= window.innerHeight - 4) return false
+            if (bounds.width <= 2 || bounds.height <= 2) return false
+
+            let current: HTMLElement | null = element
+
+            while (current && current !== document.body) {
+                const style = getComputedStyle(current)
+
+                if (style.display === 'none' || style.visibility === 'hidden') return false
+                if (Number(style.opacity) < 0.8) return false
+
+                const blur = style.filter.match(/blur\(\s*([0-9.]+)px\s*\)/iu)
+                const amount = blur?.[1] ? Number.parseFloat(blur[1]) : 0
+
+                if (amount > 1.2) return false
+
+                current = current.parentElement
+            }
+
+            return true
         }
     })
 }
