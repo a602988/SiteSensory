@@ -756,7 +756,8 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
                 segment = await trimDuplicateScenePrefix(previous, segment, dimensions.width, {
                     bandOrigin: sourceTop,
                     identicalRows: true,
-                    protectedBands: mediaBands,
+                    // 這一整幀的前綴若與前一幀相同，就是重疊步進，不能因為卡面保護帶而留下。
+                    protectedBands: preserveStickyFrame ? [] : mediaBands,
                 })
 
                 const afterPrefix = segment
