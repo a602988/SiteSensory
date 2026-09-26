@@ -749,6 +749,46 @@ describe('capture worker', { timeout: 60_000 }, () => {
         expect(await samplePixel(fullPage, 800, 2200)).toEqual([34, 197, 94])
         expect(await samplePixel(fullPage, 800, 3000)).toEqual([168, 85, 247])
     })
+
+    it('finishes a scroll-scrubbed heading instead of leaving it blank', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?scrubHeading=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+
+        expect(await samplePixel(fullPage, 80, 220)).toEqual([220, 38, 38])
+    })
+
+    it('shows a scaling scene as one full frame', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?scaleScene=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+
+        expect(await samplePixel(fullPage, 100, 100)).toEqual([49, 92, 235])
+    })
+
+    it('hides a fixed circular cursor follower', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?customCursor=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+
+        expect(await samplePixel(fullPage, 50, 50)).toEqual([248, 245, 239])
+        expect(await samplePixel(fullPage, 50, 50)).not.toEqual([255, 0, 170])
+    })
 })
 
 /**
@@ -792,6 +832,73 @@ function createFixtureServer(): Server
         const animatedSection = parameters.has('animatedSection')
         const scrollRebound = parameters.has('scrollRebound')
         const stickyPinLabel = parameters.has('stickyPinLabel')
+        const scrubHeading = parameters.has('scrubHeading')
+        const scaleScene = parameters.has('scaleScene')
+        const customCursor = parameters.has('customCursor')
+
+        if (scrubHeading) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Scrub Heading Fixture</title></head>
+<body style="margin:0;background:#f8f5ef">
+<section style="height:2400px;background:#f8f5ef">
+<h2 id="title" style="position:sticky;top:180px;left:40px;width:420px;height:140px;margin:0;background:#dc2626;opacity:0">Heading</h2>
+</section>
+<section style="height:800px;background:#111827"></section>
+<script>
+const title = document.querySelector('#title')
+const paint = () => {
+  const progress = Math.min(1, (window.scrollY || 0) / 1800)
+  title.style.opacity = String(progress)
+  title.style.filter = 'blur(' + (16 * (1 - progress)).toFixed(1) + 'px)'
+}
+addEventListener('scroll', paint)
+paint()
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (scaleScene) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Scale Scene Fixture</title></head>
+<body style="margin:0;background:#111111">
+<section style="height:3240px;background:#111111">
+<div id="card" style="position:sticky;top:80px;left:80px;width:1600px;height:800px;background:#315ceb;transform:scale(0.55);transform-origin:center center"></div>
+</section>
+<script>
+const card = document.querySelector('#card')
+const paint = () => {
+  const progress = Math.min(1, (window.scrollY || 0) / 2000)
+  card.style.transform = 'scale(' + (0.55 + 0.45 * progress).toFixed(3) + ')'
+}
+addEventListener('scroll', paint)
+paint()
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (customCursor) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Custom Cursor Fixture</title></head>
+<body style="margin:0;background:#f8f5ef">
+<div style="position:fixed;left:40px;top:40px;width:32px;height:32px;border-radius:50%;background:#ff00aa;pointer-events:none;z-index:5"></div>
+<section style="height:1800px;background:#f8f5ef"></section>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
 
         if (loopingHero) {
             const html = `<!doctype html>

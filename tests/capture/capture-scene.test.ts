@@ -440,6 +440,60 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
         expect(top).toEqual([248, 245, 239])
     })
 
+    it('keeps a near-copy band when only pixel-identical rows may be trimmed', async () => {
+        const band = await stripePng(180)
+        const near = await sharp(band).modulate({ brightness: 1.08 }).png().toBuffer()
+        const page = await stackPngs([
+            await solidPng('#f8f5ef', 220),
+            band,
+            near,
+            await solidPng('#f8f5ef', 220),
+        ])
+        const sourceHeight = (await sharp(page).metadata()).height ?? 0
+        const trimmed = await trimRepeatedTailBand(page, WIDTH, { identicalRows: true })
+
+        expect((await sharp(trimmed).metadata()).height).toBe(sourceHeight)
+    })
+
+    it('trims a pixel-identical band when identity is required', async () => {
+        const band = await stripePng(180)
+        const page = await stackPngs([
+            await solidPng('#f8f5ef', 220),
+            band,
+            band,
+            await solidPng('#f8f5ef', 220),
+        ])
+        const trimmed = await trimRepeatedTailBand(page, WIDTH, { identicalRows: true })
+        const height = (await sharp(trimmed).metadata()).height ?? 0
+
+        expect(height).toBeLessThan(800)
+        expect(height).toBeGreaterThan(500)
+    })
+
+    it('does not cut a pixel-identical band that sits inside an image box', async () => {
+        const band = await stripePng(180)
+        const page = await stackPngs([
+            band,
+            band,
+            await solidPng('#f8f5ef', 300),
+        ])
+        const trimmed = await trimRepeatedTailBand(page, WIDTH, {
+            identicalRows: true,
+            protectedBands: [{ bottom: 420, top: 0 }],
+        })
+
+        expect((await sharp(trimmed).metadata()).height).toBe(660)
+    })
+
+    it('keeps a similar prefix that is not the same pixels', async () => {
+        const band = await stripePng(700)
+        const near = await sharp(band).modulate({ brightness: 1.08 }).png().toBuffer()
+        const trimmed = await trimDuplicateScenePrefix(band, near, WIDTH, { identicalRows: true })
+
+        expect(trimmed).not.toBeNull()
+        expect((await sharp(trimmed ?? near).metadata()).height).toBe(700)
+    })
+
     it('detects held white wipe bars over mid-tone content', async () => {
         const signature = await createSettleSignature(await photoWithWipeBars())
 

@@ -89,6 +89,10 @@ const SETTLE_SIGNATURE_HEIGHT = 108
 const SETTLE_SIGNATURE_WIDTH = 192
 const SCREENSHOT_TIMEOUT_MS = 120_000
 const DOCUMENT_HEIGHT_TOLERANCE_PX = 8
+const DOCUMENT_ROW_IDENTITY = 0.003
+const CURSOR_FOLLOWER_ATTRIBUTE = 'data-sitesensory-hide-cursor'
+const SETTLED_REVEAL_ATTRIBUTE = 'data-sitesensory-settled'
+const SUPPRESSED_SWAP_ATTRIBUTE = 'data-sitesensory-suppress-swap'
 const VIRTUAL_CANVAS_SCENE_RATIO = 0.45
 const SCROLL_SHELL_HEIGHT_RATIO = 1.35
 const OVERLAP_SEAM_THRESHOLD = 0.012
@@ -187,6 +191,18 @@ export async function capturePage(options: CaptureOptions): Promise<CapturedPage
                 }
                 [data-sitesensory-repeat-label] {
                     visibility: hidden !important;
+                }
+                [${CURSOR_FOLLOWER_ATTRIBUTE}] {
+                    visibility: hidden !important;
+                }
+                [${SETTLED_REVEAL_ATTRIBUTE}] {
+                    clip-path: none !important;
+                    filter: none !important;
+                    opacity: 1 !important;
+                    transform: none !important;
+                }
+                [${SUPPRESSED_SWAP_ATTRIBUTE}] {
+                    opacity: 0 !important;
                 }
             `,
         })
@@ -510,13 +526,15 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
     let outputHeight = 0
     let previousSignature: Buffer | null = null
     let trimmedPixels = 0
+    const protectedBands: MediaBand[] = []
 
     for (const target of capturePositions) {
         await page.evaluate(({ hideFixedAttribute, scrollTop }) => {
             document.documentElement.toggleAttribute(hideFixedAttribute, scrollTop > 0)
         }, { hideFixedAttribute: HIDE_FIXED_ATTRIBUTE, scrollTop: target })
         await scrollPageToAndHold(page, target)
-        await hideRepeatedStickyPinLabels(page)
+        await settleScrollScrubbedFrame(page)
+        await hideRepeatedStickyPinLabels(page, Math.max(0, documentCoveredUntil - target))
         let settled = await settleVisibleViewport(page)
         let acceptedNudge = false
 
@@ -573,6 +591,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         }
 
         const viewport = settled.image
+        const mediaBands = hasVirtualCanvas ? [] : await readUncroppedMediaBands(page)
         let segment: Buffer | null = await sharp(viewport)
             .extract({
                 height: segmentHeight,
@@ -581,17 +600,33 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
                 width: dimensions.width,
             })
             .toBuffer()
+        let segmentBands = viewportBandsToSegment(mediaBands, sourceTop, segmentHeight)
 
         if (!hasVirtualCanvas) {
             const previous = keptSegments.at(-1)
 
             if (previous) {
-                segment = await trimDuplicateScenePrefix(previous, segment, dimensions.width)
+                const beforePrefix = segmentHeight
+
+                segment = await trimDuplicateScenePrefix(previous, segment, dimensions.width, {
+                    bandOrigin: sourceTop,
+                    identicalRows: true,
+                    protectedBands: mediaBands,
+                })
+
+                const afterPrefix = segment
+                    ? (await sharp(segment).metadata()).height ?? 0
+                    : 0
+
+                segmentBands = viewportBandsToSegment(mediaBands, sourceTop + (beforePrefix - afterPrefix), afterPrefix)
             }
         }
 
         if (segment && !hasVirtualCanvas && !singleScreen) {
-            segment = await trimRepeatedTailBand(segment, dimensions.width)
+            segment = await trimRepeatedTailBand(segment, dimensions.width, {
+                identicalRows: true,
+                protectedBands: segmentBands,
+            })
         }
 
         if (!segment) {
@@ -646,6 +681,18 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
 
         segments.push({ input: segment, left: 0, top: outputHeight })
         keptSegments.push(segment)
+
+        if (!hasVirtualCanvas) {
+            for (const band of segmentBands) {
+                const top = outputHeight + band.top
+                const bottom = outputHeight + band.bottom
+
+                if (bottom - top >= 24 && bottom <= outputHeight + keptHeight) {
+                    protectedBands.push({ bottom, top })
+                }
+            }
+        }
+
         outputHeight += keptHeight
         documentCoveredUntil = documentEnd
         previousSignature = signature
@@ -682,7 +729,13 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
 
     const trimmed = singleScreen
         ? fullPage
-        : await trimRepeatedTailBand(fullPage, dimensions.width, { viewportTiles: hasVirtualCanvas })
+        : await trimRepeatedTailBand(
+            fullPage,
+            dimensions.width,
+            hasVirtualCanvas
+                ? { viewportTiles: true }
+                : { identicalRows: true, protectedBands },
+        )
     const trimmedMeta = await sharp(trimmed).metadata()
     const imageHeight = trimmedMeta.height ?? 0
 
@@ -1176,13 +1229,242 @@ async function markFixedElements(page: import('playwright').Page): Promise<boole
 }
 
 /**
- * 滿視窗的 sticky 場景要留下預留高度，但裡面靠左或靠右、又比視窗窄的
- * 絕對定位標題會在每一段再畫一次。第一次看到該場景時留下標題，之後藏起來。
+ * 藏起跟著指標走的小圓點。只認固定定位、不接收指標、接近圓形、
+ * 而且幾乎沒有文字的小元素，避免把按鈕或返回頂端圓鈕一起藏掉。
  *
- * @param page 已捲到此段的 Playwright 頁面。
+ * @param page Playwright 頁面。
  * @returns 標記完成後結束。
  */
-async function hideRepeatedStickyPinLabels(page: import('playwright').Page): Promise<void>
+async function hideCustomCursorFollowers(page: import('playwright').Page): Promise<void>
+{
+    await page.evaluate(attribute => {
+        for (const element of document.body.querySelectorAll<HTMLElement>(`[${attribute}]`)) {
+            element.removeAttribute(attribute)
+        }
+
+        for (const element of document.body.querySelectorAll<HTMLElement>('*')) {
+            const style = getComputedStyle(element)
+
+            if (style.position !== 'fixed' || style.pointerEvents !== 'none') continue
+            if (style.visibility === 'hidden' || Number(style.opacity) === 0) continue
+
+            const bounds = element.getBoundingClientRect()
+            const size = Math.max(bounds.width, bounds.height)
+
+            if (bounds.width < 4 || bounds.height < 4 || size > 48) continue
+            if (element.closest('a, button, input, textarea, select, [role="button"]')) continue
+
+            const text = element.textContent?.replace(/\s+/g, '').trim() ?? ''
+
+            if (text.length > 1) continue
+
+            const radius = Number.parseFloat(style.borderTopLeftRadius)
+            const round = style.borderRadius.includes('%')
+                || (Number.isFinite(radius) && radius >= Math.min(bounds.width, bounds.height) * 0.4)
+
+            if (!round) continue
+
+            element.setAttribute(attribute, '')
+        }
+    }, CURSOR_FOLLOWER_ATTRIBUTE)
+}
+
+/**
+ * 把視窗裡跟捲動綁住、又停在半路的揭示收到看得到的狀態。
+ * 有限次 CSS 轉場仍交給原本的等待。互相重疊、輪流出現的內容只留目前最明顯的那一層。
+ * 圖片、畫布與大面積的 translate／scale 收到版面位置，避免同一幕被縫成多種縮放。
+ *
+ * @param page Playwright 頁面。
+ * @returns 標記完成後結束。
+ */
+async function settleScrollScrubbedFrame(page: import('playwright').Page): Promise<void>
+{
+    await page.evaluate(options => {
+        for (const element of document.body.querySelectorAll<HTMLElement>(`[${options.settled}], [${options.suppressed}]`)) {
+            element.removeAttribute(options.settled)
+            element.removeAttribute(options.suppressed)
+        }
+
+        const viewportArea = window.innerWidth * window.innerHeight
+
+        type ScrubTarget = {
+            blur: number
+            bounds: DOMRect
+            element: HTMLElement
+            midClip: boolean
+            midScale: boolean
+            opacity: number
+        }
+
+        const fades: ScrubTarget[] = []
+
+        for (const element of document.body.querySelectorAll<HTMLElement>('*')) {
+            if (hasRunningFiniteAnimation(element)) continue
+            if (getComputedStyle(element).position === 'fixed') continue
+
+            const inlineOpacity = element.style.opacity !== ''
+            const inlineFilter = element.style.filter !== ''
+            const inlineClip = element.style.clipPath !== '' && element.style.clipPath !== 'none'
+            const inlineTransform = element.style.transform
+
+            if (!inlineOpacity && !inlineFilter && !inlineClip && !inlineTransform) continue
+
+            const bounds = element.getBoundingClientRect()
+
+            if (bounds.bottom <= 4 || bounds.top >= window.innerHeight - 4) continue
+            if (bounds.width < 8 || bounds.height < 8) continue
+
+            const style = getComputedStyle(element)
+
+            if (style.display === 'none' || style.visibility === 'hidden') continue
+
+            const target: ScrubTarget = {
+                blur: blurAmount(style.filter),
+                bounds,
+                element,
+                midClip: inlineClip && clipIsOpen(style.clipPath, bounds.height),
+                midScale: scaleIsMid(style.transform),
+                opacity: Number(style.opacity),
+            }
+            const area = bounds.width * bounds.height
+            const textual = inlineOpacity || inlineFilter || inlineClip
+
+            if (textual && (target.opacity < 0.98 || target.blur > 0.5 || target.midClip || target.midScale)) {
+                fades.push(target)
+            }
+
+            const parallaxMedia = element.matches('img, video, canvas, [data-parallax]')
+                && /translate|scale/i.test(inlineTransform)
+            const largeShift = area >= viewportArea * 0.2
+                && /translateY|translate3d|scale/i.test(inlineTransform)
+
+            if ((parallaxMedia || largeShift || target.midScale) && area >= viewportArea * 0.04) {
+                element.setAttribute(options.settled, '')
+            }
+        }
+
+        const visited = new Set<HTMLElement>()
+
+        for (const seed of fades) {
+            if (visited.has(seed.element)) continue
+
+            const cluster: ScrubTarget[] = []
+            const queue = [seed]
+
+            visited.add(seed.element)
+
+            while (queue.length > 0) {
+                const current = queue.pop()
+
+                if (!current) continue
+
+                cluster.push(current)
+
+                for (const other of fades) {
+                    if (visited.has(other.element)) continue
+                    if (overlapRatio(current.bounds, other.bounds) <= 0.55) continue
+
+                    visited.add(other.element)
+                    queue.push(other)
+                }
+            }
+
+            if (cluster.length < 2) {
+                seed.element.setAttribute(options.settled, '')
+                continue
+            }
+
+            const winner = cluster.reduce((best, item) => item.opacity > best.opacity ? item : best)
+
+            winner.element.setAttribute(options.settled, '')
+
+            for (const item of cluster) {
+                if (item.element === winner.element) continue
+
+                item.element.setAttribute(options.suppressed, '')
+            }
+        }
+
+        function hasRunningFiniteAnimation(element: HTMLElement): boolean
+        {
+            return element.getAnimations().some(animation => {
+                if (animation.playState !== 'running') return false
+
+                const effect = animation.effect
+
+                if (!(effect instanceof KeyframeEffect)) return false
+
+                return effect.getComputedTiming().iterations !== Infinity
+            })
+        }
+
+        function blurAmount(filter: string): number
+        {
+            const match = filter.match(/blur\(\s*([0-9.]+)px\s*\)/iu)
+
+            return match?.[1] ? Number.parseFloat(match[1]) : 0
+        }
+
+        function scaleIsMid(transform: string): boolean
+        {
+            const match = transform.match(/matrix\(\s*([^)]+)\)/u)
+
+            if (!match?.[1]) return false
+
+            const parts = match[1].split(',').map(value => Number.parseFloat(value))
+            const a = parts[0]
+            const b = parts[1]
+            const c = parts[2]
+            const d = parts[3]
+
+            if (a === undefined || b === undefined || c === undefined || d === undefined) return false
+
+            const scaleX = Math.hypot(a, b)
+            const scaleY = Math.hypot(c, d)
+            const scale = Math.min(scaleX, scaleY)
+
+            return Math.abs(scaleX - scaleY) < 0.08 && scale > 0.35 && scale < 0.94
+        }
+
+        function clipIsOpen(clip: string, elementHeight: number): boolean
+        {
+            const match = clip.match(/inset\(\s*([^)]+)\)/iu)
+
+            if (!match?.[1]) return false
+
+            const top = Number.parseFloat(match[1])
+            const pixels = match[1].trim().endsWith('%') ? top / 100 * elementHeight : top
+
+            return pixels > elementHeight * 0.08 && pixels < elementHeight * 0.92
+        }
+
+        function overlapRatio(left: DOMRect, right: DOMRect): number
+        {
+            const width = Math.min(left.right, right.right) - Math.max(left.left, right.left)
+            const height = Math.min(left.bottom, right.bottom) - Math.max(left.top, right.top)
+
+            if (width <= 0 || height <= 0) return 0
+
+            const smaller = Math.min(left.width * left.height, right.width * right.height)
+
+            return smaller > 0 ? (width * height) / smaller : 0
+        }
+    }, {
+        settled: SETTLED_REVEAL_ATTRIBUTE,
+        suppressed: SUPPRESSED_SWAP_ATTRIBUTE,
+    })
+}
+
+/**
+ * 滿視窗的 sticky 場景要留下預留高度，但裡面靠左或靠右、又比視窗窄的
+ * 絕對定位標題會在每一段再畫一次。標題必須先在即將寫入的範圍裡真正看得見，
+ * 才算留過一次；第一次若還是透明，不能先標記，否則後面會把標題整句藏掉。
+ *
+ * @param page 已捲到此段的 Playwright 頁面。
+ * @param keptTop 這個視窗裡從上緣算起、已經覆蓋過、不會再寫入的像素。
+ * @returns 標記完成後結束。
+ */
+async function hideRepeatedStickyPinLabels(page: import('playwright').Page, keptTop: number): Promise<void>
 {
     await page.evaluate(options => {
         for (const node of document.querySelectorAll(`[${options.labelAttribute}]`)) {
@@ -1200,30 +1482,60 @@ async function hideRepeatedStickyPinLabels(page: import('playwright').Page): Pro
             if (bounds.width < window.innerWidth * options.pinCoverage) continue
             if (bounds.bottom <= 0 || bounds.top >= window.innerHeight) continue
 
+            const labels = sideLabels(element)
+            const visibleKept = labels.some(child => labelIsVisible(child) && labelInKeptBand(child))
+
             if (!element.hasAttribute(options.seenAttribute)) {
-                element.setAttribute(options.seenAttribute, '')
+                if (visibleKept) element.setAttribute(options.seenAttribute, '')
+
                 continue
             }
 
-            for (const child of element.querySelectorAll<HTMLElement>('*')) {
+            for (const child of labels) {
+                if (labelInKeptBand(child) || labelIsVisible(child)) child.setAttribute(options.labelAttribute, '')
+            }
+
+            function sideLabels(pin: HTMLElement): HTMLElement[]
+            {
+                const found: HTMLElement[] = []
+
+                for (const child of pin.querySelectorAll<HTMLElement>('*')) {
+                    const childStyle = getComputedStyle(child)
+
+                    if (childStyle.position !== 'absolute' && childStyle.position !== 'sticky') continue
+
+                    const childBounds = child.getBoundingClientRect()
+
+                    if (childBounds.width < 24 || childBounds.height < 24) continue
+                    if (childBounds.width >= window.innerWidth * options.labelMaxWidthRatio) continue
+                    if (childBounds.height >= window.innerHeight * options.labelMaxHeightRatio) continue
+                    if (childBounds.bottom <= 0 || childBounds.top >= window.innerHeight) continue
+
+                    const onSide = childBounds.left <= window.innerWidth * options.labelSideRatio
+                        || childBounds.right >= window.innerWidth * (1 - options.labelSideRatio)
+
+                    if (onSide) found.push(child)
+                }
+
+                return found
+            }
+
+            function labelIsVisible(child: HTMLElement): boolean
+            {
                 const childStyle = getComputedStyle(child)
 
-                if (childStyle.position !== 'absolute' && childStyle.position !== 'sticky') continue
+                return childStyle.visibility !== 'hidden' && Number(childStyle.opacity) >= 0.85
+            }
 
+            function labelInKeptBand(child: HTMLElement): boolean
+            {
                 const childBounds = child.getBoundingClientRect()
 
-                if (childBounds.width < 24 || childBounds.height < 24) continue
-                if (childBounds.width >= window.innerWidth * options.labelMaxWidthRatio) continue
-                if (childBounds.height >= window.innerHeight * options.labelMaxHeightRatio) continue
-                if (childBounds.bottom <= 0 || childBounds.top >= window.innerHeight) continue
-
-                const onSide = childBounds.left <= window.innerWidth * options.labelSideRatio
-                    || childBounds.right >= window.innerWidth * (1 - options.labelSideRatio)
-
-                if (onSide) child.setAttribute(options.labelAttribute, '')
+                return childBounds.bottom > options.keptTop + 4 && childBounds.top < window.innerHeight - 4
             }
         }
     }, {
+        keptTop,
         labelAttribute: 'data-sitesensory-repeat-label',
         labelMaxHeightRatio: STICKY_PIN_LABEL_MAX_HEIGHT_RATIO,
         labelMaxWidthRatio: STICKY_PIN_LABEL_MAX_WIDTH_RATIO,
@@ -2420,6 +2732,285 @@ function bandHasWipe(upperSlice: Buffer, lowerSlice: Buffer, width: number): boo
         || countBlendedWipeColumns(topUpper, width) >= WIPE_BAR_MIN_COUNT
 }
 
+type MediaBand = {
+    bottom: number
+    top: number
+}
+
+type RowIdentitySample = {
+    height: number
+    raw: Buffer
+    width: number
+}
+
+type RepeatCutGate = {
+    bands?: MediaBand[]
+    origin?: number
+    sample?: RowIdentitySample
+}
+
+/**
+ * 讀取視窗裡不該從中間剖開的圖片、影片、畫布與橫向輪播。
+ * 裁切若整段落在其中一個盒子裡，就不是整張複本，不能裁。
+ *
+ * @param page 已捲到此段的 Playwright 頁面。
+ * @returns 視窗座標裡的保護帶。
+ */
+async function readUncroppedMediaBands(page: import('playwright').Page): Promise<MediaBand[]>
+{
+    return page.evaluate(() => {
+        const bands: MediaBand[] = []
+
+        const consider = (element: Element) => {
+            const style = getComputedStyle(element)
+
+            if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return
+
+            const bounds = element.getBoundingClientRect()
+
+            if (bounds.width < 160 || bounds.height < 100) return
+            if (bounds.bottom <= 0 || bounds.top >= window.innerHeight) return
+
+            const top = Math.max(0, bounds.top)
+            const bottom = Math.min(window.innerHeight, bounds.bottom)
+
+            if (bottom - top < 80) return
+
+            bands.push({ bottom, top })
+        }
+
+        for (const node of document.querySelectorAll('img, video, canvas, picture')) consider(node)
+
+        for (const node of document.querySelectorAll<HTMLElement>('div, section, ul, ol')) {
+            const style = getComputedStyle(node)
+            const bounds = node.getBoundingClientRect()
+            const scrolling = (style.overflowX === 'auto' || style.overflowX === 'scroll')
+                && node.scrollWidth > node.clientWidth + 24
+            const images = node.querySelectorAll('img, video')
+            const row = images.length >= 2
+                && bounds.height >= 120
+                && bounds.height <= window.innerHeight * 0.95
+                && bounds.width >= window.innerWidth * 0.6
+
+            if (scrolling || row) consider(node)
+        }
+
+        return bands
+    })
+}
+
+/**
+ * 把視窗座標的保護帶換成區段座標。
+ *
+ * @param bands 視窗座標。
+ * @param origin 區段頂端在視窗裡的 y。
+ * @param height 區段高度。
+ * @returns 落在區段內的保護帶。
+ */
+function viewportBandsToSegment(bands: MediaBand[], origin: number, height: number): MediaBand[]
+{
+    if (height <= 0) return []
+
+    return bands.flatMap(band => {
+        const top = Math.max(0, band.top - origin)
+        const bottom = Math.min(height, band.bottom - origin)
+
+        if (bottom - top < 24) return []
+
+        return [{ bottom, top }]
+    })
+}
+
+/**
+ * 裁切是否從圖片或輪播盒子的內部挖掉一截。貼齊盒子邊緣的整段複本仍可裁。
+ *
+ * @param cutStart 裁切起點。
+ * @param cutHeight 裁切高度。
+ * @param bands 保護帶。
+ * @param origin 裁切座標相對保護帶的位移。
+ * @returns 裁切嚴格落在某個盒子內部時為 true。
+ */
+function cutSplitsMedia(
+    cutStart: number,
+    cutHeight: number,
+    bands: MediaBand[] | undefined,
+    origin = 0,
+): boolean
+{
+    if (!bands || bands.length === 0 || cutHeight <= 0) return false
+
+    const top = origin + cutStart
+    const bottom = top + cutHeight
+
+    return bands.some(band => top > band.top + 12 && bottom < band.bottom - 12)
+}
+
+/**
+ * 裁掉中間一段之後，把保護帶的座標跟著往上移。
+ *
+ * @param bands 裁切前的保護帶。
+ * @param cutStart 裁切起點。
+ * @param cutHeight 裁切高度。
+ * @returns 裁切後的保護帶。
+ */
+function shiftBandsAfterCut(bands: MediaBand[], cutStart: number, cutHeight: number): MediaBand[]
+{
+    const cutEnd = cutStart + cutHeight
+    const next: MediaBand[] = []
+
+    for (const band of bands) {
+        if (band.bottom <= cutStart + 1) {
+            next.push(band)
+            continue
+        }
+
+        if (band.top >= cutEnd - 1) {
+            next.push({ bottom: band.bottom - cutHeight, top: band.top - cutHeight })
+            continue
+        }
+
+        if (band.top < cutStart) next.push({ bottom: cutStart, top: band.top })
+        if (band.bottom > cutEnd) next.push({ bottom: band.bottom - cutHeight, top: cutStart })
+    }
+
+    return next.filter(band => band.bottom - band.top >= 24)
+}
+
+/**
+ * 做一份用來核對兩段是否像素相同的縮圖。寬度壓到 480，高度維持原像素列。
+ *
+ * @param image PNG。
+ * @param width 原圖寬度。
+ * @param height 原圖高度。
+ * @returns 列對齊的 RGB 樣本。
+ */
+async function createRowIdentitySample(image: Buffer, width: number, height: number): Promise<RowIdentitySample>
+{
+    const sampleWidth = Math.min(480, width)
+    const raw = await sharp(image)
+        .resize(sampleWidth, height, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+
+    return { height, raw, width: sampleWidth }
+}
+
+/**
+ * 兩段列是否為同一份像素。白條對照片的欄略過，其餘平均差必須近乎 0。
+ *
+ * @param sample 同一張圖的列樣本。
+ * @param startA 第一段起點。
+ * @param startB 第二段起點。
+ * @param rows 列數。
+ * @returns 近乎像素相同時為 true。
+ */
+function sampledRowsMatch(sample: RowIdentitySample, startA: number, startB: number, rows: number): boolean
+{
+    const rowCount = Math.min(rows, sample.height - startA, sample.height - startB)
+
+    if (rowCount < 8 || startA < 0 || startB < 0) return false
+
+    return rawRowsMatch(sample.raw, sample.raw, sample.width, startA, startB, rowCount)
+}
+
+/**
+ * 兩張圖各取一段列，確認是像素相同的複本，而不是縮圖上看起來接近。
+ *
+ * @param previous 前一段。
+ * @param next 後一段。
+ * @param width 寬度。
+ * @param previousTop 前一段的列起點。
+ * @param nextTop 後一段的列起點。
+ * @param rows 列數。
+ * @returns 近乎像素相同時為 true。
+ */
+async function rowsMatchAcross(
+    previous: Buffer,
+    next: Buffer,
+    width: number,
+    previousTop: number,
+    nextTop: number,
+    rows: number,
+): Promise<boolean>
+{
+    if (rows < 8 || previousTop < 0 || nextTop < 0) return false
+
+    const sampleWidth = Math.min(480, width)
+    const left = await sharp(previous)
+        .extract({ height: rows, left: 0, top: previousTop, width })
+        .resize(sampleWidth, rows, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+    const right = await sharp(next)
+        .extract({ height: rows, left: 0, top: nextTop, width })
+        .resize(sampleWidth, rows, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+
+    return rawRowsMatch(left, right, sampleWidth, 0, 0, rows)
+}
+
+/**
+ * 比對兩份 RGB 列。略過近白頁面與 wipe 白條對照片的像素。
+ *
+ * @param left 第一份 RGB。
+ * @param right 第二份 RGB。
+ * @param width 樣本寬度。
+ * @param startA 第一份列起點。
+ * @param startB 第二份列起點。
+ * @param rows 列數。
+ * @returns 平均通道差不超過文件流身份門檻時為 true。
+ */
+function rawRowsMatch(
+    left: Buffer,
+    right: Buffer,
+    width: number,
+    startA: number,
+    startB: number,
+    rows: number,
+): boolean
+{
+    const rowBytes = width * 3
+    const step = width > 240 ? 2 : 1
+    let total = 0
+    let count = 0
+
+    for (let row = 0; row < rows; row += 1) {
+        const leftRow = (startA + row) * rowBytes
+        const rightRow = (startB + row) * rowBytes
+
+        for (let column = 0; column < width; column += step) {
+            const leftIndex = leftRow + column * 3
+            const rightIndex = rightRow + column * 3
+            const leftLuma = 0.299 * (left[leftIndex] ?? 0)
+                + 0.587 * (left[leftIndex + 1] ?? 0)
+                + 0.114 * (left[leftIndex + 2] ?? 0)
+            const rightLuma = 0.299 * (right[rightIndex] ?? 0)
+                + 0.587 * (right[rightIndex + 1] ?? 0)
+                + 0.114 * (right[rightIndex + 2] ?? 0)
+            const wipe = (leftLuma > PHOTO_WIPE_LUMA && rightLuma <= PHOTO_BELT_PAGE_LUMA)
+                || (rightLuma > PHOTO_WIPE_LUMA && leftLuma <= PHOTO_BELT_PAGE_LUMA)
+
+            if (wipe) continue
+            if (leftLuma > PHOTO_BELT_PAGE_LUMA && rightLuma > PHOTO_BELT_PAGE_LUMA) continue
+
+            total += Math.abs((left[leftIndex] ?? 0) - (right[rightIndex] ?? 0))
+            total += Math.abs((left[leftIndex + 1] ?? 0) - (right[rightIndex + 1] ?? 0))
+            total += Math.abs((left[leftIndex + 2] ?? 0) - (right[rightIndex + 2] ?? 0))
+            count += 3
+        }
+    }
+
+    const samples = rows * Math.ceil(width / step)
+
+    if (count < samples * 0.25) return false
+
+    return total / count / 255 <= DOCUMENT_ROW_IDENTITY
+}
+
 /**
  * 去掉後段開頭與前一段內容重複的捲動場景。sticky 面板停在視窗上方時，
  * 幾何裁切後仍會再寫入同一張照片。純色底不裁，以免把留白誤刪。後段幾乎
@@ -2432,7 +3023,16 @@ function bandHasWipe(upperSlice: Buffer, lowerSlice: Buffer, width: number): boo
  * @returns 去掉重複前綴後的區段；沒有重複則原樣返回；只剩同一張照片的
  * 邊角碎帶時為 null，呼叫端應略過該段。
  */
-export async function trimDuplicateScenePrefix(previous: Buffer, next: Buffer, width: number): Promise<Buffer | null>
+export async function trimDuplicateScenePrefix(
+    previous: Buffer,
+    next: Buffer,
+    width: number,
+    options: {
+        bandOrigin?: number
+        identicalRows?: boolean
+        protectedBands?: MediaBand[]
+    } = {},
+): Promise<Buffer | null>
 {
     const previousMeta = await sharp(previous).metadata()
     const nextMeta = await sharp(next).metadata()
@@ -2456,6 +3056,7 @@ export async function trimDuplicateScenePrefix(previous: Buffer, next: Buffer, w
         .toBuffer()
     const rowBytes = SETTLE_SIGNATURE_WIDTH * 3
     const windowRows = Math.min(8, previousRows, nextRows)
+    let alignment = -1
     let matchedRows = 0
 
     for (let start = 0; start <= nextRows - windowRows; start += 1) {
@@ -2463,7 +3064,7 @@ export async function trimDuplicateScenePrefix(previous: Buffer, next: Buffer, w
 
         if (rowSliceVariance(slice) < SCENE_TRIM_MIN_VARIANCE) break
 
-        let found = false
+        let foundAt = -1
 
         for (let previousStart = 0; previousStart <= previousRows - windowRows; previousStart += 1) {
             const previousSlice = previousSignature.subarray(previousStart * rowBytes, (previousStart + windowRows) * rowBytes)
@@ -2475,23 +3076,58 @@ export async function trimDuplicateScenePrefix(previous: Buffer, next: Buffer, w
                 : visualDifference(slice, previousSlice)
 
             if (difference <= SCENE_TRIM_THRESHOLD) {
-                found = true
+                foundAt = previousStart
                 break
             }
         }
 
-        if (!found) break
+        if (foundAt < 0) break
+
+        const aligned = foundAt - start
+
+        if (alignment < 0) alignment = aligned
+        else if (Math.abs(aligned - alignment) > 1) break
 
         matchedRows = start + windowRows
     }
 
+    const identicalPrefix = async (rows: number): Promise<boolean> => {
+        if (!options.identicalRows) return true
+
+        const trimPx = Math.round(rows / scale)
+        const previousTop = Math.round(Math.max(0, alignment) / scale)
+
+        return rowsMatchAcross(
+            previous,
+            next,
+            width,
+            previousTop,
+            0,
+            Math.min(trimPx, previousHeight - previousTop, nextHeight),
+        )
+    }
+
     if (nextRows > 0 && matchedRows / nextRows >= SCENE_TRIM_CONTINUE_RATIO) {
+        if (options.identicalRows) {
+            const identical = await identicalPrefix(matchedRows)
+            const splitsMedia = cutSplitsMedia(0, nextHeight, options.protectedBands, options.bandOrigin ?? 0)
+
+            if (!identical || splitsMedia) return next
+        }
+
         return isVerticallyUniformScene(nextSignature, nextRows) ? next : null
     }
 
     const trimPx = Math.min(Math.round(matchedRows / scale), Math.floor(nextHeight * SCENE_TRIM_MAX_RATIO))
 
     if (trimPx <= 8 || trimPx >= nextHeight) return next
+
+    if (options.identicalRows) {
+        const identical = await identicalPrefix(matchedRows)
+
+        if (!identical) return next
+        if (cutSplitsMedia(0, trimPx, options.protectedBands, options.bandOrigin ?? 0)) return next
+    }
 
     if (nextHeight - trimPx <= nextHeight * SCENE_TRIM_SCRAP_RATIO) return null
 
@@ -2539,23 +3175,47 @@ function isVerticallyUniformScene(signature: Buffer, rows: number): boolean
 export async function trimRepeatedTailBand(
     image: Buffer,
     width: number,
-    options: { viewportTiles?: boolean } = {},
+    options: {
+        identicalRows?: boolean
+        protectedBands?: MediaBand[]
+        viewportTiles?: boolean
+    } = {},
 ): Promise<Buffer>
 {
     let current = image
     let removedViewportTile = false
 
     for (let pass = 0; pass < 3; pass += 1) {
-        const next = await trimOnePhotoBelt(current, width, {
-            ...options,
+        const beltOptions: {
+            identicalRows?: boolean
+            protectedBands?: MediaBand[]
+            skipCardAndThick?: boolean
+            viewportTiles?: boolean
+        } = {
             skipCardAndThick: removedViewportTile,
-        })
+        }
+
+        if (options.identicalRows === true) beltOptions.identicalRows = true
+        if (options.protectedBands) beltOptions.protectedBands = options.protectedBands
+        if (options.viewportTiles === true) beltOptions.viewportTiles = true
+
+        const outcome = await trimOnePhotoBelt(current, width, beltOptions)
         const before = (await sharp(current).metadata()).height ?? 0
-        const after = (await sharp(next).metadata()).height ?? 0
+        const after = (await sharp(outcome.image).metadata()).height ?? 0
 
-        if (after >= before) return current
+        if (!outcome.cut || after >= before) return current
 
-        current = next
+        if (options.protectedBands && outcome.cut) {
+            const shifted = shiftBandsAfterCut(
+                options.protectedBands,
+                outcome.cut.cutStart,
+                outcome.cut.cutHeight,
+            )
+
+            options.protectedBands.splice(0, options.protectedBands.length, ...shifted)
+        }
+
+        current = outcome.image
         if (before - after >= 800) removedViewportTile = true
     }
 
@@ -2574,13 +3234,18 @@ export async function trimRepeatedTailBand(
 async function trimOnePhotoBelt(
     image: Buffer,
     width: number,
-    options: { skipCardAndThick?: boolean, viewportTiles?: boolean } = {},
-): Promise<Buffer>
+    options: {
+        identicalRows?: boolean
+        protectedBands?: MediaBand[]
+        skipCardAndThick?: boolean
+        viewportTiles?: boolean
+    } = {},
+): Promise<{ cut: { cutHeight: number, cutStart: number } | null, image: Buffer }>
 {
     const metadata = await sharp(image).metadata()
     const height = metadata.height ?? 0
 
-    if (height < 160) return image
+    if (height < 160) return { cut: null, image }
 
     const reference = Math.min(PHOTO_BELT_REFERENCE_HEIGHT, height)
     const coarseHeight = Math.max(16, Math.round(height * PHOTO_BELT_SIGNATURE_WIDTH / width))
@@ -2598,11 +3263,23 @@ async function trimOnePhotoBelt(
         signature: coarse,
         signatureHeight: coarseHeight,
     }
+    const gate: RepeatCutGate | undefined = options.identicalRows
+        ? {
+            origin: 0,
+            sample: await createRowIdentitySample(image, width, height),
+            ...(options.protectedBands ? { bands: options.protectedBands } : {}),
+        }
+        : undefined
     const tileCut = options.viewportTiles === true && options.skipCardAndThick !== true
         ? findViewportTileCut(coarseContext)
         : null
 
-    if (tileCut) return applyRepeatCut(image, width, height, tileCut)
+    if (tileCut) {
+        return {
+            cut: tileCut,
+            image: await applyRepeatCut(image, width, height, tileCut),
+        }
+    }
 
     if (options.skipCardAndThick !== true) {
         const cardCut = height > PHOTO_BELT_REFERENCE_HEIGHT
@@ -2610,15 +3287,22 @@ async function trimOnePhotoBelt(
                 coarseContext,
                 PHOTO_CARD_RATIOS.filter(ratio => options.viewportTiles === true || ratio < 0.95),
                 true,
+                gate,
             )
             : null
         const thickCut = cardCut ?? findRepeatCut(
             coarseContext,
             PHOTO_BELT_RATIOS.filter(ratio => ratio >= PHOTO_BELT_THICK_RATIO),
             false,
+            gate,
         )
 
-        if (thickCut) return applyRepeatCut(image, width, height, thickCut)
+        if (thickCut) {
+            return {
+                cut: thickCut,
+                image: await applyRepeatCut(image, width, height, thickCut),
+            }
+        }
     }
 
     const fineHeight = Math.max(coarseHeight, Math.round(height / PHOTO_BELT_FINE_PX))
@@ -2637,11 +3321,16 @@ async function trimOnePhotoBelt(
         signature: fine,
         signatureHeight: fineHeight,
     }
-    const thinCut = findThinBelt1D(fineContext)
-        ?? findThinBelt1D(fineContext, { columnEnd: 32, columnStart: 0 })
-        ?? findThinBelt1D(fineContext, { columnEnd: 64, columnStart: 32 })
+    const thinCut = findThinBelt1D(fineContext, undefined, gate)
+        ?? findThinBelt1D(fineContext, { columnEnd: 32, columnStart: 0 }, gate)
+        ?? findThinBelt1D(fineContext, { columnEnd: 64, columnStart: 32 }, gate)
 
-    return thinCut ? applyRepeatCut(image, width, height, thinCut) : image
+    if (!thinCut) return { cut: null, image }
+
+    return {
+        cut: thinCut,
+        image: await applyRepeatCut(image, width, height, thinCut),
+    }
 }
 
 /**
@@ -3089,6 +3778,7 @@ function findRepeatCut(
     context: RepeatScanContext,
     ratios: number[],
     cardScale: boolean,
+    gate?: RepeatCutGate,
 ): { cutHeight: number, cutStart: number } | null
 {
     const { reference, rowBytes, scale, signature, signatureHeight } = context
@@ -3259,6 +3949,17 @@ function findRepeatCut(
             const matchedPeriod = Math.max(periodRows, lower - bestUpper)
             const candidateStart = Math.round((cardScale || upperHasWipe ? bestUpper : lower) * scale)
             const candidateHeight = Math.round(matchedPeriod * scale)
+            const neighborStart = Math.round((cardScale || upperHasWipe ? lower : bestUpper) * scale)
+
+            if (
+                gate?.sample
+                && !sampledRowsMatch(gate.sample, neighborStart, candidateStart, candidateHeight)
+            ) {
+                continue
+            }
+
+            if (cutSplitsMedia(candidateStart, candidateHeight, gate?.bands, gate?.origin ?? 0)) continue
+
             const betterPage = cardScale && aboveIsPage && !cutFromPage
             const worsePage = cardScale && cutFromPage && !aboveIsPage
             const betterDiff = maskedPair < cutDifference - 0.002
@@ -3306,6 +4007,7 @@ function findRepeatCut(
 function findThinBelt1D(
     context: RepeatScanContext,
     columns: { columnEnd: number, columnStart: number } = { columnEnd: 64, columnStart: 0 },
+    gate?: RepeatCutGate,
 ): { cutHeight: number, cutStart: number } | null
 {
     const { height, rowBytes, scale, signature, signatureHeight } = context
@@ -3451,6 +4153,17 @@ function findThinBelt1D(
             if (candidateStart < 8) continue
 
             const candidateHeight = Math.round(period * scale)
+            const neighborStart = candidateStart - candidateHeight
+
+            if (
+                gate?.sample
+                && !sampledRowsMatch(gate.sample, neighborStart, candidateStart, candidateHeight)
+            ) {
+                continue
+            }
+
+            if (cutSplitsMedia(candidateStart, candidateHeight, gate?.bands, gate?.origin ?? 0)) continue
+
             const betterDiff = pairDifference < cutDifference - 0.002
             const similarLarger = Math.abs(pairDifference - cutDifference) <= 0.002
                 && candidateHeight > cutHeight
@@ -3844,6 +4557,9 @@ async function screenshotViewport(
     animations: 'allow' | 'disabled',
 ): Promise<Buffer>
 {
+    await hideCustomCursorFollowers(page)
+    await settleScrollScrubbedFrame(page)
+
     return page.screenshot({
         animations,
         fullPage: false,
