@@ -609,8 +609,8 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         let pendingSticky: StickySignature | null = null
 
         if (segment && !hasVirtualCanvas && await stickyPinCoversViewport(page)) {
-            const safeToCollapse = mediaBands.every(band => {
-                const bandHeight = band.span ?? (band.bottom - band.top)
+            const safeToCollapse = segmentBands.every(band => {
+                const bandHeight = band.bottom - band.top
 
                 return bandHeight < 40 || bandHeight > dimensions.viewportHeight * 0.7
             })
@@ -620,34 +620,19 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
                 const relation = relateStickySignatures(stickyHold, signature)
 
                 if (relation === 'drop-same') {
-                    const richer = await captureRicherStickyFrame(page, signature, viewport)
-                    const grew = richer.signature.texts.length > signature.texts.length
-                        || richer.signature.images > signature.images
+                    const sameText = stickyHold?.texts === signature.texts
+                    const samePixels = !sameText || (recentTail
+                        ? visualDifference(
+                            await createVisualSignature(viewport),
+                            await createVisualSignature(recentTail),
+                        ) <= 0.06
+                        : true)
 
-                    if (!grew) {
-                        const sameText = stickyHold?.texts === signature.texts
-                        const samePixels = !sameText || (recentTail
-                            ? visualDifference(
-                                await createVisualSignature(viewport),
-                                await createVisualSignature(recentTail),
-                            ) <= 0.06
-                            : true)
-
-                        if (samePixels) {
-                            trimmedPixels += Math.max(0, documentEnd - documentCoveredUntil)
-                            documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
-                            continue
-                        }
+                    if (samePixels) {
+                        trimmedPixels += Math.max(0, documentEnd - documentCoveredUntil)
+                        documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
+                        continue
                     }
-
-                    const richerHeight = (await sharp(richer.image).metadata()).height ?? segmentHeight
-
-                    segment = richer.image
-                    segmentHeight = richerHeight
-                    sourceTop = 0
-                    segmentBands = viewportBandsToSegment(mediaBands, 0, richerHeight)
-                    preserveStickyFrame = true
-                    pendingSticky = richer.signature
                 }
 
                 if (relation === 'empty') {
@@ -686,7 +671,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
 
                     continue
                 }
-                else if (relation === 'keep') {
+                else if (relation === 'keep' || relation === 'drop-same') {
                     const richer = await captureRicherStickyFrame(page, signature, viewport)
                     const richerHeight = (await sharp(richer.image).metadata()).height ?? segmentHeight
 
@@ -707,8 +692,8 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         }
 
         if (!preserveStickyFrame && segment && !hasVirtualCanvas && recentTail && await stickyPinCoversViewport(page)) {
-            const safeToCollapse = mediaBands.every(band => {
-                const bandHeight = band.span ?? (band.bottom - band.top)
+            const safeToCollapse = segmentBands.every(band => {
+                const bandHeight = band.bottom - band.top
 
                 return bandHeight < 40 || bandHeight > dimensions.viewportHeight * 0.7
             })
@@ -762,28 +747,6 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             }
         }
 
-        if (preserveStickyFrame && segment) {
-            const advance = Math.max(0, documentEnd - documentCoveredUntil)
-            const frameHeight = (await sharp(segment).metadata()).height ?? 0
-            const overlap = frameHeight - advance
-
-            // 整幀比這次文件行程高出的那一截，是和前一幀重疊的步進。
-            // 留著會被接縫檢查當成重複帶。字與數字在畫面中段，拿掉頂端重疊仍讀得到。
-            if (overlap > 8 && advance >= 24) {
-                segment = await sharp(segment)
-                    .extract({
-                        height: advance,
-                        left: 0,
-                        top: overlap,
-                        width: dimensions.width,
-                    })
-                    .png()
-                    .toBuffer()
-                segmentHeight = advance
-                segmentBands = viewportBandsToSegment(mediaBands, overlap, advance)
-            }
-        }
-
         if (!hasVirtualCanvas) {
             const previous = keptSegments.at(-1)
 
@@ -793,8 +756,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
                 segment = await trimDuplicateScenePrefix(previous, segment, dimensions.width, {
                     bandOrigin: sourceTop,
                     identicalRows: true,
-                    // 這一整幀的前綴若與前一幀相同，就是重疊步進，不能因為卡面保護帶而留下。
-                    protectedBands: preserveStickyFrame ? [] : mediaBands,
+                    protectedBands: mediaBands,
                 })
 
                 const afterPrefix = segment
@@ -805,7 +767,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             }
         }
 
-        if (segment && !hasVirtualCanvas && !singleScreen && !preserveStickyFrame) {
+        if (segment && !hasVirtualCanvas && !singleScreen) {
             segment = await trimRepeatedTailBand(segment, dimensions.width, {
                 identicalRows: true,
                 protectedBands: segmentBands,
@@ -1216,25 +1178,6 @@ function buildDecorativeMask(rects: ViewportRect[], viewportWidth: number, viewp
  * @param viewportHeight 擷取視窗高度。
  * @returns 有內容的接縫重複時為 true。
  */
-function mostlyWhiteBand(slice: Buffer): boolean
-{
-    if (slice.length < 3) return true
-
-    let white = 0
-    let count = 0
-
-    for (let index = 0; index < slice.length; index += 3) {
-        const luma = (slice[index] ?? 0) * 0.3
-            + (slice[index + 1] ?? 0) * 0.59
-            + (slice[index + 2] ?? 0) * 0.11
-
-        count += 1
-        if (luma >= 246) white += 1
-    }
-
-    return count === 0 || white / count >= 0.92
-}
-
 export async function hasRepeatedOverlapSeam(
     image: Buffer,
     width: number,
@@ -1265,7 +1208,6 @@ export async function hasRepeatedOverlapSeam(
 
         if (before.length !== after.length || before.length === 0) continue
         if (rowSliceVariance(before) < OVERLAP_SEAM_MIN_VARIANCE) continue
-        if (mostlyWhiteBand(before) && mostlyWhiteBand(after)) continue
         if (visualDifference(before, after) > OVERLAP_SEAM_THRESHOLD) continue
 
         // 整段 sticky 場景會讓接縫前後都長一樣，而且再往下仍一樣。
@@ -3255,7 +3197,6 @@ function bandHasWipe(upperSlice: Buffer, lowerSlice: Buffer, width: number): boo
 
 type MediaBand = {
     bottom: number
-    span?: number
     top: number
 }
 
@@ -3304,7 +3245,7 @@ async function readUncroppedMediaBands(page: import('playwright').Page): Promise
 
             if (bottom - top < 80) return
 
-            bands.push({ bottom, span: bounds.height, top })
+            bands.push({ bottom, top })
         }
 
         for (const node of document.querySelectorAll('img, video, canvas, picture')) consider(node)
