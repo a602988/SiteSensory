@@ -436,6 +436,13 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
 
         if (settled.hasWipeArtifact || settled.hasRevealArtifact) {
             const clean = await nudgeForCleanViewport(page, target)
+            const noteRefusedSegment = (): void => {
+                // 略過的半完成幀不會寫進成品。這段文件範圍要算進已去重像素，
+                // 否則高度檢查會把刻意丟掉的 wipe／揭示垃圾當成缺頁。
+                const refusedEnd = Math.min(target + dimensions.viewportHeight, dimensions.height)
+
+                trimmedPixels += Math.max(0, refusedEnd - documentCoveredUntil)
+            }
 
             if (clean && (hasVirtualCanvas || settled.hasRevealArtifact)) {
                 const nudged = await page.evaluate(() => Math.round(window.scrollY))
@@ -447,10 +454,12 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
                 }
                 else {
                     await scrollPageTo(page, target)
+                    noteRefusedSegment()
                     continue
                 }
             }
             else {
+                noteRefusedSegment()
                 continue
             }
         }
@@ -716,7 +725,35 @@ export async function hasRepeatedOverlapSeam(
 
         if (before.length !== after.length || before.length === 0) continue
         if (rowSliceVariance(before) < SCENE_TRIM_MIN_VARIANCE) continue
-        if (visualDifference(before, after) <= OVERLAP_SEAM_THRESHOLD) return true
+        if (visualDifference(before, after) > OVERLAP_SEAM_THRESHOLD) continue
+
+        // 整段 sticky 場景會讓接縫前後都長一樣，而且再往下仍一樣。
+        // 864 步進沒裁重疊時，重複只佔一個 216px，下一段就是新內容。
+        if (seam + overlap * 2 <= height) {
+            const following = await sharp(image).extract({
+                height: overlap,
+                left: 0,
+                top: seam + overlap,
+                width,
+            }).removeAlpha().raw().toBuffer()
+
+            if (visualDifference(after, following) <= OVERLAP_SEAM_THRESHOLD) continue
+
+            return true
+        }
+
+        if (seam - overlap * 2 >= 0) {
+            const preceding = await sharp(image).extract({
+                height: overlap,
+                left: 0,
+                top: seam - overlap * 2,
+                width,
+            }).removeAlpha().raw().toBuffer()
+
+            if (visualDifference(preceding, before) <= OVERLAP_SEAM_THRESHOLD) continue
+        }
+
+        return true
     }
 
     return false
