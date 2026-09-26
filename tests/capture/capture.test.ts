@@ -682,6 +682,55 @@ describe('capture worker', { timeout: 60_000 }, () => {
         expect(result.textSummary).not.toContain('隱藏選單新聞稿')
         expect(result.textSummary).not.toContain('另一則隱藏消息')
     })
+
+    it('keeps the page under a hero whose decoration never settles', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?loopingHero=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(height).toBeGreaterThan(2200)
+        expect(await samplePixel(fullPage, 120, 100)).toEqual([255, 92, 56])
+        expect(await samplePixel(fullPage, 200, 1400)).toEqual([49, 92, 235])
+    })
+
+    it('waits for a reveal that starts further down the page', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?animatedSection=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(height).toBeGreaterThan(3000)
+        expect(await samplePixel(fullPage, 400, 2200)).toEqual([34, 197, 94])
+        expect(await samplePixel(fullPage, 400, 2200)).not.toEqual([148, 163, 184])
+        expect(await samplePixel(fullPage, 400, 2900)).toEqual([17, 24, 39])
+    })
+
+    it('returns to the requested scroll after the page rewrites it once', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?scrollRebound=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(height).toBeGreaterThan(4000)
+        expect(await samplePixel(fullPage, 200, 2000)).toEqual([168, 85, 247])
+        expect(await samplePixel(fullPage, 200, 4200)).toEqual([34, 197, 94])
+    })
 })
 
 /**
@@ -721,6 +770,98 @@ function createFixtureServer(): Server
         const clipReveal = parameters.has('clipReveal')
         const crossfade = parameters.has('crossfade')
         const hiddenMenu = parameters.has('hiddenMenu')
+        const loopingHero = parameters.has('loopingHero')
+        const animatedSection = parameters.has('animatedSection')
+        const scrollRebound = parameters.has('scrollRebound')
+
+        if (loopingHero) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Looping Hero Fixture</title></head>
+<body style="margin:0;background:#f8f5ef">
+<canvas id="blob" width="1920" height="1080" style="display:block;width:1920px;height:1080px"></canvas>
+<div style="position:absolute;left:80px;top:72px;width:280px;height:64px;background:#ff5c38"></div>
+<section style="height:1080px;background:#315ceb"></section>
+<section style="height:400px;background:#f8f5ef"></section>
+<script>
+const canvas = document.querySelector('#blob')
+const context = canvas.getContext('2d')
+let tick = 0
+const draw = () => {
+  tick += 1
+  context.fillStyle = tick % 2 === 0 ? '#7c3aed' : '#db2777'
+  context.fillRect(0, 0, 1920, 1080)
+  requestAnimationFrame(draw)
+}
+draw()
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (animatedSection) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Animated Section Fixture</title></head>
+<body style="margin:0;background:#f8f5ef">
+<section style="height:2000px;background:#f8f5ef"></section>
+<section id="block" style="height:600px;background:#22c55e;opacity:0.4"></section>
+<section style="height:800px;background:#111827"></section>
+<script>
+const block = document.querySelector('#block')
+let started = 0
+const tick = () => {
+  const top = block.getBoundingClientRect().top
+  const inView = top < window.innerHeight * 0.85 && top + block.offsetHeight > 80
+  if (!inView) {
+    started = 0
+    block.style.opacity = '0.4'
+    requestAnimationFrame(tick)
+    return
+  }
+  if (started === 0) started = performance.now()
+  const progress = Math.min(1, (performance.now() - started) / 1200)
+  block.style.opacity = String(0.4 + 0.6 * progress)
+  requestAnimationFrame(tick)
+}
+requestAnimationFrame(tick)
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (scrollRebound) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Scroll Rebound Fixture</title></head>
+<body style="margin:0;background:#f8f5ef">
+<section style="height:1800px;background:#f8f5ef"></section>
+<section style="height:400px;background:#a855f7"></section>
+<section style="height:1800px;background:#f8f5ef"></section>
+<section style="height:600px;background:#22c55e"></section>
+<script>
+let armed = true
+addEventListener('scroll', () => {
+  if (!armed) return
+  if (!document.documentElement.hasAttribute('data-sitesensory-hide-fixed')) return
+  const top = Math.round(scrollY)
+  if (top < 1600 || top > 3200) return
+  armed = false
+  scrollTo(0, top + 367)
+})
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
 
         if (cookies) {
             const html = `<!doctype html>

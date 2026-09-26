@@ -71,6 +71,8 @@ const BLENDED_WIPE_NEIGHBOR_DELTA = 24
 const WIPE_BAND_RATIO = 0.18
 const WIPE_BAND_MIN_ROWS = 6
 const VIEWPORT_WIPE_HOLD_SAMPLES = 12
+const VIEWPORT_REVEAL_HOLD_SAMPLES = 10
+const SCROLL_POSITION_ATTEMPTS = 3
 const OVERLAY_SETTLE_MS = 250
 const SIGNATURE_HEIGHT = 18
 const SIGNATURE_WIDTH = 32
@@ -323,17 +325,76 @@ async function scrollPageTo(page: import('playwright').Page, scrollTop: number):
     await page.evaluate(top => {
         const host = window as Window & {
             ScrollTrigger?: { update?: () => void }
+            __lenis?: { scrollTo?: (target: number, options?: { force?: boolean, immediate?: boolean }) => void }
             lenis?: { scrollTo?: (target: number, options?: { force?: boolean, immediate?: boolean }) => void }
         }
 
-        if (typeof host.lenis?.scrollTo === 'function') {
-            host.lenis.scrollTo(top, { force: true, immediate: true })
+        for (const controller of [host.lenis, host.__lenis]) {
+            if (typeof controller?.scrollTo === 'function') {
+                controller.scrollTo(top, { force: true, immediate: true })
+            }
         }
 
         window.scrollTo(0, top)
-
+        document.documentElement.scrollTop = top
+        document.body.scrollTop = top
         host.ScrollTrigger?.update?.()
     }, scrollTop)
+}
+
+/**
+ * 讀取目前文件捲動位置。
+ *
+ * @param page Playwright 頁面。
+ * @returns 四捨五入後的 scrollY。
+ */
+async function readDocumentScroll(page: import('playwright').Page): Promise<number>
+{
+    return page.evaluate(() => Math.round(window.scrollY))
+}
+
+/**
+ * 捲到指定位置並確認沒有被平滑捲動再帶走。網站若把目標改寫到別的位置，
+ * 會再下達幾次立即捲動；每次都等到 scrollY 連續不動。
+ *
+ * @param page Playwright 頁面。
+ * @param scrollTop 文件座標。
+ * @returns 穩定後的 scrollY。可能仍與目標不同。
+ */
+async function scrollPageToAndHold(page: import('playwright').Page, scrollTop: number): Promise<number>
+{
+    let actual = await readDocumentScroll(page)
+
+    for (let attempt = 0; attempt < SCROLL_POSITION_ATTEMPTS; attempt += 1) {
+        await scrollPageTo(page, scrollTop)
+        actual = await waitUntilScrollStops(page)
+
+        if (Math.abs(actual - scrollTop) <= DOCUMENT_HEIGHT_TOLERANCE_PX) return actual
+    }
+
+    return actual
+}
+
+/**
+ * 等到 scrollY 連續兩次不變，避免把還在滑動的中間值當成擷取位置。
+ *
+ * @param page Playwright 頁面。
+ * @returns 停下時的 scrollY。
+ */
+async function waitUntilScrollStops(page: import('playwright').Page): Promise<number>
+{
+    let previous = await readDocumentScroll(page)
+    let stable = 0
+
+    for (let index = 0; index < 12 && stable < 2; index += 1) {
+        await page.waitForTimeout(40)
+        const current = await readDocumentScroll(page)
+
+        stable = current === previous ? stable + 1 : 0
+        previous = current
+    }
+
+    return previous
 }
 
 /**
@@ -359,11 +420,14 @@ async function preparePageForCapture(page: import('playwright').Page): Promise<v
             const next = Math.min(window.scrollY + step, bottom)
             const host = window as Window & {
                 ScrollTrigger?: { update?: () => void }
+                __lenis?: { scrollTo?: (target: number, options?: { force?: boolean, immediate?: boolean }) => void }
                 lenis?: { scrollTo?: (target: number, options?: { force?: boolean, immediate?: boolean }) => void }
             }
 
-            if (typeof host.lenis?.scrollTo === 'function') {
-                host.lenis.scrollTo(next, { force: true, immediate: true })
+            for (const controller of [host.lenis, host.__lenis]) {
+                if (typeof controller?.scrollTo === 'function') {
+                    controller.scrollTo(next, { force: true, immediate: true })
+                }
             }
 
             window.scrollTo(0, next)
@@ -445,22 +509,15 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         await page.evaluate(({ hideFixedAttribute, scrollTop }) => {
             document.documentElement.toggleAttribute(hideFixedAttribute, scrollTop > 0)
         }, { hideFixedAttribute: HIDE_FIXED_ATTRIBUTE, scrollTop: target })
-        await scrollPageTo(page, target)
+        await scrollPageToAndHold(page, target)
         let settled = await settleVisibleViewport(page)
         let acceptedNudge = false
 
         if (settled.hasWipeArtifact || settled.hasRevealArtifact) {
             const clean = await nudgeForCleanViewport(page, target)
-            const noteRefusedSegment = (): void => {
-                // 略過的半完成幀不會寫進成品。這段文件範圍要算進已去重像素，
-                // 否則高度檢查會把刻意丟掉的 wipe／揭示垃圾當成缺頁。
-                const refusedEnd = Math.min(target + dimensions.viewportHeight, dimensions.height)
 
-                trimmedPixels += Math.max(0, refusedEnd - documentCoveredUntil)
-            }
-
-            if (clean && (hasVirtualCanvas || settled.hasRevealArtifact)) {
-                const nudged = await page.evaluate(() => Math.round(window.scrollY))
+            if (clean) {
+                const nudged = await readDocumentScroll(page)
                 const opensGap = !hasVirtualCanvas && nudged > documentCoveredUntil + DOCUMENT_HEIGHT_TOLERANCE_PX
 
                 if (!opensGap) {
@@ -468,24 +525,26 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
                     acceptedNudge = true
                 }
                 else {
-                    await scrollPageTo(page, target)
-                    noteRefusedSegment()
-                    continue
+                    await scrollPageToAndHold(page, target)
                 }
             }
             else {
-                noteRefusedSegment()
-                continue
+                await scrollPageToAndHold(page, target)
             }
+
+            const stillDirty = !acceptedNudge && settled.hasWipeArtifact && !settled.hasRevealArtifact
+            const laterCovers = capturePositions.some(position => position > target
+                && position <= documentCoveredUntil + DOCUMENT_HEIGHT_TOLERANCE_PX)
+
+            // 跟捲動綁死的 wipe 不寫進成品，但只在後面還有一段能從已覆蓋處接上時略過。
+            // 略過的範圍不是像素比對裁掉的重複，不能計入 trimmedPixels。
+            // 半完成揭示、以及後面接不上的區段，都寫入當時畫面；缺頁要讓高度檢查失敗。
+            if (stillDirty && laterCovers && !hasVirtualCanvas) continue
         }
 
-        let actualScroll = await page.evaluate(() => Math.round(window.scrollY))
-
-        if (actualScroll > target && !acceptedNudge) {
-            await scrollPageTo(page, target)
-            await page.waitForTimeout(SCROLL_DELAY_MS)
-            actualScroll = await page.evaluate(() => Math.round(window.scrollY))
-        }
+        const actualScroll = acceptedNudge
+            ? await readDocumentScroll(page)
+            : await scrollPageToAndHold(page, target)
 
         if (actualScroll > target && actualScroll > documentCoveredUntil) {
             throw new Error(`網站將 ${target}px 的擷取位置改到 ${actualScroll}px，無法產生無缺口的完整頁面`)
@@ -699,6 +758,188 @@ function visualDifference(left: Buffer, right: Buffer): number
     }
 
     return total / left.length / 255
+}
+
+/**
+ * 計算指紋差異時略過裝飾區域。沒有遮罩時與全圖差異相同。
+ * 遮罩蓋滿時視為沒有可比較的內容變化。
+ *
+ * @param left 前一幀指紋。
+ * @param right 目前指紋。
+ * @param mask 為 1 的像素不比較；null 表示全圖比較。
+ * @returns 介於 0 與 1 的平均像素差異。
+ */
+function maskedVisualDifference(left: Buffer, right: Buffer, mask: Uint8Array | null): number
+{
+    if (!mask) return visualDifference(left, right)
+    if (left.length !== right.length) return 1
+
+    let total = 0
+    let count = 0
+
+    for (let pixel = 0; pixel < mask.length; pixel += 1) {
+        if (mask[pixel]) continue
+
+        const index = pixel * 3
+
+        total += Math.abs((left[index] ?? 0) - (right[index] ?? 0))
+        total += Math.abs((left[index + 1] ?? 0) - (right[index + 1] ?? 0))
+        total += Math.abs((left[index + 2] ?? 0) - (right[index + 2] ?? 0))
+        count += 3
+    }
+
+    if (count === 0) return 0
+
+    return total / count / 255
+}
+
+/**
+ * 單欄或單列差異，略過裝飾像素。整欄都被遮罩時不計入。
+ *
+ * @param left 前一幀指紋。
+ * @param right 目前指紋。
+ * @param width 指紋寬度。
+ * @param height 指紋高度。
+ * @param mask 為 1 的像素不比較；null 表示全圖比較。
+ * @returns 介於 0 與 1 的最大欄或列差異。
+ */
+function maskedStripDifference(
+    left: Buffer,
+    right: Buffer,
+    width: number,
+    height: number,
+    mask: Uint8Array | null,
+): number
+{
+    if (!mask) return maxStripDifference(left, right, width, height)
+    if (left.length !== right.length || left.length !== width * height * 3) return 1
+
+    let maximum = 0
+
+    for (let column = 0; column < width; column += 1) {
+        let total = 0
+        let count = 0
+
+        for (let row = 0; row < height; row += 1) {
+            if (mask[row * width + column]) continue
+
+            const index = (row * width + column) * 3
+
+            total += Math.abs((left[index] ?? 0) - (right[index] ?? 0))
+            total += Math.abs((left[index + 1] ?? 0) - (right[index + 1] ?? 0))
+            total += Math.abs((left[index + 2] ?? 0) - (right[index + 2] ?? 0))
+            count += 1
+        }
+
+        if (count > 0) maximum = Math.max(maximum, total / count / 3 / 255)
+    }
+
+    for (let row = 0; row < height; row += 1) {
+        let total = 0
+        let count = 0
+
+        for (let column = 0; column < width; column += 1) {
+            if (mask[row * width + column]) continue
+
+            const index = (row * width + column) * 3
+
+            total += Math.abs((left[index] ?? 0) - (right[index] ?? 0))
+            total += Math.abs((left[index + 1] ?? 0) - (right[index + 1] ?? 0))
+            total += Math.abs((left[index + 2] ?? 0) - (right[index + 2] ?? 0))
+            count += 1
+        }
+
+        if (count > 0) maximum = Math.max(maximum, total / count / 3 / 255)
+    }
+
+    return maximum
+}
+
+type ViewportRect = {
+    height: number
+    width: number
+    x: number
+    y: number
+}
+
+/**
+ * 找出視窗裡一直在動、但不該擋住定影的裝飾：canvas、video，以及
+ * 無限循環的 CSS／WAAPI 動畫目標。
+ *
+ * @param page Playwright 頁面。
+ * @returns 與視窗相交的矩形，單位是 CSS 像素。
+ */
+async function readDecorativeViewportRects(page: import('playwright').Page): Promise<ViewportRect[]>
+{
+    return page.evaluate(() => {
+        const rects: ViewportRect[] = []
+        const seen = new Set<Element>()
+        const push = (element: Element): void => {
+            if (seen.has(element)) return
+
+            const bounds = element.getBoundingClientRect()
+
+            if (bounds.bottom <= 0 || bounds.top >= window.innerHeight) return
+            if (bounds.right <= 0 || bounds.left >= window.innerWidth) return
+            if (bounds.width < 8 || bounds.height < 8) return
+
+            seen.add(element)
+            rects.push({
+                height: bounds.height,
+                width: bounds.width,
+                x: bounds.x,
+                y: bounds.y,
+            })
+        }
+
+        for (const node of document.querySelectorAll('canvas, video')) push(node)
+
+        for (const animation of document.getAnimations()) {
+            if (animation.playState !== 'running') continue
+
+            const effect = animation.effect
+
+            if (!(effect instanceof KeyframeEffect)) continue
+            if (effect.getComputedTiming().iterations !== Infinity) continue
+            if (effect.target instanceof Element) push(effect.target)
+        }
+
+        return rects
+    })
+}
+
+/**
+ * 把裝飾矩形對到 settle 指紋的像素遮罩。
+ *
+ * @param rects 視窗座標中的裝飾範圍。
+ * @param viewportWidth 視窗寬度。
+ * @param viewportHeight 視窗高度。
+ * @returns 指紋像素遮罩；沒有裝飾時為 null。
+ */
+function buildDecorativeMask(rects: ViewportRect[], viewportWidth: number, viewportHeight: number): Uint8Array | null
+{
+    if (rects.length === 0 || viewportWidth <= 0 || viewportHeight <= 0) return null
+
+    const mask = new Uint8Array(SETTLE_SIGNATURE_WIDTH * SETTLE_SIGNATURE_HEIGHT)
+
+    for (const rect of rects) {
+        const x0 = Math.max(0, Math.floor(rect.x / viewportWidth * SETTLE_SIGNATURE_WIDTH))
+        const x1 = Math.min(
+            SETTLE_SIGNATURE_WIDTH,
+            Math.ceil((rect.x + rect.width) / viewportWidth * SETTLE_SIGNATURE_WIDTH),
+        )
+        const y0 = Math.max(0, Math.floor(rect.y / viewportHeight * SETTLE_SIGNATURE_HEIGHT))
+        const y1 = Math.min(
+            SETTLE_SIGNATURE_HEIGHT,
+            Math.ceil((rect.y + rect.height) / viewportHeight * SETTLE_SIGNATURE_HEIGHT),
+        )
+
+        for (let y = y0; y < y1; y += 1) {
+            for (let x = x0; x < x1; x += 1) mask[y * SETTLE_SIGNATURE_WIDTH + x] = 1
+        }
+    }
+
+    return mask
 }
 
 /**
@@ -941,7 +1182,7 @@ async function settleVisibleViewport(page: import('playwright').Page): Promise<{
 {
     const first = await waitForVisibleViewportToSettle(page)
 
-    if (!first.hasWipeArtifact && !first.hasRevealArtifact) return first
+    if (!first.hasWipeArtifact) return first
 
     return waitForVisibleViewportToSettle(page)
 }
@@ -1290,7 +1531,9 @@ async function dismissAndHideOverlaysInPage(options: {
  * clip-path。CSS／WAAPI 有限次動畫仍要等完；無限循環動畫不列入。
  * 直條若貫穿整段指紋且連續穩定超過設計停留門檻，視為版面線條而非
  * wipe。只打在照片帶上的直條若連續穩定，視為跟捲動綁死的半完成揭示，
- * 提早結束 settle，交給呼叫端微移或略過，不可把逾時垃圾寫進成品。
+ * 提早結束 settle，交給呼叫端微移；後面接得上才略過，否則寫入當時畫面。
+ * 揭示停住約兩秒仍未結束時，視為跟捲動綁住的狀態並交回呼叫端，不再空等。
+ * canvas、video 與無限循環動畫的像素不列入定影，避免裝飾永遠等不完。
  * 不使用 prefers-reduced-motion。
  *
  * @param page 已捲到目標位置的 Playwright 頁面。
@@ -1309,10 +1552,16 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
     await waitForVisibleImages(page)
 
     const deadline = Date.now() + VIEWPORT_SETTLE_TIMEOUT_MS
+    const viewport = page.viewportSize() ?? {
+        height: DESKTOP_CAPTURE_PROFILE.height,
+        width: DESKTOP_CAPTURE_PROFILE.width,
+    }
     let previousSignature: Buffer | null = null
     let previousLayout = ''
     let stableSamples = 0
     let wipeHoldSamples = 0
+    let revealHoldSamples = 0
+    let decorativeHoldSamples = 0
     let latest: Buffer | null = null
     let latestHasWipe = false
     let latestHasReveal = false
@@ -1321,17 +1570,23 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
         const hasCssMotion = await hasFiniteViewportAnimations(page)
         const layout = await readViewportLayoutState(page)
         const incompleteReveal = await hasIncompleteReveal(page)
+        const decorativeMask = buildDecorativeMask(
+            await readDecorativeViewportRects(page),
+            viewport.width,
+            viewport.height,
+        )
         const screenshot = await screenshotViewport(page, 'allow')
         const signature = await createSettleSignature(screenshot)
         const hasWipe = looksLikeVerticalWipe(signature, SETTLE_SIGNATURE_WIDTH, SETTLE_SIGNATURE_HEIGHT)
         const visuallyStable = Boolean(
             previousSignature
-            && visualDifference(previousSignature, signature) <= VIEWPORT_SETTLE_THRESHOLD
-            && maxStripDifference(
+            && maskedVisualDifference(previousSignature, signature, decorativeMask) <= VIEWPORT_SETTLE_THRESHOLD
+            && maskedStripDifference(
                 previousSignature,
                 signature,
                 SETTLE_SIGNATURE_WIDTH,
                 SETTLE_SIGNATURE_HEIGHT,
+                decorativeMask,
             ) <= VIEWPORT_SETTLE_STRIP_THRESHOLD,
         )
         const layoutStable = previousLayout !== '' && previousLayout === layout
@@ -1342,6 +1597,10 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
         latestHasWipe = hasWipe
         latestHasReveal = incompleteReveal
         wipeHoldSamples = hasWipe && motionStopped ? wipeHoldSamples + 1 : 0
+        revealHoldSamples = incompleteReveal && motionStopped && !hasWipe ? revealHoldSamples + 1 : 0
+        decorativeHoldSamples = !hasCssMotion && layoutStable && !incompleteReveal && !hasWipe && !visuallyStable
+            ? decorativeHoldSamples + 1
+            : 0
         const wipeLooksLikeDesign = pageLevelWipe && wipeHoldSamples >= VIEWPORT_WIPE_HOLD_SAMPLES
         const wipeLooksLocked = hasWipe && !pageLevelWipe && motionStopped
             && wipeHoldSamples >= VIEWPORT_LOCKED_WIPE_SAMPLES
@@ -1353,11 +1612,27 @@ async function waitForVisibleViewportToSettle(page: import('playwright').Page): 
         previousLayout = layout
 
         // 揭示沒結束就先交卷，會把縮放或淡入停在半路的畫面存下來。
-        // 等到揭示結束或到達等待上限；只有跟捲動綁死的 wipe 才提早結束。
+        // 有限次動畫仍要等到結束。畫面已經停住、卻仍像揭示時，那是跟捲動綁住的狀態。
         if (wipeLooksLocked) {
             return {
                 hasRevealArtifact: incompleteReveal,
                 hasWipeArtifact: true,
+                image: screenshot,
+            }
+        }
+
+        if (revealHoldSamples >= VIEWPORT_REVEAL_HOLD_SAMPLES) {
+            return {
+                hasRevealArtifact: true,
+                hasWipeArtifact: false,
+                image: screenshot,
+            }
+        }
+
+        if (decorativeHoldSamples >= VIEWPORT_REVEAL_HOLD_SAMPLES) {
+            return {
+                hasRevealArtifact: false,
+                hasWipeArtifact: false,
                 image: screenshot,
             }
         }
@@ -1460,6 +1735,7 @@ async function hasFiniteViewportAnimations(page: import('playwright').Page): Pro
  * 視窗裡是否還有沒播完的水平 clip、交叉淡化、分段淡入，或大元素停在中間縮放。
  * 圓角 polygon 與單一設計用的半透明層不算，避免正常版面被空等。
  * 三條以上的半透明帶，或蓋住約半個視窗、縮放還在 0.35 到 0.94 的元素，算還沒定影。
+ * canvas、video 與無限循環動畫是裝飾，不當成沒播完的揭示。
  *
  * @param page Playwright 頁面。
  * @returns 仍像揭示或交叉淡化的中間幀時為 true。
@@ -1471,8 +1747,11 @@ async function hasIncompleteReveal(page: import('playwright').Page): Promise<boo
         const minArea = viewportArea * 0.08
         const partials: DOMRect[] = []
         let partialBands = 0
+        const decorative = decorativeMotionElements()
 
         for (const element of document.body.querySelectorAll<HTMLElement>('*')) {
+            if (decorative.has(element)) continue
+
             const style = getComputedStyle(element)
 
             if (style.display === 'none' || style.visibility === 'hidden') continue
@@ -1521,6 +1800,25 @@ async function hasIncompleteReveal(page: import('playwright').Page): Promise<boo
         }
 
         return false
+
+        function decorativeMotionElements(): Set<HTMLElement>
+        {
+            const elements = new Set<HTMLElement>()
+
+            for (const node of document.querySelectorAll<HTMLElement>('canvas, video')) elements.add(node)
+
+            for (const animation of document.getAnimations()) {
+                if (animation.playState !== 'running') continue
+
+                const effect = animation.effect
+
+                if (!(effect instanceof KeyframeEffect)) continue
+                if (effect.getComputedTiming().iterations !== Infinity) continue
+                if (effect.target instanceof HTMLElement) elements.add(effect.target)
+            }
+
+            return elements
+        }
 
         function scaleLooksLikeMidReveal(transform: string): boolean
         {
@@ -1582,8 +1880,23 @@ async function readViewportLayoutState(page: import('playwright').Page): Promise
 {
     return page.evaluate(() => {
         const parts: string[] = []
+        const decorative = new Set<HTMLElement>()
+
+        for (const node of document.querySelectorAll<HTMLElement>('canvas, video')) decorative.add(node)
+
+        for (const animation of document.getAnimations()) {
+            if (animation.playState !== 'running') continue
+
+            const effect = animation.effect
+
+            if (!(effect instanceof KeyframeEffect)) continue
+            if (effect.getComputedTiming().iterations !== Infinity) continue
+            if (effect.target instanceof HTMLElement) decorative.add(effect.target)
+        }
 
         for (const element of document.body.querySelectorAll<HTMLElement>('*')) {
+            if (decorative.has(element)) continue
+
             const bounds = element.getBoundingClientRect()
 
             if (bounds.bottom <= 0 || bounds.top >= window.innerHeight) continue
