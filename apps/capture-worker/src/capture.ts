@@ -1437,11 +1437,10 @@ async function freezeExpandingBoxes(page: import('playwright').Page): Promise<vo
 
         if (!element) return
 
-        element.style.setProperty('width', `${box.width}px`, 'important')
-        element.style.setProperty('height', `${box.height}px`, 'important')
-        element.style.setProperty('top', `${box.top}px`, 'important')
-        element.style.setProperty('left', `${box.left}px`, 'important')
-        element.style.setProperty('border-radius', `${box.radius}px`, 'important')
+        const style = document.createElement('style')
+
+        style.textContent = `[data-sitesensory-box-id="${id}"]{width:${box.width}px !important;height:${box.height}px !important;top:${box.top}px !important;left:${box.left}px !important;border-radius:${box.radius}px !important;}`
+        document.head.appendChild(style)
     }, { box: finalBox, id: candidate })
 }
 
