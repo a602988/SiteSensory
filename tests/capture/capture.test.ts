@@ -992,7 +992,7 @@ const paint = () => {
   if (scroll < start) {
     title.style.opacity = '0'
     title.style.transform = 'none'
-  } else if (scroll < start + 180) {
+  } else if (scroll < start + 520) {
     title.style.opacity = '1'
     title.style.transform = 'none'
   } else {

@@ -704,7 +704,8 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             && pinnedStart > documentStart + 24
             && pinnedStart < documentEnd - 24
         ) {
-            const landed = await scrollPageToAndHold(page, pinnedStart)
+            const revealScroll = Math.min(documentEnd - 24, pinnedStart + 280)
+            const landed = await scrollPageToAndHold(page, revealScroll)
 
             if (landed >= pinnedStart - DOCUMENT_HEIGHT_TOLERANCE_PX) {
                 const lead = pinnedStart - documentStart
@@ -741,6 +742,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
                 keptSegments.push(frameImage)
                 outputHeight += room
                 recentTail = frameImage
+                trimmedPixels += Math.max(0, landed - pinnedStart)
                 documentCoveredUntil = Math.max(documentCoveredUntil, landed + room)
                 stickyHold = await readStickySignature(page)
                 continue
