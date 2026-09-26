@@ -620,19 +620,34 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
                 const relation = relateStickySignatures(stickyHold, signature)
 
                 if (relation === 'drop-same') {
-                    const sameText = stickyHold?.texts === signature.texts
-                    const samePixels = !sameText || (recentTail
-                        ? visualDifference(
-                            await createVisualSignature(viewport),
-                            await createVisualSignature(recentTail),
-                        ) <= 0.06
-                        : true)
+                    const richer = await captureRicherStickyFrame(page, signature, viewport)
+                    const grew = richer.signature.texts.length > signature.texts.length
+                        || richer.signature.images > signature.images
 
-                    if (samePixels) {
-                        trimmedPixels += Math.max(0, documentEnd - documentCoveredUntil)
-                        documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
-                        continue
+                    if (!grew) {
+                        const sameText = stickyHold?.texts === signature.texts
+                        const samePixels = !sameText || (recentTail
+                            ? visualDifference(
+                                await createVisualSignature(viewport),
+                                await createVisualSignature(recentTail),
+                            ) <= 0.06
+                            : true)
+
+                        if (samePixels) {
+                            trimmedPixels += Math.max(0, documentEnd - documentCoveredUntil)
+                            documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
+                            continue
+                        }
                     }
+
+                    const richerHeight = (await sharp(richer.image).metadata()).height ?? segmentHeight
+
+                    segment = richer.image
+                    segmentHeight = richerHeight
+                    sourceTop = 0
+                    segmentBands = viewportBandsToSegment(mediaBands, 0, richerHeight)
+                    preserveStickyFrame = true
+                    pendingSticky = richer.signature
                 }
 
                 if (relation === 'empty') {
@@ -671,7 +686,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
 
                     continue
                 }
-                else if (relation === 'keep' || relation === 'drop-same') {
+                else if (relation === 'keep') {
                     const richer = await captureRicherStickyFrame(page, signature, viewport)
                     const richerHeight = (await sharp(richer.image).metadata()).height ?? segmentHeight
 
@@ -1201,6 +1216,25 @@ function buildDecorativeMask(rects: ViewportRect[], viewportWidth: number, viewp
  * @param viewportHeight 擷取視窗高度。
  * @returns 有內容的接縫重複時為 true。
  */
+function mostlyWhiteBand(slice: Buffer): boolean
+{
+    if (slice.length < 3) return true
+
+    let white = 0
+    let count = 0
+
+    for (let index = 0; index < slice.length; index += 3) {
+        const luma = (slice[index] ?? 0) * 0.3
+            + (slice[index + 1] ?? 0) * 0.59
+            + (slice[index + 2] ?? 0) * 0.11
+
+        count += 1
+        if (luma >= 246) white += 1
+    }
+
+    return count === 0 || white / count >= 0.92
+}
+
 export async function hasRepeatedOverlapSeam(
     image: Buffer,
     width: number,
@@ -1231,6 +1265,7 @@ export async function hasRepeatedOverlapSeam(
 
         if (before.length !== after.length || before.length === 0) continue
         if (rowSliceVariance(before) < OVERLAP_SEAM_MIN_VARIANCE) continue
+        if (mostlyWhiteBand(before) && mostlyWhiteBand(after)) continue
         if (visualDifference(before, after) > OVERLAP_SEAM_THRESHOLD) continue
 
         // 整段 sticky 場景會讓接縫前後都長一樣，而且再往下仍一樣。
