@@ -456,17 +456,16 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
     })
 
     it('trims a pixel-identical band when identity is required', async () => {
-        const band = await stripePng(180)
+        const belt = await photoBeltPng(200)
         const page = await stackPngs([
-            await solidPng('#f8f5ef', 220),
-            band,
-            band,
-            await solidPng('#f8f5ef', 220),
+            await uniquePhotoPng(400),
+            belt,
+            belt,
         ])
         const trimmed = await trimRepeatedTailBand(page, WIDTH, { identicalRows: true })
         const height = (await sharp(trimmed).metadata()).height ?? 0
 
-        expect(height).toBeLessThan(800)
+        expect(height).toBeLessThan(750)
         expect(height).toBeGreaterThan(500)
     })
 
