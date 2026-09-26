@@ -877,7 +877,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         throw new Error('完整頁面合成後的尺寸與穩定頁面尺寸不一致')
     }
 
-    const trimmed = singleScreen
+    let trimmed = singleScreen
         ? fullPage
         : await trimRepeatedTailBand(
             fullPage,
@@ -886,8 +886,23 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
                 ? { viewportTiles: true }
                 : { identicalRows: true, protectedBands },
         )
-    const trimmedMeta = await sharp(trimmed).metadata()
-    const imageHeight = trimmedMeta.height ?? 0
+    let trimmedMeta = await sharp(trimmed).metadata()
+    let imageHeight = trimmedMeta.height ?? 0
+
+    if (!hasVirtualCanvas && imageHeight > finalHeight + DOCUMENT_HEIGHT_TOLERANCE_PX) {
+        const absorbed = await absorbStrictWhiteOvershoot(
+            trimmed,
+            dimensions.width,
+            imageHeight - finalHeight,
+            protectedBands,
+        )
+
+        if (absorbed) {
+            trimmed = absorbed
+            trimmedMeta = await sharp(trimmed).metadata()
+            imageHeight = trimmedMeta.height ?? 0
+        }
+    }
 
     if (trimmedMeta.width !== dimensions.width) {
         throw new Error('完整頁面合成後的尺寸與穩定頁面尺寸不一致')
@@ -1823,6 +1838,18 @@ async function settleScrollScrubbedFrame(page: import('playwright').Page): Promi
             return smaller > 0 ? (width * height) / smaller : 0
         }
 
+        function coverageOf(target: DOMRect, other: DOMRect): number
+        {
+            const width = Math.min(target.right, other.right) - Math.max(target.left, other.left)
+            const height = Math.min(target.bottom, other.bottom) - Math.max(target.top, other.top)
+
+            if (width <= 0 || height <= 0) return 0
+
+            const area = target.width * target.height
+
+            return area > 0 ? (width * height) / area : 0
+        }
+
         function shouldForceHiddenText(target: ScrubTarget): boolean
         {
             const text = target.element.textContent?.replace(/\s+/g, ' ').trim() ?? ''
@@ -1837,7 +1864,8 @@ async function settleScrollScrubbedFrame(page: import('playwright').Page): Promi
             const peers = fades.filter(other => {
                 if (other.element === target.element) return false
                 if (!scope.contains(other.element)) return false
-                if (overlapRatio(target.bounds, other.bounds) <= 0.3) return false
+                // 只跟蓋住這一句大部分面積的另一句競爭。滑進標題角落的專案名稱不是交叉淡化。
+                if (coverageOf(target.bounds, other.bounds) <= 0.3) return false
 
                 const otherText = other.element.textContent?.replace(/\s+/g, ' ').trim() ?? ''
 
@@ -3176,9 +3204,15 @@ async function readUncroppedMediaBands(page: import('playwright').Page): Promise
         const bands: MediaBand[] = []
 
         const consider = (element: Element) => {
-            const style = getComputedStyle(element)
+            let current: Element | null = element
 
-            if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return
+            while (current && current !== document.body) {
+                const style = getComputedStyle(current)
+
+                if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) < 0.8) return
+
+                current = current.parentElement
+            }
 
             const bounds = element.getBoundingClientRect()
 
@@ -3688,6 +3722,92 @@ export async function stickyBlankEdges(
  * @param slice 一列 RGB。
  * @returns 平均亮度很高時為 true。
  */
+/**
+ * 整幀 sticky 比文件行程多出來的高度，只從最長的純白縫收回。
+ * 至少留下 24px，避免把刻意留白刪光。沒有夠長的純白縫就保持失敗。
+ *
+ * @param image 已拼接的頁面。
+ * @param width 頁面寬度。
+ * @param excess 高出文件的像素。
+ * @param protectedBands 圖片與輪播盒子，純白縫若落在裡面就不砍。
+ * @returns 收回後的頁面；收不回來時為 null。
+ */
+export async function absorbStrictWhiteOvershoot(
+    image: Buffer,
+    width: number,
+    excess: number,
+    protectedBands: MediaBand[] = [],
+): Promise<Buffer | null>
+{
+    if (excess <= 0) return image
+
+    const height = (await sharp(image).metadata()).height ?? 0
+
+    if (height <= excess + 24) return null
+
+    const sampleWidth = Math.min(64, width)
+    const raw = await sharp(image)
+        .resize(sampleWidth, height, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+    const rowBytes = sampleWidth * 3
+    let bestStart = -1
+    let bestLength = 0
+    let runStart = 0
+    let runLength = 0
+
+    const blocked = (row: number): boolean => protectedBands.some(band => row >= band.top && row < band.bottom)
+
+    const closeRun = (end: number): void => {
+        if (runLength > bestLength && runLength >= excess + 24) {
+            bestStart = runStart
+            bestLength = runLength
+        }
+
+        runLength = 0
+        runStart = end
+    }
+
+    for (let row = 0; row < height; row += 1) {
+        const slice = raw.subarray(row * rowBytes, (row + 1) * rowBytes)
+        const open = isNearWhiteRow(slice) && !blocked(row)
+
+        if (open) {
+            if (runLength === 0) runStart = row
+            runLength += 1
+        }
+        else if (runLength > 0) closeRun(row)
+    }
+
+    if (runLength > 0) closeRun(height)
+
+    if (bestStart < 0 || bestLength < excess + 24) return null
+
+    const cutAt = bestStart + Math.floor((bestLength - excess) / 2)
+    const head = await sharp(image).extract({ height: cutAt, left: 0, top: 0, width }).png().toBuffer()
+    const tailHeight = height - (cutAt + excess)
+    const tail = await sharp(image)
+        .extract({ height: tailHeight, left: 0, top: cutAt + excess, width })
+        .png()
+        .toBuffer()
+
+    return sharp({
+        create: {
+            background: '#ffffff',
+            channels: 3,
+            height: cutAt + tailHeight,
+            width,
+        },
+    })
+        .composite([
+            { input: head, left: 0, top: 0 },
+            { input: tail, left: 0, top: cutAt },
+        ])
+        .png()
+        .toBuffer()
+}
+
 function isNearWhiteRow(slice: Buffer): boolean
 {
     if (slice.length < 3) return true

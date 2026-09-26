@@ -7,6 +7,7 @@ import {
     looksLikeFullColumnWipe,
     looksLikeVerticalWipe,
     rowSliceVariance,
+    absorbStrictWhiteOvershoot,
     relateStickySignatures,
     stickyDuplicatePrefixLength,
     trimDuplicateScenePrefix,
@@ -630,6 +631,26 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
         await expect(stickyDuplicatePrefixLength(blank, kept, WIDTH)).resolves.toBe(864)
         await expect(stickyDuplicatePrefixLength(blue, kept, WIDTH)).resolves.toBe(0)
         await expect(stickyDuplicatePrefixLength(fresh, kept, WIDTH)).resolves.toBe(200)
+    })
+
+    it('pays a full-frame overlap back from one strict-white gap', async () => {
+        const page = await stackPngs([
+            await solidPng('#dc2626', 80),
+            await solidPng('#ffffff', 400),
+            await solidPng('#315ceb', 80),
+        ])
+        const shrunk = await absorbStrictWhiteOvershoot(page, WIDTH, 216)
+
+        expect(shrunk).not.toBeNull()
+        expect((await sharp(shrunk ?? page).metadata()).height).toBe(344)
+
+        const raw = await sharp(shrunk ?? page).removeAlpha().raw().toBuffer()
+        const rowBytes = WIDTH * 3
+
+        expect(raw[0]).toBe(220)
+        expect(raw[(344 * rowBytes) - 3]).toBe(49)
+        await expect(absorbStrictWhiteOvershoot(await solidPng('#315ceb', 400), WIDTH, 50)).resolves.toBeNull()
+        await expect(absorbStrictWhiteOvershoot(await solidPng('#ffffff', 200), WIDTH, 216)).resolves.toBeNull()
     })
 })
 
