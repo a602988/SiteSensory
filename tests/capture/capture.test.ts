@@ -731,6 +731,24 @@ describe('capture worker', { timeout: 60_000 }, () => {
         expect(await samplePixel(fullPage, 200, 2000)).toEqual([168, 85, 247])
         expect(await samplePixel(fullPage, 200, 4200)).toEqual([34, 197, 94])
     })
+
+    it('keeps a sticky pin label once while later states stay in the image', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?stickyPinLabel=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(height).toBeGreaterThan(2800)
+        expect(await samplePixel(fullPage, 40, 480)).toEqual([220, 38, 38])
+        expect(await samplePixel(fullPage, 40, 2200)).not.toEqual([220, 38, 38])
+        expect(await samplePixel(fullPage, 800, 2200)).toEqual([34, 197, 94])
+        expect(await samplePixel(fullPage, 800, 3000)).toEqual([168, 85, 247])
+    })
 })
 
 /**
@@ -773,6 +791,7 @@ function createFixtureServer(): Server
         const loopingHero = parameters.has('loopingHero')
         const animatedSection = parameters.has('animatedSection')
         const scrollRebound = parameters.has('scrollRebound')
+        const stickyPinLabel = parameters.has('stickyPinLabel')
 
         if (loopingHero) {
             const html = `<!doctype html>
@@ -855,6 +874,32 @@ addEventListener('scroll', () => {
   armed = false
   scrollTo(0, top + 367)
 })
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (stickyPinLabel) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Sticky Pin Label Fixture</title></head>
+<body style="margin:0;background:#f8f5ef">
+<section style="height:3240px">
+<div style="position:sticky;top:0;height:1080px">
+<div id="stage" style="position:absolute;inset:0;background:#315ceb"></div>
+<div style="position:absolute;left:0;top:400px;width:220px;height:180px;background:#dc2626"></div>
+</div>
+</section>
+<script>
+const stage = document.querySelector('#stage')
+const paint = () => {
+  stage.style.background = scrollY < 900 ? '#315ceb' : scrollY < 1800 ? '#22c55e' : '#a855f7'
+}
+addEventListener('scroll', paint)
+paint()
 </script>
 </body></html>`
 

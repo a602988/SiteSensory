@@ -29,6 +29,9 @@ const STICKY_CHROME_MIN_WIDTH_RATIO = 0.5
 const STICKY_CHROME_TOP_MAX_PX = 80
 const STICKY_SIDE_MAX_WIDTH_RATIO = 0.4
 const STICKY_SIDE_MIN_HEIGHT_RATIO = 0.2
+const STICKY_PIN_LABEL_MAX_WIDTH_RATIO = 0.45
+const STICKY_PIN_LABEL_MAX_HEIGHT_RATIO = 0.55
+const STICKY_PIN_LABEL_SIDE_RATIO = 0.22
 const STICKY_CHROME_SIDE_MAX_PX = 80
 const SCENE_TRIM_MAX_RATIO = 0.8
 const SCENE_TRIM_CONTINUE_RATIO = 0.75
@@ -181,6 +184,9 @@ export async function capturePage(options: CaptureOptions): Promise<CapturedPage
                 }
                 [${OVERLAY_ATTRIBUTE}] {
                     display: none !important;
+                }
+                [data-sitesensory-repeat-label] {
+                    visibility: hidden !important;
                 }
             `,
         })
@@ -510,6 +516,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             document.documentElement.toggleAttribute(hideFixedAttribute, scrollTop > 0)
         }, { hideFixedAttribute: HIDE_FIXED_ATTRIBUTE, scrollTop: target })
         await scrollPageToAndHold(page, target)
+        await hideRepeatedStickyPinLabels(page)
         let settled = await settleVisibleViewport(page)
         let acceptedNudge = false
 
@@ -1165,6 +1172,64 @@ async function markFixedElements(page: import('playwright').Page): Promise<boole
         shellRatio: SCROLL_SHELL_HEIGHT_RATIO,
         sideMaxWidthRatio: STICKY_SIDE_MAX_WIDTH_RATIO,
         sideMinHeightRatio: STICKY_SIDE_MIN_HEIGHT_RATIO,
+    })
+}
+
+/**
+ * 滿視窗的 sticky 場景要留下預留高度，但裡面靠左或靠右、又比視窗窄的
+ * 絕對定位標題會在每一段再畫一次。第一次看到該場景時留下標題，之後藏起來。
+ *
+ * @param page 已捲到此段的 Playwright 頁面。
+ * @returns 標記完成後結束。
+ */
+async function hideRepeatedStickyPinLabels(page: import('playwright').Page): Promise<void>
+{
+    await page.evaluate(options => {
+        for (const node of document.querySelectorAll(`[${options.labelAttribute}]`)) {
+            node.removeAttribute(options.labelAttribute)
+        }
+
+        for (const element of document.body.querySelectorAll<HTMLElement>('*')) {
+            const style = getComputedStyle(element)
+
+            if (style.position !== 'sticky') continue
+
+            const bounds = element.getBoundingClientRect()
+
+            if (bounds.height < window.innerHeight * options.pinCoverage) continue
+            if (bounds.width < window.innerWidth * options.pinCoverage) continue
+            if (bounds.bottom <= 0 || bounds.top >= window.innerHeight) continue
+
+            if (!element.hasAttribute(options.seenAttribute)) {
+                element.setAttribute(options.seenAttribute, '')
+                continue
+            }
+
+            for (const child of element.querySelectorAll<HTMLElement>('*')) {
+                const childStyle = getComputedStyle(child)
+
+                if (childStyle.position !== 'absolute' && childStyle.position !== 'sticky') continue
+
+                const childBounds = child.getBoundingClientRect()
+
+                if (childBounds.width < 24 || childBounds.height < 24) continue
+                if (childBounds.width >= window.innerWidth * options.labelMaxWidthRatio) continue
+                if (childBounds.height >= window.innerHeight * options.labelMaxHeightRatio) continue
+                if (childBounds.bottom <= 0 || childBounds.top >= window.innerHeight) continue
+
+                const onSide = childBounds.left <= window.innerWidth * options.labelSideRatio
+                    || childBounds.right >= window.innerWidth * (1 - options.labelSideRatio)
+
+                if (onSide) child.setAttribute(options.labelAttribute, '')
+            }
+        }
+    }, {
+        labelAttribute: 'data-sitesensory-repeat-label',
+        labelMaxHeightRatio: STICKY_PIN_LABEL_MAX_HEIGHT_RATIO,
+        labelMaxWidthRatio: STICKY_PIN_LABEL_MAX_WIDTH_RATIO,
+        labelSideRatio: STICKY_PIN_LABEL_SIDE_RATIO,
+        pinCoverage: FIXED_CANVAS_COVERAGE_RATIO,
+        seenAttribute: 'data-sitesensory-pin-seen',
     })
 }
 
