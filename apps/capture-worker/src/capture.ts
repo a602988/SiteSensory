@@ -573,7 +573,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             if (stillDirty && laterCovers && !hasVirtualCanvas) continue
         }
 
-        const actualScroll = acceptedNudge
+        let actualScroll = acceptedNudge
             ? await readDocumentScroll(page)
             : await scrollPageToAndHold(page, target)
 
@@ -581,10 +581,11 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             throw new Error(`網站將 ${target}px 的擷取位置改到 ${actualScroll}px，無法產生無缺口的完整頁面`)
         }
 
-        const documentStart = hasVirtualCanvas ? actualScroll : Math.max(actualScroll, documentCoveredUntil)
-        const documentEnd = Math.min(actualScroll + dimensions.viewportHeight, dimensions.height)
+        let documentStart = hasVirtualCanvas ? actualScroll : Math.max(actualScroll, documentCoveredUntil)
+        let documentEnd = Math.min(actualScroll + dimensions.viewportHeight, dimensions.height)
         let sourceTop = hasVirtualCanvas ? 0 : documentStart - actualScroll
         let segmentHeight = hasVirtualCanvas ? dimensions.viewportHeight : documentEnd - documentStart
+        let viewport = settled.image
 
         if (segmentHeight <= 0) {
             const uncovered = dimensions.height - documentCoveredUntil
@@ -601,10 +602,25 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
 
             if (laterCanPass && windowAlreadyCovered) continue
 
-            throw new Error(`無法擷取頁面 ${target}px 到 ${target + dimensions.viewportHeight}px 的區段`)
-        }
+            for (let retry = 0; retry < 4 && segmentHeight <= 0; retry += 1) {
+                await page.waitForTimeout(400)
+                const landed = await scrollPageToAndHold(page, target)
 
-        const viewport = settled.image
+                if (landed + dimensions.viewportHeight <= documentCoveredUntil + DOCUMENT_HEIGHT_TOLERANCE_PX) continue
+
+                await freezeExpandingBoxes(page)
+                viewport = await screenshotViewport(page, 'allow')
+                actualScroll = landed
+                documentStart = hasVirtualCanvas ? actualScroll : Math.max(actualScroll, documentCoveredUntil)
+                documentEnd = Math.min(actualScroll + dimensions.viewportHeight, dimensions.height)
+                sourceTop = hasVirtualCanvas ? 0 : documentStart - actualScroll
+                segmentHeight = hasVirtualCanvas ? dimensions.viewportHeight : documentEnd - documentStart
+            }
+
+            if (segmentHeight <= 0) {
+                throw new Error(`無法擷取頁面 ${target}px 到 ${target + dimensions.viewportHeight}px 的區段（實際 ${actualScroll}px，已覆蓋到 ${documentCoveredUntil}px）`)
+            }
+        }
 
         if (!hasVirtualCanvas && !singleScreen) {
             const stacked = await readStackedFadeSection(page)
