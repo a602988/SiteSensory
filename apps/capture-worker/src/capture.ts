@@ -670,6 +670,61 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             }
         }
 
+        const pinnedStart = !hasVirtualCanvas && !singleScreen && viewport
+            ? await readUnreadablePinnedSectionStart(page)
+            : null
+
+        if (
+            pinnedStart !== null
+            && viewport
+            && pinnedStart > documentStart + 24
+            && pinnedStart < documentEnd - 24
+        ) {
+            const landed = await scrollPageToAndHold(page, pinnedStart)
+
+            if (landed >= pinnedStart - DOCUMENT_HEIGHT_TOLERANCE_PX) {
+                const lead = pinnedStart - documentStart
+                const leadImage = await sharp(viewport)
+                    .extract({
+                        height: lead,
+                        left: 0,
+                        top: sourceTop,
+                        width: dimensions.width,
+                    })
+                    .png()
+                    .toBuffer()
+
+                segments.push({ input: leadImage, left: 0, top: outputHeight })
+                keptSegments.push(leadImage)
+                outputHeight += lead
+
+                await freezeExpandingBoxes(page)
+                const frame = await screenshotViewport(page, 'allow')
+                const room = Math.min(dimensions.viewportHeight, Math.max(1, dimensions.height - landed))
+                const frameImage = room < dimensions.viewportHeight
+                    ? await sharp(frame)
+                        .extract({
+                            height: room,
+                            left: 0,
+                            top: 0,
+                            width: dimensions.width,
+                        })
+                        .png()
+                        .toBuffer()
+                    : frame
+
+                segments.push({ input: frameImage, left: 0, top: outputHeight })
+                keptSegments.push(frameImage)
+                outputHeight += room
+                recentTail = frameImage
+                documentCoveredUntil = Math.max(documentCoveredUntil, landed + room)
+                stickyHold = await readStickySignature(page)
+                continue
+            }
+
+            await scrollPageToAndHold(page, actualScroll)
+        }
+
         const mediaBands = hasVirtualCanvas ? [] : await readUncroppedMediaBands(page)
         let segment: Buffer | null = await sharp(viewport)
             .extract({
@@ -997,8 +1052,10 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         }
     }
 
-    if (await hasRepeatedOverlapSeam(trimmed, dimensions.width, dimensions.viewportHeight)) {
-        throw new Error('拼接接縫以重疊步進重複同一段內容，拒絕保存')
+    const overlapSeam = await hasRepeatedOverlapSeam(trimmed, dimensions.width, dimensions.viewportHeight)
+
+    if (overlapSeam > 0) {
+        throw new Error(`拼接接縫以重疊步進重複同一段內容，拒絕保存（y=${overlapSeam}）`)
     }
 
     return trimmed
@@ -1252,19 +1309,19 @@ function buildDecorativeMask(rects: ViewportRect[], viewportWidth: number, viewp
  * @param image 拼接後的完整頁面。
  * @param width 圖片寬度。
  * @param viewportHeight 擷取視窗高度。
- * @returns 有內容的接縫重複時為 true。
+ * @returns 重複接縫的 y；沒有時為 0。
  */
 export async function hasRepeatedOverlapSeam(
     image: Buffer,
     width: number,
     viewportHeight: number,
-): Promise<boolean>
+): Promise<number>
 {
     const metadata = await sharp(image).metadata()
     const height = metadata.height ?? 0
     const overlap = Math.max(Math.round(viewportHeight * (1 - CAPTURE_STEP_RATIO)), 1)
 
-    if (height < viewportHeight + overlap || width <= 0) return false
+    if (height < viewportHeight + overlap || width <= 0) return 0
 
     for (let seam = viewportHeight; seam + overlap <= height; seam += viewportHeight) {
         const [before, after] = await Promise.all([
@@ -1284,6 +1341,7 @@ export async function hasRepeatedOverlapSeam(
 
         if (before.length !== after.length || before.length === 0) continue
         if (rowSliceVariance(before) < OVERLAP_SEAM_MIN_VARIANCE) continue
+        if (!bandHasVisualStructure(before)) continue
         if (visualDifference(before, after) > OVERLAP_SEAM_THRESHOLD) continue
 
         // 整段 sticky 場景會讓接縫前後都長一樣，而且再往下仍一樣。
@@ -1298,7 +1356,7 @@ export async function hasRepeatedOverlapSeam(
 
             if (visualDifference(after, following) <= OVERLAP_SEAM_THRESHOLD) continue
 
-            return true
+            return seam
         }
 
         if (seam - overlap * 2 >= 0) {
@@ -1312,10 +1370,10 @@ export async function hasRepeatedOverlapSeam(
             if (visualDifference(preceding, before) <= OVERLAP_SEAM_THRESHOLD) continue
         }
 
-        return true
+        return seam
     }
 
-    return false
+    return 0
 }
 
 /**
@@ -1478,6 +1536,13 @@ async function markFixedElements(page: import('playwright').Page): Promise<boole
 async function parkPointer(page: import('playwright').Page): Promise<void>
 {
     await page.mouse.move(-80, -80).catch(() => undefined)
+    await page.evaluate(() => {
+        window.dispatchEvent(new MouseEvent('mousemove', {
+            bubbles: true,
+            clientX: -200,
+            clientY: -200,
+        }))
+    }).catch(() => undefined)
 }
 
 /**
@@ -1527,6 +1592,7 @@ async function hideCustomCursorFollowers(page: import('playwright').Page): Promi
             if (!decorative && !systemCursorHidden) continue
 
             element.setAttribute(attribute, '')
+            element.style.setProperty('visibility', 'hidden', 'important')
         }
     }, CURSOR_FOLLOWER_ATTRIBUTE)
 }
@@ -1772,6 +1838,12 @@ async function settleScrollScrubbedFrame(page: import('playwright').Page): Promi
             if (bounds.width < 8 || bounds.height < 8) continue
             if (style.display === 'none' || style.visibility === 'hidden') continue
 
+            const scale = uniformScale(style.transform)
+            const shrunkHeading = heading
+                && scale !== null
+                && scale < 0.92
+                && scale > 0.05
+                && Number(style.opacity) >= 0.85
             const target: ScrubTarget = {
                 blur: blurAmount(style.filter),
                 bounds,
@@ -1780,6 +1852,8 @@ async function settleScrollScrubbedFrame(page: import('playwright').Page): Promi
                 midScale: scaleIsMid(style.transform),
                 opacity: Number(style.opacity),
             }
+
+            if (shrunkHeading) element.setAttribute(options.settled, '')
             const area = bounds.width * bounds.height
             const textual = inlineOpacity || inlineFilter || inlineClip || computedReveal
 
@@ -1900,11 +1974,11 @@ async function settleScrollScrubbedFrame(page: import('playwright').Page): Promi
             return { x, y }
         }
 
-        function scaleIsMid(transform: string): boolean
+        function uniformScale(transform: string): number | null
         {
             const match = transform.match(/matrix\(\s*([^)]+)\)/u)
 
-            if (!match?.[1]) return false
+            if (!match?.[1]) return null
 
             const parts = match[1].split(',').map(value => Number.parseFloat(value))
             const a = parts[0]
@@ -1912,13 +1986,21 @@ async function settleScrollScrubbedFrame(page: import('playwright').Page): Promi
             const c = parts[2]
             const d = parts[3]
 
-            if (a === undefined || b === undefined || c === undefined || d === undefined) return false
+            if (a === undefined || b === undefined || c === undefined || d === undefined) return null
 
             const scaleX = Math.hypot(a, b)
             const scaleY = Math.hypot(c, d)
-            const scale = Math.min(scaleX, scaleY)
 
-            return Math.abs(scaleX - scaleY) < 0.08 && scale > 0.35 && scale < 0.94
+            if (Math.abs(scaleX - scaleY) > 0.08) return null
+
+            return Math.min(scaleX, scaleY)
+        }
+
+        function scaleIsMid(transform: string): boolean
+        {
+            const scale = uniformScale(transform)
+
+            return scale !== null && scale > 0.35 && scale < 0.94
         }
 
         function clipIsOpen(clip: string, elementHeight: number): boolean
@@ -3341,13 +3423,17 @@ async function readUncroppedMediaBands(page: import('playwright').Page): Promise
             const bounds = node.getBoundingClientRect()
             const scrolling = (style.overflowX === 'auto' || style.overflowX === 'scroll')
                 && node.scrollWidth > node.clientWidth + 24
-            const images = node.querySelectorAll('img, video')
+            const images = [...node.querySelectorAll<HTMLElement>('img, video')]
             const row = images.length >= 2
                 && bounds.height >= 120
                 && bounds.height <= window.innerHeight * 0.95
                 && bounds.width >= window.innerWidth * 0.6
+            const imageBounds = images.map(image => image.getBoundingClientRect())
+            // 一排很小的 logo 不是照片帶。保護它會讓同一組 logo 的揭示各留一幀。
+            const logoGrid = imageBounds.length >= 4
+                && imageBounds.every(item => item.height > 0 && item.height < 96 && item.width < 320)
 
-            if (scrolling || row) consider(node)
+            if ((scrolling || row) && !logoGrid) consider(node)
         }
 
         return bands
@@ -3623,6 +3709,68 @@ async function readStickySignature(page: import('playwright').Page): Promise<Sti
 
             return true
         }
+    })
+}
+
+/**
+ * 這段即將寫進區段起點，但區段裡的大標題還沒進畫面或還沒可讀。
+ * 這種標題若等下一個擷取步進，通常已經縮到重疊帶裡，長圖就會留下空白。
+ *
+ * @param page 停在目前擷取位置的頁面。
+ * @returns 應改從這裡重截的文件座標；沒有時為 null。
+ */
+async function readUnreadablePinnedSectionStart(page: import('playwright').Page): Promise<number | null>
+{
+    return page.evaluate(() => {
+        let best: number | null = null
+
+        for (const node of document.querySelectorAll<HTMLElement>('h1, h2')) {
+            const text = node.textContent?.replace(/\s+/g, ' ').trim() ?? ''
+
+            if (text.length < 2) continue
+
+            let pin: HTMLElement | null = node.parentElement
+
+            while (pin && pin !== document.body && getComputedStyle(pin).position !== 'sticky') {
+                pin = pin.parentElement
+            }
+
+            if (!pin || pin === document.body) continue
+
+            const style = getComputedStyle(node)
+            const bounds = node.getBoundingClientRect()
+            const opacity = Number(style.opacity)
+            const blurMatch = style.filter.match(/blur\(\s*([0-9.]+)px\s*\)/iu)
+            const blur = blurMatch?.[1] ? Number.parseFloat(blurMatch[1]) : 0
+            const matrix = style.transform.match(/matrix\(\s*([^)]+)\)/u)
+            const parts = matrix?.[1]?.split(',').map(value => Number.parseFloat(value)) ?? []
+            const scaleX = parts.length >= 2 ? Math.hypot(parts[0] ?? 1, parts[1] ?? 0) : 1
+            const onScreen = bounds.bottom > 8 && bounds.top < window.innerHeight - 8 && bounds.height > 8
+            const readable = onScreen && opacity >= 0.9 && blur <= 0.6 && scaleX >= 0.9
+
+            if (readable) continue
+
+            let section: HTMLElement | null = pin.parentElement
+
+            while (
+                section
+                && section !== document.body
+                && section.offsetHeight < window.innerHeight * 1.05
+            ) {
+                section = section.parentElement
+            }
+
+            const host = section && section !== document.body ? section : pin
+            const start = Math.round(host.getBoundingClientRect().top + window.scrollY)
+
+            if (start <= window.scrollY + 24) continue
+            if (start >= window.scrollY + window.innerHeight - 24) continue
+            if (best !== null && start >= best) continue
+
+            best = start
+        }
+
+        return best
     })
 }
 
@@ -5843,6 +5991,36 @@ export async function isSamePinnedScene(previous: Buffer, next: Buffer, width: n
  * @param slice 連續列的 RGB 資料。
  * @returns 介於 0 與 1 的平均空間變異。
  */
+/**
+ * 幾乎純色的帶不算拼接重複。少數亮點會把變異數抬過門檻，但畫面仍是暗邊或留白。
+ *
+ * @param slice 一段 RGB 像素。
+ * @returns 有足夠多像素偏離平均亮度時為 true。
+ */
+function bandHasVisualStructure(slice: Buffer): boolean
+{
+    const pixels = Math.floor(slice.length / 3)
+
+    if (pixels === 0) return false
+
+    let mean = 0
+
+    for (let index = 0; index < pixels * 3; index += 3) {
+        mean += ((slice[index] ?? 0) + (slice[index + 1] ?? 0) + (slice[index + 2] ?? 0)) / 3
+    }
+
+    mean /= pixels
+    let outliers = 0
+
+    for (let index = 0; index < pixels * 3; index += 3) {
+        const luma = ((slice[index] ?? 0) + (slice[index + 1] ?? 0) + (slice[index + 2] ?? 0)) / 3
+
+        if (Math.abs(luma - mean) > 18) outliers += 1
+    }
+
+    return outliers / pixels >= 0.08
+}
+
 export function rowSliceVariance(slice: Buffer): number
 {
     if (slice.length < 3) return 0

@@ -24,9 +24,9 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
         const distinct = await hasRepeatedOverlapSeam(await seamImage(false), WIDTH, 1080)
         const flat = await hasRepeatedOverlapSeam(await solidPng('#22c55e', 1080 + 216), WIDTH, 1080)
 
-        expect(repeated).toBe(true)
-        expect(distinct).toBe(false)
-        expect(flat).toBe(false)
+        expect(repeated).toBeGreaterThan(0)
+        expect(distinct).toBe(0)
+        expect(flat).toBe(0)
     })
 
     it('treats a saturated solid color as zero spatial variance', () => {

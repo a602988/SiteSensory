@@ -842,6 +842,37 @@ describe('capture worker', { timeout: 60_000 }, () => {
         expect(height).toBeLessThan(1800)
         expect(await countPixels(fullPage, [17, 24, 39])).toBeGreaterThan(8_000)
     }, 120_000)
+
+    it('writes a pinned heading from the scroll where it is readable', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?pinnedHeading=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+
+        expect(await countPixels(fullPage, [220, 38, 38])).toBeGreaterThan(20_000)
+    }, 120_000)
+
+    it('keeps one frame when a logo grid reveals inside a tall row', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?logoGrid=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+        const ink = await countPixels(fullPage, [17, 24, 39])
+
+        expect(height).toBeGreaterThan(900)
+        expect(height).toBeLessThan(2_000)
+        expect(ink).toBeGreaterThan(4_000)
+        expect(ink).toBeLessThan(30_000)
+    }, 120_000)
 })
 
 /**
@@ -889,6 +920,8 @@ function createFixtureServer(): Server
         const scaleScene = parameters.has('scaleScene')
         const customCursor = parameters.has('customCursor')
         const stackedFade = parameters.has('stackedFade')
+        const pinnedHeading = parameters.has('pinnedHeading')
+        const logoGrid = parameters.has('logoGrid')
 
         if (scrubHeading) {
             const html = `<!doctype html>
@@ -929,6 +962,71 @@ const card = document.querySelector('#card')
 const paint = () => {
   const progress = Math.min(1, (window.scrollY || 0) / 2000)
   card.style.transform = 'scale(' + (0.55 + 0.45 * progress).toFixed(3) + ')'
+}
+addEventListener('scroll', paint)
+paint()
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (pinnedHeading) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Pinned Heading Fixture</title></head>
+<body style="margin:0;background:#f8f5ef">
+<section style="height:1500px;background:#f8f5ef"></section>
+<section style="height:2200px;background:#ffffff">
+<div style="position:sticky;top:0;height:1080px;background:#ffffff">
+<h2 id="title" style="position:absolute;left:80px;top:760px;width:640px;height:180px;margin:0;background:#dc2626;opacity:0">Our Projects</h2>
+</div>
+</section>
+<script>
+const title = document.querySelector('#title')
+const start = 1500
+const paint = () => {
+  const scroll = window.scrollY || 0
+  if (scroll < start) {
+    title.style.opacity = '0'
+    title.style.transform = 'none'
+  } else if (scroll < start + 180) {
+    title.style.opacity = '1'
+    title.style.transform = 'none'
+  } else {
+    title.style.opacity = '1'
+    title.style.transform = 'translateY(-900px) scale(0.3)'
+  }
+}
+addEventListener('scroll', paint)
+paint()
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (logoGrid) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Logo Grid Fixture</title></head>
+<body style="margin:0;background:#ffffff">
+<section style="height:3200px">
+<div style="position:sticky;top:0;height:1080px;background:#ffffff">
+<h2 style="margin:72px 0 0 80px;font-size:64px">Partners</h2>
+<div id="grid" style="position:absolute;left:40px;top:280px;width:1800px;height:720px;opacity:0">
+${Array.from({ length: 8 }, (_, index) => `<img alt="" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" style="position:absolute;left:${(index % 4) * 200}px;top:${Math.floor(index / 4) * 80}px;width:120px;height:28px"><span style="display:inline-block;width:120px;height:28px;margin:24px;background:#111827"></span>`).join('')}
+</div>
+</div>
+</section>
+<script>
+const grid = document.querySelector('#grid')
+const paint = () => {
+  grid.style.opacity = window.scrollY > 700 ? '1' : '0'
 }
 addEventListener('scroll', paint)
 paint()
