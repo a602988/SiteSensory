@@ -525,6 +525,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
     let documentCoveredUntil = 0
     let outputHeight = 0
     let previousSignature: Buffer | null = null
+    let recentTail: Buffer | null = null
     let trimmedPixels = 0
     const protectedBands: MediaBand[] = []
 
@@ -533,6 +534,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             document.documentElement.toggleAttribute(hideFixedAttribute, scrollTop > 0)
         }, { hideFixedAttribute: HIDE_FIXED_ATTRIBUTE, scrollTop: target })
         await scrollPageToAndHold(page, target)
+        await freezeExpandingBoxes(page)
         await settleScrollScrubbedFrame(page)
         await hideRepeatedStickyPinLabels(page, Math.max(0, documentCoveredUntil - target))
         let settled = await settleVisibleViewport(page)
@@ -601,6 +603,17 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             })
             .toBuffer()
         let segmentBands = viewportBandsToSegment(mediaBands, sourceTop, segmentHeight)
+
+        if (segment && !hasVirtualCanvas && recentTail && await stickyPinCoversViewport(page)) {
+            const repeatsKeptScene = segmentBands.every(band => band.bottom - band.top < 40)
+                && await stickySegmentRepeatsKeptScene(segment, recentTail, dimensions.width)
+
+            if (repeatsKeptScene) {
+                trimmedPixels += Math.max(0, documentEnd - documentCoveredUntil)
+                documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
+                continue
+            }
+        }
 
         if (!hasVirtualCanvas) {
             const previous = keptSegments.at(-1)
@@ -681,6 +694,10 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
 
         segments.push({ input: segment, left: 0, top: outputHeight })
         keptSegments.push(segment)
+
+        if (!hasVirtualCanvas) {
+            recentTail = await rememberRecentScene(recentTail, segment, dimensions.width, dimensions.viewportHeight)
+        }
 
         if (!hasVirtualCanvas) {
             for (const band of segmentBands) {
@@ -1270,6 +1287,159 @@ async function hideCustomCursorFollowers(page: import('playwright').Page): Promi
 }
 
 /**
+ * 蓋滿視窗的 sticky 場景。這種畫面的新列若只是同一幀的空白或複本，
+ * 不能再往下接一截。
+ *
+ * @param page Playwright 頁面。
+ * @returns 有 sticky 層同時蓋住寬高約 85% 時為 true。
+ */
+async function stickyPinCoversViewport(page: import('playwright').Page): Promise<boolean>
+{
+    return page.evaluate(() => {
+        for (const element of document.body.querySelectorAll<HTMLElement>('*')) {
+            const style = getComputedStyle(element)
+
+            if (style.position !== 'sticky') continue
+            if (style.visibility === 'hidden' || Number(style.opacity) < 0.2) continue
+
+            const bounds = element.getBoundingClientRect()
+
+            if (bounds.width < window.innerWidth * 0.85 || bounds.height < window.innerHeight * 0.85) continue
+            if (bounds.top > window.innerHeight * 0.15) continue
+            if (bounds.bottom < window.innerHeight * 0.85) continue
+
+            return true
+        }
+
+        return false
+    })
+}
+
+/**
+ * 把還在長大的內聯盒子收到它自己的終態。只對已經佔據視窗的盒子往前看，
+ * 讀到寬高與圓角不再變化後回到原捲動位置，再用 !important 釘住那組尺寸。
+ *
+ * @param page 已停在擷取位置的頁面。
+ * @returns 釘住或確認不需要釘之後結束。
+ */
+async function freezeExpandingBoxes(page: import('playwright').Page): Promise<void>
+{
+    const original = await readDocumentScroll(page)
+    const candidate = await page.evaluate(() => {
+        let bestId = ''
+        let bestArea = 0
+        const viewportArea = window.innerWidth * window.innerHeight
+
+        for (const element of document.body.querySelectorAll<HTMLElement>('*')) {
+            if (element.style.width === '' || element.style.height === '') continue
+
+            const style = getComputedStyle(element)
+
+            if (style.position === 'fixed' || style.display === 'none') continue
+
+            const bounds = element.getBoundingClientRect()
+            const area = bounds.width * bounds.height
+
+            if (area < viewportArea * 0.28 || area <= bestArea) continue
+            if (bounds.bottom < window.innerHeight * 0.45 || bounds.top > window.innerHeight * 0.92) continue
+
+            const radius = Number.parseFloat(style.borderTopLeftRadius)
+            const fullBleed = bounds.width >= window.innerWidth - 8
+                && bounds.height >= window.innerHeight - 8
+                && (!Number.isFinite(radius) || radius < 1)
+
+            if (fullBleed) continue
+
+            const id = element.getAttribute('data-sitesensory-box-id')
+                ?? `box-${bestArea.toFixed(0)}-${Math.round(bounds.top)}`
+
+            element.setAttribute('data-sitesensory-box-id', id)
+            bestId = id
+            bestArea = area
+        }
+
+        return bestId
+    })
+
+    if (!candidate) return
+
+    let saved: FrozenBox | null = null
+    let stable = 0
+
+    for (let step = 1; step <= 5; step += 1) {
+        const landed = await scrollPageToAndHold(page, original + step * 160)
+        const box = await readFrozenBox(page, candidate)
+
+        if (!box || Math.abs(landed - (original + step * 160)) > DOCUMENT_HEIGHT_TOLERANCE_PX * 4) break
+
+        const grew = saved === null
+            || box.width > saved.width + 4
+            || box.height > saved.height + 4
+            || box.radius < saved.radius - 1
+
+        saved = box
+        stable = grew ? 0 : stable + 1
+
+        const fullBleed = box.width >= 1912 && box.height >= 1072 && box.radius < 1
+
+        if (fullBleed || stable >= 2) break
+    }
+
+    await scrollPageToAndHold(page, original)
+
+    if (!saved) return
+
+    const finalBox = saved
+
+    await page.evaluate(({ box, id }) => {
+        const element = document.querySelector<HTMLElement>(`[data-sitesensory-box-id="${id}"]`)
+
+        if (!element) return
+
+        element.style.setProperty('width', `${box.width}px`, 'important')
+        element.style.setProperty('height', `${box.height}px`, 'important')
+        element.style.setProperty('top', `${box.top}px`, 'important')
+        element.style.setProperty('left', `${box.left}px`, 'important')
+        element.style.setProperty('border-radius', `${box.radius}px`, 'important')
+    }, { box: finalBox, id: candidate })
+}
+
+type FrozenBox = {
+    height: number
+    left: number
+    radius: number
+    top: number
+    width: number
+}
+
+/**
+ * 讀取正在展開的盒子目前尺寸。
+ *
+ * @param page Playwright 頁面。
+ * @param id 先前標上的盒子 id。
+ * @returns 找不到時為 null。
+ */
+async function readFrozenBox(page: import('playwright').Page, id: string): Promise<FrozenBox | null>
+{
+    return page.evaluate(boxId => {
+        const element = document.querySelector<HTMLElement>(`[data-sitesensory-box-id="${boxId}"]`)
+
+        if (!element) return null
+
+        const bounds = element.getBoundingClientRect()
+        const radius = Number.parseFloat(getComputedStyle(element).borderTopLeftRadius)
+
+        return {
+            height: Math.round(bounds.height),
+            left: Math.round(bounds.left),
+            radius: Number.isFinite(radius) ? Math.round(radius) : 0,
+            top: Math.round(bounds.top),
+            width: Math.round(bounds.width),
+        }
+    }, id)
+}
+
+/**
  * 把視窗裡跟捲動綁住、又停在半路的揭示收到看得到的狀態。
  * 有限次 CSS 轉場仍交給原本的等待。互相重疊、輪流出現的內容只留目前最明顯的那一層。
  * 圖片、畫布與大面積的 translate／scale 收到版面位置，避免同一幕被縫成多種縮放。
@@ -1306,16 +1476,30 @@ async function settleScrollScrubbedFrame(page: import('playwright').Page): Promi
             const inlineFilter = element.style.filter !== ''
             const inlineClip = element.style.clipPath !== '' && element.style.clipPath !== 'none'
             const inlineTransform = element.style.transform
-
-            if (!inlineOpacity && !inlineFilter && !inlineClip && !inlineTransform) continue
-
+            const style = getComputedStyle(element)
             const bounds = element.getBoundingClientRect()
+            const heading = element.tagName === 'H1' || element.tagName === 'H2' || element.tagName === 'H3'
+            const text = element.textContent?.replace(/\s+/g, ' ').trim() ?? ''
+            const glyph = (element.tagName === 'SPAN' || element.tagName === 'EM' || element.tagName === 'I')
+                && text.length > 0
+                && text.length < 28
+                && bounds.height > 8
+                && bounds.height < 220
+                && bounds.width < 480
+            const shift = translationOf(style.transform)
+            const verticalParallax = element.matches('img, video, canvas, [data-parallax]')
+                && shift !== null
+                && Math.abs(shift.y) > 8
+                && Math.abs(shift.x) < 16
+            const computedReveal = (heading || glyph)
+                && bounds.bottom > 4
+                && bounds.top < window.innerHeight - 4
+                && (Number(style.opacity) < 0.98 || blurAmount(style.filter) > 0.5 || (glyph && style.transform !== 'none'))
+
+            if (!inlineOpacity && !inlineFilter && !inlineClip && !inlineTransform && !computedReveal && !verticalParallax) continue
 
             if (bounds.bottom <= 4 || bounds.top >= window.innerHeight - 4) continue
             if (bounds.width < 8 || bounds.height < 8) continue
-
-            const style = getComputedStyle(element)
-
             if (style.display === 'none' || style.visibility === 'hidden') continue
 
             const target: ScrubTarget = {
@@ -1327,18 +1511,21 @@ async function settleScrollScrubbedFrame(page: import('playwright').Page): Promi
                 opacity: Number(style.opacity),
             }
             const area = bounds.width * bounds.height
-            const textual = inlineOpacity || inlineFilter || inlineClip
+            const textual = inlineOpacity || inlineFilter || inlineClip || computedReveal
 
-            if (textual && (target.opacity < 0.98 || target.blur > 0.5 || target.midClip || target.midScale)) {
-                fades.push(target)
+            if (glyph && style.transform !== 'none' && target.opacity >= 0.9 && target.blur <= 0.5) {
+                element.setAttribute(options.settled, '')
+                continue
             }
 
+            if (textual) fades.push(target)
+
             const parallaxMedia = element.matches('img, video, canvas, [data-parallax]')
-                && /translate|scale/i.test(inlineTransform)
+                && (/translate|scale/i.test(inlineTransform) || verticalParallax)
             const largeShift = area >= viewportArea * 0.2
                 && /translateY|translate3d|scale/i.test(inlineTransform)
 
-            if ((parallaxMedia || largeShift || target.midScale) && area >= viewportArea * 0.04) {
+            if (verticalParallax || ((parallaxMedia || largeShift || target.midScale) && area >= viewportArea * 0.04)) {
                 element.setAttribute(options.settled, '')
             }
         }
@@ -1369,17 +1556,23 @@ async function settleScrollScrubbedFrame(page: import('playwright').Page): Promi
                 }
             }
 
+            const winner = cluster.reduce((best, item) => item.opacity > best.opacity ? item : best)
+            const winnerNeedsSettle = winner.opacity < 0.98
+                || winner.blur > 0.5
+                || winner.midClip
+                || winner.midScale
+
             if (cluster.length < 2) {
-                seed.element.setAttribute(options.settled, '')
+                if (winnerNeedsSettle) seed.element.setAttribute(options.settled, '')
+
                 continue
             }
 
-            const winner = cluster.reduce((best, item) => item.opacity > best.opacity ? item : best)
-
-            winner.element.setAttribute(options.settled, '')
+            if (winnerNeedsSettle) winner.element.setAttribute(options.settled, '')
 
             for (const item of cluster) {
                 if (item.element === winner.element) continue
+                if (item.opacity >= winner.opacity - 0.02) continue
 
                 item.element.setAttribute(options.suppressed, '')
             }
@@ -1403,6 +1596,21 @@ async function settleScrollScrubbedFrame(page: import('playwright').Page): Promi
             const match = filter.match(/blur\(\s*([0-9.]+)px\s*\)/iu)
 
             return match?.[1] ? Number.parseFloat(match[1]) : 0
+        }
+
+        function translationOf(transform: string): { x: number, y: number } | null
+        {
+            const match = transform.match(/matrix\(\s*([^)]+)\)/u)
+
+            if (!match?.[1]) return null
+
+            const parts = match[1].split(',').map(value => Number.parseFloat(value))
+            const x = parts[4]
+            const y = parts[5]
+
+            if (x === undefined || y === undefined || Number.isNaN(x) || Number.isNaN(y)) return null
+
+            return { x, y }
         }
 
         function scaleIsMid(transform: string): boolean
@@ -2877,6 +3085,178 @@ function shiftBandsAfterCut(bands: MediaBand[], cutStart: number, cutHeight: num
 }
 
 /**
+ * 保留最近一個視窗高的已寫入畫面，用來辨認下一段是不是同一幀。
+ *
+ * @param previous 目前保留的尾端；第一段時為 null。
+ * @param segment 剛寫入的區段。
+ * @param width 頁面寬度。
+ * @param viewportHeight 視窗高度。
+ * @returns 不超過一個視窗高的尾端圖。
+ */
+async function rememberRecentScene(
+    previous: Buffer | null,
+    segment: Buffer,
+    width: number,
+    viewportHeight: number,
+): Promise<Buffer>
+{
+    if (!previous) return segment
+
+    const previousHeight = (await sharp(previous).metadata()).height ?? 0
+    const segmentHeight = (await sharp(segment).metadata()).height ?? 0
+    const combinedHeight = previousHeight + segmentHeight
+    const combined = await sharp({
+        create: {
+            background: '#ffffff',
+            channels: 3,
+            height: combinedHeight,
+            width,
+        },
+    })
+        .composite([
+            { input: previous, left: 0, top: 0 },
+            { input: segment, left: 0, top: previousHeight },
+        ])
+        .png()
+        .toBuffer()
+
+    if (combinedHeight <= viewportHeight) return combined
+
+    return sharp(combined)
+        .extract({
+            height: viewportHeight,
+            left: 0,
+            top: combinedHeight - viewportHeight,
+            width,
+        })
+        .png()
+        .toBuffer()
+}
+
+/**
+ * 新區段是不是已經留下的同一幀。空白列，或是對得上既有列的少量文字，
+ * 都算同一幀的捲動行程。飽和純色的預留高度不算，那種畫面要留住。
+ *
+ * @param segment 這次準備接上的區段。
+ * @param recent 最近已寫入的畫面。
+ * @param width 頁面寬度。
+ * @returns 可以當成像素複本拿掉時為 true。
+ */
+export async function stickySegmentRepeatsKeptScene(
+    segment: Buffer,
+    recent: Buffer,
+    width: number,
+): Promise<boolean>
+{
+    const segmentHeight = (await sharp(segment).metadata()).height ?? 0
+    const recentHeight = (await sharp(recent).metadata()).height ?? 0
+
+    if (segmentHeight < 80 || recentHeight < 40) return false
+
+    const sampleWidth = Math.min(64, width)
+    const segmentRaw = await sharp(segment)
+        .resize(sampleWidth, segmentHeight, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+    const recentRaw = await sharp(recent)
+        .resize(sampleWidth, recentHeight, { fit: 'fill' })
+        .removeAlpha()
+        .raw()
+        .toBuffer()
+    const rowBytes = sampleWidth * 3
+    const recentKeys = new Set<string>()
+    let recentHasInk = false
+
+    for (let row = 0; row < recentHeight; row += 1) {
+        const slice = recentRaw.subarray(row * rowBytes, (row + 1) * rowBytes)
+
+        if (!isNearWhiteRow(slice)) recentHasInk = true
+
+        recentKeys.add(rowKey(slice))
+    }
+
+    if (!recentHasInk) return false
+
+    let inkRows = 0
+    let matchedInk = 0
+    let lumaTotal = 0
+    let lumaSquares = 0
+
+    for (let row = 0; row < segmentHeight; row += 1) {
+        const slice = segmentRaw.subarray(row * rowBytes, (row + 1) * rowBytes)
+        const luma = rowLuma(slice)
+
+        lumaTotal += luma
+        lumaSquares += luma * luma
+
+        if (isNearWhiteRow(slice)) continue
+
+        inkRows += 1
+        if (recentKeys.has(rowKey(slice))) matchedInk += 1
+    }
+
+    const mean = lumaTotal / segmentHeight
+    const variance = Math.sqrt(Math.max(0, lumaSquares / segmentHeight - mean * mean)) / 255
+
+    if (variance < 0.02) return mean >= 246
+
+    if (inkRows === 0) return true
+    if (matchedInk !== inkRows) return false
+
+    return true
+}
+
+/**
+ * 一列是否近白。近白的 sticky 行程可以拿掉；飽和色列不行。
+ *
+ * @param slice 一列 RGB。
+ * @returns 平均亮度很高時為 true。
+ */
+function isNearWhiteRow(slice: Buffer): boolean
+{
+    return rowLuma(slice) >= 246
+}
+
+/**
+ * 一列的平均亮度。
+ *
+ * @param slice 一列 RGB。
+ * @returns 0 到 255。
+ */
+function rowLuma(slice: Buffer): number
+{
+    if (slice.length < 3) return 255
+
+    let total = 0
+    let count = 0
+
+    for (let index = 0; index < slice.length; index += 3) {
+        total += (slice[index] ?? 0) * 0.3 + (slice[index + 1] ?? 0) * 0.59 + (slice[index + 2] ?? 0) * 0.11
+        count += 1
+    }
+
+    return count > 0 ? total / count : 255
+}
+
+/**
+ * 把一列量化成可比對的鍵。相鄰 2 階視為同一列，避免抗鋸齒差 1 就被當成新內容。
+ *
+ * @param slice 一列 RGB。
+ * @returns 列鍵。
+ */
+function rowKey(slice: Buffer): string
+{
+    let key = ''
+
+    for (let index = 0; index < slice.length; index += 1) {
+        key += String.fromCharCode((slice[index] ?? 0) >> 1)
+    }
+
+    return key
+}
+
+/**
  * 做一份用來核對兩段是否像素相同的縮圖。寬度壓到 480，高度維持原像素列。
  *
  * @param image PNG。
@@ -2911,7 +3291,14 @@ function sampledRowsMatch(sample: RowIdentitySample, startA: number, startB: num
 
     if (rowCount < 8 || startA < 0 || startB < 0) return false
 
-    return rawRowsMatch(sample.raw, sample.raw, sample.width, startA, startB, rowCount)
+    for (let delta = -4; delta <= 4; delta += 1) {
+        const shifted = startB + delta
+
+        if (shifted < 0 || shifted + rowCount > sample.height) continue
+        if (rawRowsMatch(sample.raw, sample.raw, sample.width, startA, shifted, rowCount)) return true
+    }
+
+    return false
 }
 
 /**

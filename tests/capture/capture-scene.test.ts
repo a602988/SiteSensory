@@ -7,6 +7,7 @@ import {
     looksLikeFullColumnWipe,
     looksLikeVerticalWipe,
     rowSliceVariance,
+    stickySegmentRepeatsKeptScene,
     trimDuplicateScenePrefix,
     trimRepeatedTailBand,
 } from '../../apps/capture-worker/src/capture.js'
@@ -574,6 +575,34 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
         ])
 
         await expect(isSamePinnedScene(first, second, WIDTH)).resolves.toBe(false)
+    })
+
+    it('drops sticky travel that only repeats a kept heading or a white gap', async () => {
+        const heading = await sharp({
+            create: { background: '#111111', channels: 3, height: 180, width: WIDTH },
+        }).png().toBuffer()
+        const kept = await stackPngs([
+            await solidPng('#ffffff', 400),
+            heading,
+            await solidPng('#ffffff', 500),
+        ])
+        const repeatedHeading = await stackPngs([
+            await solidPng('#ffffff', 200),
+            heading,
+            await solidPng('#ffffff', 500),
+        ])
+        const blank = await solidPng('#ffffff', 864)
+        const blue = await solidPng('#315ceb', 864)
+        const fresh = await stackPngs([
+            await solidPng('#ffffff', 200),
+            await solidPng('#dc2626', 180),
+            await solidPng('#ffffff', 484),
+        ])
+
+        await expect(stickySegmentRepeatsKeptScene(repeatedHeading, kept, WIDTH)).resolves.toBe(true)
+        await expect(stickySegmentRepeatsKeptScene(blank, kept, WIDTH)).resolves.toBe(true)
+        await expect(stickySegmentRepeatsKeptScene(blue, kept, WIDTH)).resolves.toBe(false)
+        await expect(stickySegmentRepeatsKeptScene(fresh, kept, WIDTH)).resolves.toBe(false)
     })
 })
 
