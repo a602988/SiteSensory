@@ -3085,8 +3085,10 @@ export async function trimDuplicateScenePrefix(
 
         const aligned = foundAt - start
 
-        if (alignment < 0) alignment = aligned
-        else if (Math.abs(aligned - alignment) > 1) break
+        if (options.identicalRows) {
+            if (alignment < 0) alignment = aligned
+            else if (Math.abs(aligned - alignment) > 1) break
+        }
 
         matchedRows = start + windowRows
     }
