@@ -777,7 +777,9 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         let preserveStickyFrame = false
         let pendingSticky: StickySignature | null = null
 
-        if (segment && !hasVirtualCanvas && await stickyPinCoversViewport(page)) {
+        const pinCovers = segment ? !hasVirtualCanvas && await stickyPinCoversViewport(page) : false
+
+        if (segment && pinCovers) {
             const safeToCollapse = segmentBands.every(band => {
                 const bandHeight = band.bottom - band.top
 
@@ -873,7 +875,58 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             }
         }
         else if (!hasVirtualCanvas) {
+            // 釘住盒已經縮到 85% 以下，畫面卻可能還是同一組 logo。
+            // 那一刀不是下一個區段，整段計入去重，簽名留到內容真的換掉。
+            if (
+                segment
+                && stickyHold
+                && recentTail
+                && await stickySegmentAlreadyShown(segment, recentTail, dimensions.width)
+            ) {
+                trimmedPixels += Math.max(0, documentEnd - documentCoveredUntil)
+                documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
+                continue
+            }
+
             stickyHold = null
+        }
+
+        if (preserveStickyFrame && segment && keptSegments.length > 0) {
+            const previous = keptSegments.at(-1)
+            const previousTop = Number(segments.at(-1)?.top ?? 0)
+
+            if (previous) {
+                const previousHeight = (await sharp(previous).metadata()).height ?? 0
+                const kept = await stickyOpeningCut(previous, segment, dimensions.width)
+                const removed = previousHeight - kept
+
+                if (kept >= 80 && removed >= 80) {
+                    const shortened = await sharp(previous)
+                        .extract({
+                            height: kept,
+                            left: 0,
+                            top: 0,
+                            width: dimensions.width,
+                        })
+                        .png()
+                        .toBuffer()
+                    const lastIndex = keptSegments.length - 1
+
+                    keptSegments[lastIndex] = shortened
+                    segments[lastIndex] = { input: shortened, left: 0, top: previousTop }
+                    outputHeight -= removed
+                    trimmedPixels += removed
+
+                    for (let bandIndex = protectedBands.length - 1; bandIndex >= 0; bandIndex -= 1) {
+                        const band = protectedBands[bandIndex]
+
+                        if (!band || band.top < previousTop) continue
+
+                        if (band.top >= previousTop + kept) protectedBands.splice(bandIndex, 1)
+                        else if (band.bottom > previousTop + kept) band.bottom = previousTop + kept
+                    }
+                }
+            }
         }
 
         if (!preserveStickyFrame && segment && !hasVirtualCanvas && recentTail && await stickyPinCoversViewport(page)) {
@@ -4370,6 +4423,170 @@ export async function stickyDuplicatePrefixLength(
     }
 
     return aligned >= 24 ? aligned : 0
+}
+
+/**
+ * 釘住盒已經縮到蓋不滿視窗之後，這一段若只是剛留下的同一組字與 logo，
+ * 就是這一幕往上移走的殘影。非白列都能在最近畫面裡找到，而且那些列本身有明暗起伏
+ * （logo 或字形，不是飽和色塊），整段視為已經出現過。
+ *
+ * @param segment 這次準備接上的區段。
+ * @param recent 最近已寫入的畫面。
+ * @param width 頁面寬度。
+ * @returns 整段都是已留下的內容時為 true。
+ */
+export async function stickySegmentAlreadyShown(
+    segment: Buffer,
+    recent: Buffer,
+    width: number,
+): Promise<boolean>
+{
+    const segmentSample = await sampleRgbRows(segment, width)
+    const recentSample = await sampleRgbRows(recent, width)
+
+    if (segmentSample.height < 24 || recentSample.height < 24) return false
+
+    const recentKeys = new Set<string>()
+
+    for (let row = 0; row < recentSample.height; row += 1) {
+        const slice = recentSample.raw.subarray(row * recentSample.rowBytes, (row + 1) * recentSample.rowBytes)
+
+        recentKeys.add(rowKey(slice))
+    }
+
+    let inkRows = 0
+    let matchedInk = 0
+    let structured = 0
+
+    for (let row = 0; row < segmentSample.height; row += 1) {
+        const slice = segmentSample.raw.subarray(row * segmentSample.rowBytes, (row + 1) * segmentSample.rowBytes)
+
+        if (isNearWhiteRow(slice)) continue
+
+        inkRows += 1
+        if (recentKeys.has(rowKey(slice))) matchedInk += 1
+        if (rowHasStructure(slice)) structured += 1
+    }
+
+    return inkRows >= 8 && structured >= 8 && matchedInk === inkRows
+}
+
+/**
+ * 更完整的 sticky 幀即將接上時，前一段底部若已經畫過同一個開頭，
+ * 回傳應保留的高度。對不上就回傳原本高度。
+ *
+ * @param previous 已經寫入的上一段。
+ * @param next 即將接上的完整幀。
+ * @param width 頁面寬度。
+ * @returns 上一段應留下的像素高度。
+ */
+export async function stickyOpeningCut(
+    previous: Buffer,
+    next: Buffer,
+    width: number,
+): Promise<number>
+{
+    const previousSample = await sampleRgbRows(previous, width)
+    const nextSample = await sampleRgbRows(next, width)
+    const span = Math.min(180, previousSample.height, nextSample.height)
+
+    if (span < 100 || previousSample.height < span + 48) return previousSample.height
+
+    const nextKeys: string[] = []
+    const nextInk: boolean[] = []
+    let openingInk = 0
+
+    for (let row = 0; row < span; row += 1) {
+        const slice = nextSample.raw.subarray(row * nextSample.rowBytes, (row + 1) * nextSample.rowBytes)
+        const ink = !isNearWhiteRow(slice)
+
+        nextKeys.push(rowKey(slice))
+        nextInk.push(ink)
+        if (ink) openingInk += 1
+    }
+
+    if (openingInk < 16) return previousSample.height
+
+    const previousKeys: string[] = []
+
+    for (let row = 0; row < previousSample.height; row += 1) {
+        const slice = previousSample.raw.subarray(row * previousSample.rowBytes, (row + 1) * previousSample.rowBytes)
+
+        previousKeys.push(rowKey(slice))
+    }
+
+    for (let y = previousSample.height - span; y >= 48; y -= 1) {
+        let same = 0
+        let inkSame = 0
+
+        for (let row = 0; row < span; row += 1) {
+            if (previousKeys[y + row] !== nextKeys[row]) continue
+
+            same += 1
+            if (nextInk[row]) inkSame += 1
+        }
+
+        if (inkSame >= 16 && same >= span * 0.85) return y
+    }
+
+    return previousSample.height
+}
+
+/**
+ * 把圖縮成固定寬的 RGB 列，列數維持原高，方便逐列比對。
+ *
+ * @param image PNG。
+ * @param width 頁面寬度。
+ * @returns 列緩衝與每列位元組數。
+ */
+async function sampleRgbRows(
+    image: Buffer,
+    width: number,
+): Promise<{ height: number, raw: Buffer, rowBytes: number }>
+{
+    const height = (await sharp(image).metadata()).height ?? 0
+    const sampleWidth = Math.min(64, width)
+    const raw = height === 0
+        ? Buffer.alloc(0)
+        : await sharp(image)
+            .resize(sampleWidth, height, { fit: 'fill' })
+            .removeAlpha()
+            .raw()
+            .toBuffer()
+
+    return { height, raw, rowBytes: sampleWidth * 3 }
+}
+
+/**
+ * 一列裡有沒有字形或 logo 的明暗起伏。整列同一個飽和色不算。
+ *
+ * @param slice 一列 RGB。
+ * @returns 亮度標準差超過 10 時為 true。
+ */
+function rowHasStructure(slice: Buffer): boolean
+{
+    if (slice.length < 3) return false
+
+    let sum = 0
+    let squares = 0
+    let count = 0
+
+    for (let index = 0; index < slice.length; index += 3) {
+        const luma = (slice[index] ?? 0) * 0.3
+            + (slice[index + 1] ?? 0) * 0.59
+            + (slice[index + 2] ?? 0) * 0.11
+
+        sum += luma
+        squares += luma * luma
+        count += 1
+    }
+
+    if (count === 0) return false
+
+    const mean = sum / count
+    const deviation = Math.sqrt(Math.max(0, squares / count - mean * mean))
+
+    return deviation > 10
 }
 
 /**

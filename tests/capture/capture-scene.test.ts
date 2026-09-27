@@ -11,6 +11,8 @@ import {
     closeInsetCaptureSeams,
     relateStickySignatures,
     stickyDuplicatePrefixLength,
+    stickyOpeningCut,
+    stickySegmentAlreadyShown,
     trimDuplicateScenePrefix,
     trimRepeatedTailBand,
 } from '../../apps/capture-worker/src/capture.js'
@@ -666,6 +668,31 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
         await expect(stickyDuplicatePrefixLength(blank, kept, WIDTH)).resolves.toBe(864)
         await expect(stickyDuplicatePrefixLength(blue, kept, WIDTH)).resolves.toBe(0)
         await expect(stickyDuplicatePrefixLength(fresh, kept, WIDTH)).resolves.toBe(200)
+
+        const headingRows = await variedBlock(220, 11)
+        const services = await variedBlock(500, 90)
+        const partial = await stackPngs([
+            services,
+            headingRows,
+            await solidPng('#ffffff', 220),
+        ])
+        const complete = await stackPngs([
+            headingRows,
+            await variedBlock(280, 40),
+            await solidPng('#ffffff', 200),
+        ])
+        const replay = await stackPngs([
+            await solidPng('#ffffff', 120),
+            headingRows,
+            await solidPng('#ffffff', 300),
+        ])
+        const projects = await variedBlock(640, 7)
+
+        await expect(stickyOpeningCut(partial, complete, WIDTH)).resolves.toBe(500)
+        await expect(stickyOpeningCut(services, complete, WIDTH)).resolves.toBe(500)
+        await expect(stickySegmentAlreadyShown(replay, complete, WIDTH)).resolves.toBe(true)
+        await expect(stickySegmentAlreadyShown(projects, complete, WIDTH)).resolves.toBe(false)
+        await expect(stickySegmentAlreadyShown(blue, complete, WIDTH)).resolves.toBe(false)
     })
 
     it('pays a full-frame overlap back from one strict-white gap', async () => {
@@ -724,6 +751,24 @@ async function seamImage(repeat: boolean): Promise<Buffer>
             raw[index] = value
             raw[index + 1] = (value * 2) % 220
             raw[index + 2] = 40 + (column % 50)
+        }
+    }
+
+    return sharp(raw, { raw: { channels: 3, height, width: WIDTH } }).png().toBuffer()
+}
+
+async function variedBlock(height: number, seed: number): Promise<Buffer>
+{
+    const raw = Buffer.alloc(WIDTH * height * 3)
+
+    for (let row = 0; row < height; row += 1) {
+        for (let column = 0; column < WIDTH; column += 1) {
+            const index = (row * WIDTH + column) * 3
+            const band = Math.floor(column / 120) % 2 === 0
+
+            raw[index] = band ? (30 + (seed + row * 5) % 90) : (150 + (seed + row * 5) % 70)
+            raw[index + 1] = band ? (20 + (seed + row * 3) % 50) : (80 + (row * 4) % 90)
+            raw[index + 2] = 15 + ((seed + row) % 80)
         }
     }
 
