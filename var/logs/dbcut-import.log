@@ -1,0 +1,2 @@
+$ pnpm --filter @sitesensory/cli import:dbcut
+$ tsx src/import-dbcut.ts
