@@ -526,6 +526,8 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
     let outputHeight = 0
     let previousSignature: Buffer | null = null
     let recentTail: Buffer | null = null
+    let keptFullViewport: Buffer | null = null
+    let keptFullScroll = 0
     let stickyHold: StickySignature | null = null
     let trimmedPixels = 0
     const protectedBands: MediaBand[] = []
@@ -703,6 +705,33 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             fadeExit
             && actualScroll < fadeExit.end + dimensions.viewportHeight * 0.35
         ) {
+            trimmedPixels += Math.max(0, documentEnd - documentCoveredUntil)
+            documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
+            continue
+        }
+
+        if (
+            viewport
+            && keptFullViewport
+            && !hasVirtualCanvas
+            && !singleScreen
+            && actualScroll - keptFullScroll > 200
+            && await isUnshiftedScene(keptFullViewport, viewport, dimensions.width)
+        ) {
+            const lastIndex = keptSegments.length - 1
+            const previousBuffer = keptSegments[lastIndex]
+            const previousHeight = previousBuffer ? (await sharp(previousBuffer).metadata()).height ?? 0 : 0
+            const fullHeight = (await sharp(viewport).metadata()).height ?? 0
+
+            if (lastIndex >= 0 && previousHeight > 0 && fullHeight > previousHeight + 24) {
+                const lastTop = Number(segments[lastIndex]?.top ?? 0)
+
+                segments[lastIndex] = { input: viewport, left: 0, top: lastTop }
+                keptSegments[lastIndex] = viewport
+                outputHeight += fullHeight - previousHeight
+                recentTail = viewport
+            }
+
             trimmedPixels += Math.max(0, documentEnd - documentCoveredUntil)
             documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
             continue
@@ -956,6 +985,11 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
 
         segments.push({ input: segment, left: 0, top: outputHeight })
         keptSegments.push(segment)
+
+        if (viewport) {
+            keptFullViewport = viewport
+            keptFullScroll = actualScroll
+        }
         stickyHold = pendingSticky ?? (hasVirtualCanvas ? stickyHold : null)
 
         if (!hasVirtualCanvas) {
@@ -1605,11 +1639,77 @@ async function hideCustomCursorFollowers(page: import('playwright').Page): Promi
 }
 
 /**
- * 蓋滿視窗的 sticky 場景。這種畫面的新列若只是同一幀的空白或複本，
- * 不能再往下接一截。
+ * 釘住在視窗裡的場景，往下捲之後畫面幾乎沒有跟著文件往上移。
+ * 這種畫面若仍按文件座標切片，會把同一幕的不同進度疊成三截。
+ * 平坦的留白與飽和色不當成這種場景，避免把預留高度裁掉。
+ *
+ * @param previous 上一張留下的完整視窗。
+ * @param next 目前視窗。
+ * @param width 視窗寬度。
+ * @returns 中段仍是同一張有細節的畫面時為 true。
+ */
+async function isUnshiftedScene(previous: Buffer, next: Buffer, width: number): Promise<boolean>
+{
+    const previousRaw = await sharp(previous).removeAlpha().raw().toBuffer()
+    const nextRaw = await sharp(next).removeAlpha().raw().toBuffer()
+    const previousHeight = Math.floor(previousRaw.length / (width * 3))
+    const nextHeight = Math.floor(nextRaw.length / (width * 3))
+    const bandTop = 180
+    const bandBottom = Math.min(760, previousHeight, nextHeight)
+
+    if (bandBottom - bandTop < 200) return false
+
+    let difference = 0
+    let compared = 0
+    let spread = 0
+
+    for (let y = bandTop; y < bandBottom; y += 16) {
+        let rowDifference = 0
+        let rowSpread = 0
+        let count = 0
+        let lumaSum = 0
+
+        for (let x = 40; x < width - 40; x += 16) {
+            const left = (y * width + x) * 3
+            const leftLuma = ((previousRaw[left] ?? 0) + (previousRaw[left + 1] ?? 0) + (previousRaw[left + 2] ?? 0)) / 3
+
+            rowDifference += Math.abs((previousRaw[left] ?? 0) - (nextRaw[left] ?? 0))
+                + Math.abs((previousRaw[left + 1] ?? 0) - (nextRaw[left + 1] ?? 0))
+                + Math.abs((previousRaw[left + 2] ?? 0) - (nextRaw[left + 2] ?? 0))
+            lumaSum += leftLuma
+            count += 1
+        }
+
+        if (count === 0) continue
+
+        const mean = lumaSum / count
+
+        for (let x = 40; x < width - 40; x += 16) {
+            const left = (y * width + x) * 3
+            const luma = ((previousRaw[left] ?? 0) + (previousRaw[left + 1] ?? 0) + (previousRaw[left + 2] ?? 0)) / 3
+
+            rowSpread += Math.abs(luma - mean)
+        }
+
+        difference += rowDifference / (count * 255 * 3)
+        spread += rowSpread / count
+        compared += 1
+    }
+
+    if (compared === 0) return false
+
+    const averageDifference = difference / compared
+    const averageSpread = spread / compared
+
+    return averageSpread > 12 && averageDifference < 0.045
+}
+
+/**
+ * 視窗裡是否有蓋住大部分畫面的 sticky。
+ * 窄側欄與還沒進入畫面的區塊不算。
  *
  * @param page Playwright 頁面。
- * @returns 有 sticky 層同時蓋住寬高約 85% 時為 true。
+ * @returns 有這種釘住層時為 true。
  */
 async function stickyPinCoversViewport(page: import('playwright').Page): Promise<boolean>
 {
