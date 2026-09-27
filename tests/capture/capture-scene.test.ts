@@ -8,6 +8,7 @@ import {
     looksLikeVerticalWipe,
     rowSliceVariance,
     absorbStrictWhiteOvershoot,
+    closeInsetCaptureSeams,
     relateStickySignatures,
     stickyDuplicatePrefixLength,
     trimDuplicateScenePrefix,
@@ -27,6 +28,40 @@ describe('capture scene heuristics', { timeout: 15_000 }, () => {
         expect(repeated).toBeGreaterThan(0)
         expect(distinct).toBe(0)
         expect(flat).toBe(0)
+    })
+
+    it('closes a full-width white seam between saturated rows and a 1px inset edge', async () => {
+        const width = 64
+        const height = 90
+        const raw = Buffer.alloc(width * height * 3, 255)
+        const paint = (row: number, from = 0): void => {
+            for (let x = from; x < width; x += 1) {
+                const index = (row * width + x) * 3
+
+                raw[index] = 0
+                raw[index + 1] = 4
+                raw[index + 2] = 255
+            }
+        }
+
+        for (let row = 10; row < 37; row += 1) paint(row)
+        for (let row = 40; row < 45; row += 1) paint(row)
+        for (let row = 45; row < 85; row += 1) paint(row, 1)
+
+        const source = await sharp(raw, { raw: { channels: 3, height, width } }).png().toBuffer()
+        const closed = await closeInsetCaptureSeams(source, width)
+        const meta = await sharp(closed.image).metadata()
+        const pixels = await sharp(closed.image).removeAlpha().raw().toBuffer()
+        const at = (x: number, y: number): number[] => {
+            const index = (y * width + x) * 3
+
+            return [pixels[index] ?? 0, pixels[index + 1] ?? 0, pixels[index + 2] ?? 0]
+        }
+
+        expect(closed.removedRows).toBe(3)
+        expect(meta.height).toBe(87)
+        expect(at(0, 30)).toEqual([0, 4, 255])
+        expect(at(0, 50)).toEqual([0, 4, 255])
     })
 
     it('treats a saturated solid color as zero spatial variance', () => {

@@ -687,6 +687,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
                         trimmedPixels += Math.max(0, span - frames.length * frameHeight)
                         documentCoveredUntil = stacked.end
                         emittedFadeSections.add(stacked.start)
+                        await markStackedFadeEmitted(page, stacked.end)
                         stickyHold = null
                         continue
                     }
@@ -694,61 +695,17 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             }
         }
 
-        const pinnedStart = !hasVirtualCanvas && !singleScreen && viewport
-            ? await readUnreadablePinnedSectionStart(page)
+        const fadeExit = !hasVirtualCanvas && !singleScreen
+            ? await readEmittedFadeExit(page)
             : null
 
         if (
-            pinnedStart !== null
-            && viewport
-            && pinnedStart > documentStart + 24
-            && pinnedStart < documentEnd - 24
+            fadeExit
+            && actualScroll < fadeExit.end + dimensions.viewportHeight * 0.35
         ) {
-            const revealScroll = Math.min(documentEnd - 24, pinnedStart + 280)
-            const landed = await scrollPageToAndHold(page, revealScroll)
-
-            if (landed >= pinnedStart - DOCUMENT_HEIGHT_TOLERANCE_PX) {
-                const lead = pinnedStart - documentStart
-                const leadImage = await sharp(viewport)
-                    .extract({
-                        height: lead,
-                        left: 0,
-                        top: sourceTop,
-                        width: dimensions.width,
-                    })
-                    .png()
-                    .toBuffer()
-
-                segments.push({ input: leadImage, left: 0, top: outputHeight })
-                keptSegments.push(leadImage)
-                outputHeight += lead
-
-                await freezeExpandingBoxes(page)
-                const frame = await screenshotViewport(page, 'allow')
-                const room = Math.min(dimensions.viewportHeight, Math.max(1, dimensions.height - landed))
-                const frameImage = room < dimensions.viewportHeight
-                    ? await sharp(frame)
-                        .extract({
-                            height: room,
-                            left: 0,
-                            top: 0,
-                            width: dimensions.width,
-                        })
-                        .png()
-                        .toBuffer()
-                    : frame
-
-                segments.push({ input: frameImage, left: 0, top: outputHeight })
-                keptSegments.push(frameImage)
-                outputHeight += room
-                recentTail = frameImage
-                trimmedPixels += Math.max(0, landed - pinnedStart)
-                documentCoveredUntil = Math.max(documentCoveredUntil, landed + room)
-                stickyHold = await readStickySignature(page)
-                continue
-            }
-
-            await scrollPageToAndHold(page, actualScroll)
+            trimmedPixels += Math.max(0, documentEnd - documentCoveredUntil)
+            documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
+            continue
         }
 
         const mediaBands = hasVirtualCanvas ? [] : await readUncroppedMediaBands(page)
@@ -803,7 +760,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
                         continue
                     }
                 }
-                else if (relation === 'replace' && stickyHold && keptSegments.length > 0) {
+                else if ((relation === 'replace' || relation === 'drop-same') && stickyHold && keptSegments.length > 0) {
                     const richer = await captureRicherStickyFrame(page, signature, viewport)
                     const lastIndex = keptSegments.length - 1
                     const previousBuffer = keptSegments[lastIndex] ?? richer.image
@@ -828,14 +785,30 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
 
                     continue
                 }
-                else if (relation === 'keep' || relation === 'drop-same') {
+                else if (relation === 'keep') {
                     const richer = await captureRicherStickyFrame(page, signature, viewport)
-                    const richerHeight = (await sharp(richer.image).metadata()).height ?? segmentHeight
+                    let richerHeight = (await sharp(richer.image).metadata()).height ?? segmentHeight
+                    const alreadyShown = Math.max(0, documentCoveredUntil - richer.scroll)
+                    const cropTop = Math.min(alreadyShown, Math.max(0, richerHeight - 48))
+                    let image = richer.image
 
-                    segment = richer.image
+                    if (cropTop >= 8) {
+                        image = await sharp(richer.image)
+                            .extract({
+                                height: richerHeight - cropTop,
+                                left: 0,
+                                top: cropTop,
+                                width: dimensions.width,
+                            })
+                            .png()
+                            .toBuffer()
+                        richerHeight -= cropTop
+                    }
+
+                    segment = image
                     segmentHeight = richerHeight
-                    sourceTop = 0
-                    segmentBands = viewportBandsToSegment(mediaBands, 0, richerHeight)
+                    sourceTop = cropTop
+                    segmentBands = viewportBandsToSegment(mediaBands, cropTop, richerHeight)
                     preserveStickyFrame = true
                     pendingSticky = richer.signature
                 }
@@ -1059,6 +1032,14 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             trimmedMeta = await sharp(trimmed).metadata()
             imageHeight = trimmedMeta.height ?? 0
         }
+    }
+
+    if (!hasVirtualCanvas && !singleScreen) {
+        const closed = await closeInsetCaptureSeams(trimmed, dimensions.width)
+
+        trimmed = closed.image
+        trimmedMeta = await sharp(trimmed).metadata()
+        imageHeight = trimmedMeta.height ?? 0
     }
 
     if (trimmedMeta.width !== dimensions.width) {
@@ -1760,8 +1741,27 @@ async function freezeExpandingBoxes(page: import('playwright').Page): Promise<vo
 
         const style = document.createElement('style')
 
+        const viewportWidth = window.innerWidth
+        const viewportHeight = window.innerHeight
+        let left = box.left
+        let width = box.width
+        let top = lockedTop
+        let height = box.height
+        let radius = box.radius
+
+        if (width >= viewportWidth - 12 && left <= 8 && left + width >= viewportWidth - 8) {
+            left = 0
+            width = viewportWidth
+        }
+
+        if (height >= viewportHeight - 12 && top <= 8 && top + height >= viewportHeight - 8) {
+            top = 0
+            height = viewportHeight
+            radius = 0
+        }
+
         style.setAttribute('data-sitesensory-freeze-for', id)
-        style.textContent = `[data-sitesensory-box-id="${id}"]{width:${box.width}px !important;height:${box.height}px !important;top:${lockedTop}px !important;left:${box.left}px !important;border-radius:${box.radius}px !important;}`
+        style.textContent = `[data-sitesensory-box-id="${id}"]{width:${width}px !important;height:${height}px !important;top:${top}px !important;left:${left}px !important;border-radius:${radius}px !important;}`
         document.head.appendChild(style)
     }, { box: finalBox, id: candidate, top })
 }
@@ -1864,12 +1864,6 @@ async function settleScrollScrubbedFrame(page: import('playwright').Page): Promi
             if (bounds.width < 8 || bounds.height < 8) continue
             if (style.display === 'none' || style.visibility === 'hidden') continue
 
-            const scale = uniformScale(style.transform)
-            const shrunkHeading = heading
-                && scale !== null
-                && scale < 0.92
-                && scale > 0.05
-                && Number(style.opacity) >= 0.85
             const target: ScrubTarget = {
                 blur: blurAmount(style.filter),
                 bounds,
@@ -1879,7 +1873,6 @@ async function settleScrollScrubbedFrame(page: import('playwright').Page): Promi
                 opacity: Number(style.opacity),
             }
 
-            if (shrunkHeading) element.setAttribute(options.settled, '')
             const area = bounds.width * bounds.height
             const textual = inlineOpacity || inlineFilter || inlineClip || computedReveal
 
@@ -3739,64 +3732,62 @@ async function readStickySignature(page: import('playwright').Page): Promise<Sti
 }
 
 /**
- * 這段即將寫進區段起點，但區段裡的大標題還沒進畫面或還沒可讀。
- * 這種標題若等下一個擷取步進，通常已經縮到重疊帶裡，長圖就會留下空白。
+ * 堆疊淡化的每一層都已寫進成品後，標上區段結尾。
+ * 後面的視窗若還被這層蓋住，是淡出的空卡，不是下一句。
  *
- * @param page 停在目前擷取位置的頁面。
- * @returns 應改從這裡重截的文件座標；沒有時為 null。
+ * @param page Playwright 頁面。
+ * @param end 區段文件結尾。
+ * @returns 標記完成後結束。
  */
-async function readUnreadablePinnedSectionStart(page: import('playwright').Page): Promise<number | null>
+async function markStackedFadeEmitted(page: import('playwright').Page, end: number): Promise<void>
+{
+    await page.evaluate(sectionEnd => {
+        for (const node of document.querySelectorAll<HTMLElement>('[data-sitesensory-fade-layer]')) {
+            node.setAttribute('data-sitesensory-fade-emitted', '')
+            node.setAttribute('data-sitesensory-fade-end', String(sectionEnd))
+        }
+    }, end)
+}
+
+/**
+ * 已經留過的淡化層是否仍蓋住視窗中央。
+ * 文字淡掉、底圖還在時，不能再當成一張新卡。
+ *
+ * @param page 停在擷取位置的頁面。
+ * @returns 區段結尾；這層已經離開視窗時為 null。
+ */
+async function readEmittedFadeExit(page: import('playwright').Page): Promise<{ end: number } | null>
 {
     return page.evaluate(() => {
-        let best: number | null = null
+        for (const element of document.querySelectorAll<HTMLElement>('[data-sitesensory-fade-emitted]')) {
+            const bounds = element.getBoundingClientRect()
 
-        for (const node of document.querySelectorAll<HTMLElement>('h1, h2')) {
-            const text = node.textContent?.replace(/\s+/g, ' ').trim() ?? ''
+            if (bounds.height < window.innerHeight * 0.55 || bounds.width < window.innerWidth * 0.5) continue
+            if (bounds.top > window.innerHeight * 0.25) continue
+            if (bounds.bottom < window.innerHeight * 0.7) continue
 
-            if (text.length < 2) continue
+            const outsideHeading = [...document.querySelectorAll<HTMLElement>('h1, h2, h3')].some(node => {
+                if (element.contains(node)) return false
 
-            let pin: HTMLElement | null = node.parentElement
+                const heading = node.getBoundingClientRect()
+                const opacity = Number(getComputedStyle(node).opacity)
 
-            while (pin && pin !== document.body && getComputedStyle(pin).position !== 'sticky') {
-                pin = pin.parentElement
-            }
+                return heading.height > 20
+                    && heading.top > 24
+                    && heading.bottom < window.innerHeight - 24
+                    && opacity > 0.8
+            })
 
-            if (!pin || pin === document.body) continue
+            if (outsideHeading) continue
 
-            const style = getComputedStyle(node)
-            const bounds = node.getBoundingClientRect()
-            const opacity = Number(style.opacity)
-            const blurMatch = style.filter.match(/blur\(\s*([0-9.]+)px\s*\)/iu)
-            const blur = blurMatch?.[1] ? Number.parseFloat(blurMatch[1]) : 0
-            const matrix = style.transform.match(/matrix\(\s*([^)]+)\)/u)
-            const parts = matrix?.[1]?.split(',').map(value => Number.parseFloat(value)) ?? []
-            const scaleX = parts.length >= 2 ? Math.hypot(parts[0] ?? 1, parts[1] ?? 0) : 1
-            const onScreen = bounds.bottom > 8 && bounds.top < window.innerHeight - 8 && bounds.height > 8
-            const readable = onScreen && opacity >= 0.9 && blur <= 0.6 && scaleX >= 0.9
+            const end = Number(element.getAttribute('data-sitesensory-fade-end'))
 
-            if (readable) continue
+            if (!Number.isFinite(end)) continue
 
-            let section: HTMLElement | null = pin.parentElement
-
-            while (
-                section
-                && section !== document.body
-                && section.offsetHeight < window.innerHeight * 1.05
-            ) {
-                section = section.parentElement
-            }
-
-            const host = section && section !== document.body ? section : pin
-            const start = Math.round(host.getBoundingClientRect().top + window.scrollY)
-
-            if (start <= window.scrollY + 24) continue
-            if (start >= window.scrollY + window.innerHeight - 24) continue
-            if (best !== null && start >= best) continue
-
-            best = start
+            return { end }
         }
 
-        return best
+        return null
     })
 }
 
@@ -4007,18 +3998,19 @@ async function captureStackedFadeFrames(
  * @param page 停在擷取位置的頁面。
  * @param signature 這一幀已經看得見的簽名。
  * @param current 目前視窗截圖。
- * @returns 更完整的視窗，以及那一幀的簽名。
+ * @returns 更完整的視窗、那一幀的簽名，以及截下它時的捲動位置。
  */
 async function captureRicherStickyFrame(
     page: import('playwright').Page,
     signature: StickySignature,
     current: Buffer,
-): Promise<{ image: Buffer, signature: StickySignature }>
+): Promise<{ image: Buffer, scroll: number, signature: StickySignature }>
 {
     const origin = await readDocumentScroll(page)
     let bestImage = current
     let bestSignature = signature
     let bestScore = stickySignatureScore(signature)
+    let bestScroll = origin
 
     for (let step = 1; step <= 10; step += 1) {
         const requested = origin + step * 220
@@ -4039,13 +4031,14 @@ async function captureRicherStickyFrame(
         if (score > bestScore) {
             bestScore = score
             bestSignature = next
+            bestScroll = landed
             bestImage = await screenshotViewport(page, 'allow')
         }
     }
 
     await scrollPageToAndHold(page, origin)
 
-    return { image: bestImage, signature: bestSignature }
+    return { image: bestImage, signature: bestSignature, scroll: bestScroll }
 }
 
 /**
@@ -4198,11 +4191,122 @@ export async function stickyBlankEdges(
 }
 
 /**
- * 一列是否近白。近白的 sticky 行程可以拿掉；飽和色列不行。
+ * 接縫上 1–6px 的全寬白線，以及貼齊左緣、只有 1px 的白邊。
+ * 兩邊都是滿版的非白內容時，那條白線是拼接縫，不是版面留白。
+ * 左緣白、右鄰已是畫面時，把左緣補成鄰欄，不刪列。
  *
- * @param slice 一列 RGB。
- * @returns 平均亮度很高時為 true。
+ * @param image 已拼接的頁面。
+ * @param width 頁面寬度。
+ * @returns 補過的頁面，以及刪掉的列數。
  */
+export async function closeInsetCaptureSeams(
+    image: Buffer,
+    width: number,
+): Promise<{ image: Buffer, removedRows: number }>
+{
+    const height = (await sharp(image).metadata()).height ?? 0
+
+    if (height < 8 || width < 8) return { image, removedRows: 0 }
+
+    const raw = await sharp(image).removeAlpha().raw().toBuffer()
+    const rowBytes = width * 3
+    const sampleStep = 8
+    const whiteFraction = (row: number): number => {
+        let white = 0
+        let count = 0
+
+        for (let x = 0; x < width; x += sampleStep) {
+            const index = row * rowBytes + x * 3
+            const luma = ((raw[index] ?? 0) + (raw[index + 1] ?? 0) + (raw[index + 2] ?? 0)) / 3
+
+            if (luma > 248) white += 1
+            count += 1
+        }
+
+        return count === 0 ? 0 : white / count
+    }
+    const drop = new Set<number>()
+    let runStart = -1
+    const closeRun = (runEnd: number): void => {
+        if (runStart < 0) return
+
+        const runLength = runEnd - runStart
+
+        if (runLength >= 1 && runLength <= 6 && runStart > 0 && runEnd < height) {
+            const above = whiteFraction(runStart - 1)
+            const below = whiteFraction(runEnd)
+
+            if (above < 0.05 && below < 0.05) {
+                for (let row = runStart; row < runEnd; row += 1) drop.add(row)
+            }
+        }
+
+        runStart = -1
+    }
+
+    for (let row = 0; row < height; row += 1) {
+        if (whiteFraction(row) > 0.985) {
+            if (runStart < 0) runStart = row
+        }
+        else {
+            closeRun(row)
+        }
+    }
+
+    closeRun(height)
+
+    let edgeRun = 0
+    let edgePainted = false
+    const paintEdge = (row: number): void => {
+        const index = row * rowBytes
+        const neighbor = index + 3
+
+        raw[index] = raw[neighbor] ?? 0
+        raw[index + 1] = raw[neighbor + 1] ?? 0
+        raw[index + 2] = raw[neighbor + 2] ?? 0
+    }
+
+    for (let row = 0; row <= height; row += 1) {
+        const index = row * rowBytes
+        const neighbor = index + 3
+        const onEdge = row < height
+            && ((raw[index] ?? 0) + (raw[index + 1] ?? 0) + (raw[index + 2] ?? 0)) / 3 > 248
+            && ((raw[neighbor] ?? 0) + (raw[neighbor + 1] ?? 0) + (raw[neighbor + 2] ?? 0)) / 3 < 210
+
+        if (onEdge) {
+            edgeRun += 1
+            continue
+        }
+
+        if (edgeRun >= 32) {
+            edgePainted = true
+
+            for (let painted = row - edgeRun; painted < row; painted += 1) paintEdge(painted)
+        }
+
+        edgeRun = 0
+    }
+
+    if (drop.size === 0 && !edgePainted) return { image, removedRows: 0 }
+
+    const removedRows = drop.size
+    const nextHeight = height - removedRows
+    const packed = Buffer.alloc(nextHeight * rowBytes)
+    let offset = 0
+
+    for (let row = 0; row < height; row += 1) {
+        if (drop.has(row)) continue
+
+        raw.copy(packed, offset, row * rowBytes, (row + 1) * rowBytes)
+        offset += rowBytes
+    }
+
+    return {
+        image: await sharp(packed, { raw: { channels: 3, height: nextHeight, width } }).png().toBuffer(),
+        removedRows,
+    }
+}
+
 /**
  * 整幀 sticky 比文件行程多出來的高度，只從最長的純白縫收回。
  * 至少留下 24px，避免把刻意留白刪光。沒有夠長的純白縫就保持失敗。
@@ -4289,6 +4393,12 @@ export async function absorbStrictWhiteOvershoot(
         .toBuffer()
 }
 
+/**
+ * 一列是否近白。近白的 sticky 行程可以拿掉；飽和色列不行。
+ *
+ * @param slice 一列 RGB。
+ * @returns 平均亮度很高時為 true。
+ */
 function isNearWhiteRow(slice: Buffer): boolean
 {
     if (slice.length < 3) return true
