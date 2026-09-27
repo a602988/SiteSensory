@@ -4,11 +4,19 @@ import {
     down,
     up,
 } from './001-initial.js'
+import {
+    down as downDiscoverySource,
+    up as upDiscoverySource,
+} from './002-discovery-source.js'
 
 const migrations: Record<string, Migration> = {
     '001-initial': {
         down,
         up,
+    },
+    '002-discovery-source': {
+        down: downDiscoverySource,
+        up: upDiscoverySource,
     },
 }
 

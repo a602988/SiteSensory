@@ -604,6 +604,275 @@ describe('capture worker', { timeout: 60_000 }, () => {
         expect(await samplePixel(fullPage, 20, 40)).toEqual([34, 197, 94])
         expect(await samplePixel(fullPage, 60, 40)).toEqual([21, 128, 61])
     })
+
+    it('does not treat a transparent fixed shell as a virtual canvas', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?transparentShell=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(readPngSize(fullPage).width).toBe(1920)
+        expect(height).toBeGreaterThan(2380)
+        expect(height).toBeLessThan(2420)
+        expect(await samplePixel(fullPage, 1856, 40)).toEqual([220, 38, 38])
+        expect(await samplePixel(fullPage, 1856, 1120)).not.toEqual([220, 38, 38])
+        expect(await samplePixel(fullPage, 960, 1500)).toEqual([49, 92, 235])
+    })
+
+    it('captures a scroll-locked single screen instead of failing on the leftover pixels', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?scrollLocked=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(readPngSize(fullPage).width).toBe(1920)
+        expect(height).toBeGreaterThan(1070)
+        expect(height).toBeLessThanOrEqual(1084)
+        expect(await samplePixel(fullPage, 960, 540)).toEqual([34, 197, 94])
+    })
+
+    it('waits for a horizontal clip reveal before saving the hero', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?clipReveal=1`,
+        })
+        const viewport = await storage.get(result.viewport.objectKey)
+
+        expect(await samplePixel(viewport, 960, 80)).toEqual([34, 197, 94])
+        expect(await samplePixel(viewport, 960, 80)).not.toEqual([220, 38, 38])
+    })
+
+    it('waits for a crossfade to finish before saving the hero', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?crossfade=1`,
+        })
+        const viewport = await storage.get(result.viewport.objectKey)
+
+        expect(await samplePixel(viewport, 960, 200)).toEqual([34, 197, 94])
+        expect(await samplePixel(viewport, 960, 200)).not.toEqual([220, 38, 38])
+    })
+
+    it('omits hidden menu text from the capture summary', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?hiddenMenu=1`,
+        })
+
+        expect(result.textSummary).toContain('可見標題')
+        expect(result.textSummary).not.toContain('隱藏選單新聞稿')
+        expect(result.textSummary).not.toContain('另一則隱藏消息')
+    })
+
+    it('keeps the page under a hero whose decoration never settles', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?loopingHero=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(height).toBeGreaterThan(2200)
+        expect(await samplePixel(fullPage, 120, 100)).toEqual([255, 92, 56])
+        expect(await samplePixel(fullPage, 200, 1400)).toEqual([49, 92, 235])
+    })
+
+    it('waits for a reveal that starts further down the page', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?animatedSection=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(height).toBeGreaterThan(3000)
+        expect(await samplePixel(fullPage, 400, 2200)).toEqual([34, 197, 94])
+        expect(await samplePixel(fullPage, 400, 2200)).not.toEqual([148, 163, 184])
+        expect(await samplePixel(fullPage, 400, 2900)).toEqual([17, 24, 39])
+    })
+
+    it('returns to the requested scroll after the page rewrites it once', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?scrollRebound=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(height).toBeGreaterThan(4000)
+        expect(await samplePixel(fullPage, 200, 2000)).toEqual([168, 85, 247])
+        expect(await samplePixel(fullPage, 200, 4200)).toEqual([34, 197, 94])
+    })
+
+    it('keeps a sticky pin label once while later states stay in the image', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?stickyPinLabel=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(height).toBeGreaterThan(2800)
+        expect(await samplePixel(fullPage, 40, 480)).toEqual([220, 38, 38])
+        expect(await samplePixel(fullPage, 40, 2200)).not.toEqual([220, 38, 38])
+        expect(await samplePixel(fullPage, 800, 2200)).toEqual([34, 197, 94])
+        expect(await samplePixel(fullPage, 800, 3000)).toEqual([168, 85, 247])
+    })
+
+    it('finishes a scroll-scrubbed heading instead of leaving it blank', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?scrubHeading=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+
+        expect(await samplePixel(fullPage, 80, 220)).toEqual([220, 38, 38])
+    })
+
+    it('shows a scaling scene as one full frame', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?scaleScene=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+
+        expect(await samplePixel(fullPage, 100, 100)).toEqual([49, 92, 235])
+    })
+
+    it('hides a fixed circular cursor follower', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?customCursor=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+
+        expect(await samplePixel(fullPage, 50, 50)).toEqual([248, 245, 239])
+        expect(await samplePixel(fullPage, 50, 50)).not.toEqual([255, 0, 170])
+        expect(await samplePixel(fullPage, 420, 420)).toEqual([248, 245, 239])
+        expect(await samplePixel(fullPage, 420, 420)).not.toEqual([17, 24, 39])
+    })
+
+    it('keeps each readable sticky state instead of stacking them', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?stickyStates=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(height).toBeGreaterThan(1700)
+        expect(height).toBeLessThan(3200)
+        expect(await samplePixel(fullPage, 200, 200)).toEqual([220, 38, 38])
+        expect(await samplePixel(fullPage, 200, 1300)).toEqual([34, 197, 94])
+    }, 120_000)
+
+    it('keeps one full frame for each stacked fade state', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?stackedFade=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(height).toBeGreaterThan(2800)
+        expect(height).toBeLessThan(3600)
+        expect(await samplePixel(fullPage, 200, 400)).toEqual([220, 38, 38])
+        expect(await samplePixel(fullPage, 200, 1500)).toEqual([34, 197, 94])
+        expect(await samplePixel(fullPage, 200, 2600)).toEqual([49, 92, 235])
+    }, 120_000)
+
+    it('keeps one settled frame when a sticky block reveals in stages', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?stickyReveal=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+
+        expect(height).toBeGreaterThan(900)
+        expect(height).toBeLessThan(1800)
+        expect(await countPixels(fullPage, [17, 24, 39])).toBeGreaterThan(8_000)
+    }, 120_000)
+
+    it('writes a pinned heading from the scroll where it is readable', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?pinnedHeading=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+
+        expect(await countPixels(fullPage, [220, 38, 38])).toBeGreaterThan(20_000)
+    }, 120_000)
+
+    it('keeps one frame when a logo grid reveals inside a tall row', async () => {
+        const storage = createLocalObjectStorage(storageRoot)
+        const result = await capturePage({
+            allowLocalNetwork: true,
+            browser,
+            storage,
+            url: `${fixtureUrl}?logoGrid=1`,
+        })
+        const fullPage = await storage.get(result.fullPage.objectKey)
+        const height = readPngSize(fullPage).height
+        const ink = await countPixels(fullPage, [17, 24, 39])
+
+        expect(height).toBeGreaterThan(900)
+        expect(height).toBeLessThan(2_000)
+        expect(ink).toBeGreaterThan(4_000)
+        expect(ink).toBeLessThan(30_000)
+    }, 120_000)
 })
 
 /**
@@ -638,6 +907,356 @@ function createFixtureServer(): Server
         const canvasWipeStack = parameters.has('canvasWipeStack')
         const midCanvasWipeStack = parameters.has('midCanvasWipeStack')
         const venetianCanvasWipe = parameters.has('venetianCanvasWipe')
+        const transparentShell = parameters.has('transparentShell')
+        const scrollLocked = parameters.has('scrollLocked')
+        const clipReveal = parameters.has('clipReveal')
+        const crossfade = parameters.has('crossfade')
+        const hiddenMenu = parameters.has('hiddenMenu')
+        const loopingHero = parameters.has('loopingHero')
+        const animatedSection = parameters.has('animatedSection')
+        const scrollRebound = parameters.has('scrollRebound')
+        const stickyPinLabel = parameters.has('stickyPinLabel')
+        const scrubHeading = parameters.has('scrubHeading')
+        const scaleScene = parameters.has('scaleScene')
+        const customCursor = parameters.has('customCursor')
+        const stackedFade = parameters.has('stackedFade')
+        const pinnedHeading = parameters.has('pinnedHeading')
+        const logoGrid = parameters.has('logoGrid')
+
+        if (scrubHeading) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Scrub Heading Fixture</title></head>
+<body style="margin:0;background:#f8f5ef">
+<section style="height:2400px;background:#f8f5ef">
+<h2 id="title" style="position:sticky;top:180px;left:40px;width:420px;height:140px;margin:0;background:#dc2626;opacity:0">Heading</h2>
+</section>
+<section style="height:800px;background:#111827"></section>
+<script>
+const title = document.querySelector('#title')
+const paint = () => {
+  const progress = Math.min(1, (window.scrollY || 0) / 1800)
+  title.style.opacity = String(progress)
+  title.style.filter = 'blur(' + (16 * (1 - progress)).toFixed(1) + 'px)'
+}
+addEventListener('scroll', paint)
+paint()
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (scaleScene) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Scale Scene Fixture</title></head>
+<body style="margin:0;background:#111111">
+<section style="height:3240px;background:#111111">
+<div id="card" style="position:sticky;top:80px;left:80px;width:1600px;height:800px;background:#315ceb;transform:scale(0.55);transform-origin:center center"></div>
+</section>
+<script>
+const card = document.querySelector('#card')
+const paint = () => {
+  const progress = Math.min(1, (window.scrollY || 0) / 2000)
+  card.style.transform = 'scale(' + (0.55 + 0.45 * progress).toFixed(3) + ')'
+}
+addEventListener('scroll', paint)
+paint()
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (pinnedHeading) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Pinned Heading Fixture</title></head>
+<body style="margin:0;background:#f8f5ef">
+<section style="height:1500px;background:#f8f5ef"></section>
+<section style="height:2200px;background:#ffffff">
+<div style="position:sticky;top:0;height:1080px;background:#ffffff">
+<h2 id="title" style="position:absolute;left:80px;top:760px;width:640px;height:180px;margin:0;background:#dc2626;opacity:0">Our Projects</h2>
+</div>
+</section>
+<script>
+const title = document.querySelector('#title')
+const start = 1500
+const paint = () => {
+  const scroll = window.scrollY || 0
+  if (scroll < start) {
+    title.style.opacity = '0'
+    title.style.transform = 'none'
+  } else if (scroll < start + 520) {
+    title.style.opacity = '1'
+    title.style.transform = 'none'
+  } else {
+    title.style.opacity = '1'
+    title.style.transform = 'translateY(-900px) scale(0.3)'
+  }
+}
+addEventListener('scroll', paint)
+paint()
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (logoGrid) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Logo Grid Fixture</title></head>
+<body style="margin:0;background:#ffffff">
+<section style="height:3200px">
+<div style="position:sticky;top:0;height:1080px;background:#ffffff">
+<h2 style="margin:72px 0 0 80px;font-size:64px">Partners</h2>
+<div id="grid" style="position:absolute;left:40px;top:280px;width:1800px;height:720px;opacity:0">
+${Array.from({ length: 8 }, (_, index) => `<img alt="" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" style="position:absolute;left:${(index % 4) * 200}px;top:${Math.floor(index / 4) * 80}px;width:120px;height:28px"><span style="display:inline-block;width:120px;height:28px;margin:24px;background:#111827"></span>`).join('')}
+</div>
+</div>
+</section>
+<script>
+const grid = document.querySelector('#grid')
+const paint = () => {
+  grid.style.opacity = window.scrollY > 700 ? '1' : '0'
+}
+addEventListener('scroll', paint)
+paint()
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (stackedFade) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Stacked Fade Fixture</title></head>
+<body style="margin:0;background:#ffffff">
+<section style="height:3240px">
+<div style="position:sticky;top:0;height:1080px">
+<div id="one" style="position:absolute;inset:0;background:#dc2626;opacity:0">One</div>
+<div id="two" style="position:absolute;inset:0;background:#22c55e;opacity:0">Two</div>
+<div id="three" style="position:absolute;inset:0;background:#315ceb;opacity:0">Three</div>
+</div>
+</section>
+<script>
+const one = document.querySelector('#one')
+const two = document.querySelector('#two')
+const three = document.querySelector('#three')
+const paint = () => {
+  const scroll = window.scrollY || 0
+  one.style.opacity = scroll >= 200 && scroll < 700 ? '1' : '0'
+  two.style.opacity = scroll >= 1100 && scroll < 1600 ? '1' : '0'
+  three.style.opacity = scroll >= 1900 && scroll < 2500 ? '1' : '0'
+}
+addEventListener('scroll', paint)
+paint()
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (parameters.has('stickyStates')) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Sticky States Fixture</title></head>
+<body style="margin:0;background:#ffffff">
+<section style="height:3600px">
+<div style="position:sticky;top:0;height:1080px">
+<div id="alpha" style="position:absolute;inset:0;background:#dc2626;color:#fff;font-size:64px;padding:80px;opacity:1">Alpha State</div>
+<div id="beta" style="position:absolute;inset:0;background:#22c55e;color:#fff;font-size:64px;padding:80px;opacity:0">Beta State</div>
+</div>
+</section>
+<script>
+const alpha = document.querySelector('#alpha')
+const beta = document.querySelector('#beta')
+const paint = () => {
+  const showBeta = window.scrollY >= 1400
+  alpha.style.opacity = showBeta ? '0' : '1'
+  beta.style.opacity = showBeta ? '1' : '0'
+}
+addEventListener('scroll', paint)
+paint()
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (parameters.has('stickyReveal')) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Sticky Reveal Fixture</title></head>
+<body style="margin:0;background:#ffffff;font-family:Arial,sans-serif">
+<section style="height:3240px">
+<div style="position:sticky;top:0;height:1080px;background:#ffffff">
+<h2 style="margin:48px 0 0 80px;font-size:72px">Partners</h2>
+<p id="desc" style="margin:24px 0 0 80px;font-size:32px;opacity:0">Settled copy</p>
+<div id="logos" style="position:absolute;left:80px;top:520px;width:640px;height:80px;background:#111827;color:#fff;font-size:28px;opacity:0">Logo Row</div>
+</div>
+</section>
+<script>
+const desc = document.querySelector('#desc')
+const logos = document.querySelector('#logos')
+const paint = () => {
+  desc.style.opacity = window.scrollY > 500 ? '1' : '0'
+  logos.style.opacity = window.scrollY > 1200 ? '1' : '0'
+}
+addEventListener('scroll', paint)
+paint()
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (customCursor) {
+            const html = `<!doctype html>
+<html lang="zh-Hant" style="cursor:none">
+<head><meta charset="utf-8"><title>Custom Cursor Fixture</title></head>
+<body style="margin:0;background:#f8f5ef;cursor:none">
+<div style="position:fixed;left:40px;top:40px;width:32px;height:32px;border-radius:50%;background:#ff00aa;pointer-events:none;z-index:5"></div>
+<div style="position:fixed;left:360px;top:360px;width:120px;height:120px;border-radius:50%;background:#111827;color:#fff;pointer-events:none;display:grid;place-items:center;z-index:6">View Project</div>
+<section style="height:1800px;background:#f8f5ef"></section>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (loopingHero) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Looping Hero Fixture</title></head>
+<body style="margin:0;background:#f8f5ef">
+<canvas id="blob" width="1920" height="1080" style="display:block;width:1920px;height:1080px"></canvas>
+<div style="position:absolute;left:80px;top:72px;width:280px;height:64px;background:#ff5c38"></div>
+<section style="height:1080px;background:#315ceb"></section>
+<section style="height:400px;background:#f8f5ef"></section>
+<script>
+const canvas = document.querySelector('#blob')
+const context = canvas.getContext('2d')
+let tick = 0
+const draw = () => {
+  tick += 1
+  context.fillStyle = tick % 2 === 0 ? '#7c3aed' : '#db2777'
+  context.fillRect(0, 0, 1920, 1080)
+  requestAnimationFrame(draw)
+}
+draw()
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (animatedSection) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Animated Section Fixture</title></head>
+<body style="margin:0;background:#f8f5ef">
+<section style="height:2000px;background:#f8f5ef"></section>
+<section id="block" style="height:600px;background:#22c55e;opacity:0.4"></section>
+<section style="height:800px;background:#111827"></section>
+<script>
+const block = document.querySelector('#block')
+let started = 0
+const tick = () => {
+  const top = block.getBoundingClientRect().top
+  const inView = top < window.innerHeight * 0.85 && top + block.offsetHeight > 80
+  if (!inView) {
+    started = 0
+    block.style.opacity = '0.4'
+    requestAnimationFrame(tick)
+    return
+  }
+  if (started === 0) started = performance.now()
+  const progress = Math.min(1, (performance.now() - started) / 1200)
+  block.style.opacity = String(0.4 + 0.6 * progress)
+  requestAnimationFrame(tick)
+}
+requestAnimationFrame(tick)
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (scrollRebound) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Scroll Rebound Fixture</title></head>
+<body style="margin:0;background:#f8f5ef">
+<section style="height:1800px;background:#f8f5ef"></section>
+<section style="height:400px;background:#a855f7"></section>
+<section style="height:1800px;background:#f8f5ef"></section>
+<section style="height:600px;background:#22c55e"></section>
+<script>
+let armed = true
+addEventListener('scroll', () => {
+  if (!armed) return
+  if (!document.documentElement.hasAttribute('data-sitesensory-hide-fixed')) return
+  const top = Math.round(scrollY)
+  if (top < 1600 || top > 3200) return
+  armed = false
+  scrollTo(0, top + 367)
+})
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (stickyPinLabel) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Sticky Pin Label Fixture</title></head>
+<body style="margin:0;background:#f8f5ef">
+<section style="height:3240px">
+<div style="position:sticky;top:0;height:1080px">
+<div id="stage" style="position:absolute;inset:0;background:#315ceb"></div>
+<div style="position:absolute;left:0;top:400px;width:220px;height:180px;background:#dc2626"></div>
+</div>
+</section>
+<script>
+const stage = document.querySelector('#stage')
+const paint = () => {
+  stage.style.background = scrollY < 900 ? '#315ceb' : scrollY < 1800 ? '#22c55e' : '#a855f7'
+}
+addEventListener('scroll', paint)
+paint()
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
 
         if (cookies) {
             const html = `<!doctype html>
@@ -1386,6 +2005,96 @@ addEventListener('scroll',()=>{
             return
         }
 
+        if (transparentShell) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Transparent Shell Fixture</title></head>
+<body style="margin:0;background:#315ceb">
+<header style="position:fixed;top:0;left:0;width:1920px;height:1120px;pointer-events:none;background:transparent;z-index:5">
+<div style="position:fixed;top:24px;right:24px;width:80px;height:40px;background:#dc2626"></div>
+</header>
+<main style="height:2400px;background:#315ceb"></main>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (scrollLocked) {
+            const html = `<!doctype html>
+<html lang="zh-Hant" style="overflow:hidden">
+<head><meta charset="utf-8"><title>Scroll Locked Fixture</title></head>
+<body style="margin:0;overflow:hidden;height:1084px;background:#22c55e">
+<div style="height:1084px;background:#22c55e"></div>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (clipReveal) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Clip Reveal Fixture</title></head>
+<body style="margin:0;background:#dc2626">
+<section id="hero" style="height:2200px;background:#22c55e;clip-path:inset(45% 0 0 0)"></section>
+<script>
+setTimeout(() => {
+  const hero = document.querySelector('#hero')
+  hero.style.transition = 'clip-path 900ms linear'
+  hero.style.clipPath = 'inset(0% 0 0 0)'
+}, 100)
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (crossfade) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Crossfade Fixture</title></head>
+<body style="margin:0;background:#111111">
+<div style="position:relative;height:2200px">
+<div id="from" style="position:absolute;left:0;top:0;width:1920px;height:1080px;background:#dc2626;opacity:1"></div>
+<div id="to" style="position:absolute;left:0;top:0;width:1920px;height:1080px;background:#22c55e;opacity:0.25"></div>
+</div>
+<script>
+setTimeout(() => {
+  const from = document.querySelector('#from')
+  const to = document.querySelector('#to')
+  from.style.transition = 'opacity 1s linear'
+  to.style.transition = 'opacity 1s linear'
+  from.style.opacity = '0'
+  to.style.opacity = '1'
+}, 80)
+</script>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
+        if (hiddenMenu) {
+            const html = `<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Hidden Menu Fixture</title></head>
+<body style="margin:0;background:#f8f5ef">
+<main style="height:2200px;padding:80px;font-size:48px">可見標題</main>
+<nav style="position:fixed;left:-3000px;top:0;width:400px;height:200px">隱藏選單新聞稿</nav>
+<div aria-hidden="true" style="position:absolute;top:200px;left:80px">另一則隱藏消息</div>
+</body></html>`
+
+            response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+            response.end(html)
+            return
+        }
+
         const changed = parameters.has('variant')
         const lazy = parameters.has('lazy')
         const fixedCanvas = parameters.has('fixedCanvas')
@@ -1442,6 +2151,18 @@ function readPngSize(image: Buffer): { height: number, width: number }
  * @param top 垂直座標。
  * @returns 該點的 RGB 值。
  */
+async function countPixels(image: Buffer, color: [number, number, number]): Promise<number>
+{
+    const { data } = await sharp(image).removeAlpha().raw().toBuffer({ resolveWithObject: true })
+    let count = 0
+
+    for (let index = 0; index < data.length; index += 3) {
+        if (data[index] === color[0] && data[index + 1] === color[1] && data[index + 2] === color[2]) count += 1
+    }
+
+    return count
+}
+
 async function samplePixel(image: Buffer, left: number, top: number): Promise<number[]>
 {
     const pixel = await sharp(image)

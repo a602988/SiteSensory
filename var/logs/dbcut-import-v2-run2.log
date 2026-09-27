@@ -1,0 +1,55 @@
+$ pnpm --filter @sitesensory/cli import:dbcut
+$ tsx src/import-dbcut.ts
+[
+  {
+    "name": "Ceramic Beats",
+    "postUrl": "https://www.dbcut.com/websites/25939",
+    "websiteId": "25939",
+    "capturedUrl": "https://ceramic-beats.zui.ooo/",
+    "externalUrl": "https://ceramic-beats.zui.ooo/",
+    "pageId": "374a6e59-d570-44b4-8e73-2e8d32f90162",
+    "pageType": "home",
+    "status": "imported"
+  },
+  {
+    "name": "Pensatori Irrazionali",
+    "postUrl": "https://www.dbcut.com/websites/25938",
+    "websiteId": "25938",
+    "capturedUrl": "https://pensatori-irrazionali.com/",
+    "externalUrl": "https://pensatori-irrazionali.com/",
+    "pageId": "934f099d-2b4a-43e2-8a57-eca542ea0e39",
+    "pageType": "home",
+    "status": "imported"
+  },
+  {
+    "name": "Pensatori Irrazionali",
+    "postUrl": "https://www.dbcut.com/websites/25938",
+    "websiteId": "25938",
+    "capturedUrl": "https://pensatori-irrazionali.com/contact",
+    "externalUrl": "https://pensatori-irrazionali.com/",
+    "pageId": "2b40bc6a-0773-4791-9dd6-a79797afb208",
+    "pageType": "contact",
+    "status": "imported"
+  },
+  {
+    "name": "인스플래닛",
+    "postUrl": "https://www.dbcut.com/websites/25937",
+    "websiteId": "25937",
+    "capturedUrl": "https://www.insplanet.co.kr/",
+    "externalUrl": "https://www.insplanet.co.kr/",
+    "pageId": "c32d0fcf-5ab5-4452-9ba2-713b7728a101",
+    "pageType": "home",
+    "status": "imported"
+  },
+  {
+    "name": "인스플래닛",
+    "postUrl": "https://www.dbcut.com/websites/25937",
+    "websiteId": "25937",
+    "capturedUrl": "https://www.insplanet.co.kr/about",
+    "externalUrl": "https://www.insplanet.co.kr/",
+    "pageId": "33855d73-3b8d-4e0f-9a9e-9014c74f7b2d",
+    "pageType": "about",
+    "status": "imported"
+  }
+]
+EXIT=0

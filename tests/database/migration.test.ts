@@ -36,7 +36,7 @@ integration('database migration', () => {
     it('applies seeds, protects created_at, and rolls back', async () => {
         const migrationResults = await migrateToLatest(database)
 
-        expect(migrationResults).toHaveLength(1)
+        expect(migrationResults).toHaveLength(2)
 
         const extension = await sql<{ extversion: string }>`
             SELECT extversion FROM pg_extension WHERE extname = 'vector'
@@ -184,6 +184,18 @@ integration('database migration', () => {
         await expect(sql`
             UPDATE users SET created_at = created_at - interval '1 day' WHERE id = ${userId}
         `.execute(database)).rejects.toThrow('created_at is immutable')
+
+        const rollbackDiscovery = await rollbackOne(database)
+        const discoveryColumn = await sql<{ column_name: string | null }>`
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'pages'
+              AND column_name = 'discovery_source_url'
+        `.execute(database)
+
+        expect(rollbackDiscovery).toHaveLength(1)
+        expect(discoveryColumn.rows).toEqual([])
 
         const rollbackResults = await rollbackOne(database)
         const usersTable = await sql<{ relation: string | null }>`

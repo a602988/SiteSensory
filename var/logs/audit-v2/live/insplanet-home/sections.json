@@ -1,0 +1,264 @@
+{
+ "url": "https://www.insplanet.co.kr/",
+ "scrollHeight": 18655,
+ "heads": [
+  {
+   "tag": "H1",
+   "y": 512,
+   "h": 337,
+   "t": "We Are Insplanet"
+  },
+  {
+   "tag": "SECTION",
+   "y": 1080,
+   "h": 2808,
+   "t": "Beyond UX The AX Creator 기술에 가치를 더해, 내일의 설렘을 완성합니다."
+  },
+  {
+   "tag": "H2",
+   "y": 1492,
+   "h": 257,
+   "t": "Beyond UX The AX Creator"
+  },
+  {
+   "tag": "SECTION",
+   "y": 3888,
+   "h": 2916,
+   "t": "새롭고 독창적인 탐색, 인스플래닛은 경험을 만들어 갑니다. 새롭고 독창적인 탐색, 인스플래닛은 경험을 만들어 갑니다. 새롭고 "
+  },
+  {
+   "tag": "H2",
+   "y": 4217,
+   "h": 346,
+   "t": "비즈니스의 본질을 읽고, 더 깊은 아이디어를 제안합니다."
+  },
+  {
+   "tag": "H2",
+   "y": 4217,
+   "h": 346,
+   "t": "끊임없는 트렌드 탐구를 통해 남다른 사용자 경험을 설계합니다."
+  },
+  {
+   "tag": "H2",
+   "y": 4217,
+   "h": 346,
+   "t": "검증된 프로젝트 노하우로 완벽한 디지털 전환을 실현합니다."
+  },
+  {
+   "tag": "SECTION",
+   "y": 6804,
+   "h": 5695,
+   "t": "Our Services Mega Finance DNA UI/UX Design Platform Operation Service "
+  },
+  {
+   "tag": "H2",
+   "y": 7264,
+   "h": 160,
+   "t": "Our Services"
+  },
+  {
+   "tag": "H3",
+   "y": 8532,
+   "h": 67,
+   "t": "Mega Finance DNA"
+  },
+  {
+   "tag": "H3",
+   "y": 9521,
+   "h": 67,
+   "t": "Cross-Industry Insight"
+  },
+  {
+   "tag": "H3",
+   "y": 10510,
+   "h": 67,
+   "t": "SI Synergy & Partnership"
+  },
+  {
+   "tag": "H3",
+   "y": 11499,
+   "h": 67,
+   "t": "AX Tech & Design System"
+  },
+  {
+   "tag": "SECTION",
+   "y": 12499,
+   "h": 2700,
+   "t": "Our Partners 고객이 지향하는 브랜드 철학의 본질을 심도 있게 분석하여 최선의 결과물을 만들어냅니다. 브랜드의 메시지"
+  },
+  {
+   "tag": "H2",
+   "y": 12840,
+   "h": 194,
+   "t": "Our Partners"
+  },
+  {
+   "tag": "SECTION",
+   "y": 15199,
+   "h": 1296,
+   "t": "Our Projects 차세대지급결제플랫폼 온누리 디지털상품권 Client 조폐공사 Launch M"
+  },
+  {
+   "tag": "H2",
+   "y": 15439,
+   "h": 58,
+   "t": "Our Projects"
+  },
+  {
+   "tag": "H3",
+   "y": 15657,
+   "h": 134,
+   "t": "차세대지급결제플랫폼 온누리 디지털상품권"
+  },
+  {
+   "tag": "H3",
+   "y": 15657,
+   "h": 134,
+   "t": "신한은행 HeyYoung Campus"
+  },
+  {
+   "tag": "H3",
+   "y": 15657,
+   "h": 134,
+   "t": "LG CNS DAP GenAI"
+  },
+  {
+   "tag": "SECTION",
+   "y": 16495,
+   "h": 1080,
+   "t": "Say Hello! 우리와 어떤 프로젝트를 함께 하고 싶으세요?"
+  },
+  {
+   "tag": "H2",
+   "y": 16870,
+   "h": 216,
+   "t": "Say Hello!"
+  },
+  {
+   "tag": "SECTION",
+   "y": 0,
+   "h": 0,
+   "t": "Beyond UXThe AX Creator기술에 가치를 더해,내일의 설렘을 완성합니다."
+  },
+  {
+   "tag": "H2",
+   "y": 0,
+   "h": 0,
+   "t": "Beyond UXThe AX Creator"
+  },
+  {
+   "tag": "SECTION",
+   "y": 0,
+   "h": 0,
+   "t": "Insight비즈니스의본질을 읽고,더 깊은 아이디어를제안합니다.Interest끊임없는트렌드 탐구를 통해남다른 사용자 경험을설계"
+  },
+  {
+   "tag": "H2",
+   "y": 0,
+   "h": 0,
+   "t": "비즈니스의본질을 읽고,더 깊은 아이디어를제안합니다."
+  },
+  {
+   "tag": "H2",
+   "y": 0,
+   "h": 0,
+   "t": "끊임없는트렌드 탐구를 통해남다른 사용자 경험을설계합니다."
+  },
+  {
+   "tag": "H2",
+   "y": 0,
+   "h": 0,
+   "t": "검증된프로젝트 노하우로완벽한 디지털 전환을실현합니다."
+  },
+  {
+   "tag": "SECTION",
+   "y": 0,
+   "h": 0,
+   "t": "Our ServicesMega Finance DNAUI/UX DesignPlatform OperationService Rene"
+  },
+  {
+   "tag": "H2",
+   "y": 0,
+   "h": 0,
+   "t": "Our Services"
+  },
+  {
+   "tag": "H3",
+   "y": 0,
+   "h": 0,
+   "t": "Mega Finance DNA"
+  },
+  {
+   "tag": "H3",
+   "y": 0,
+   "h": 0,
+   "t": "Cross-Industry Insight"
+  },
+  {
+   "tag": "H3",
+   "y": 0,
+   "h": 0,
+   "t": "SI Synergy & Partnership"
+  },
+  {
+   "tag": "H3",
+   "y": 0,
+   "h": 0,
+   "t": "AX Tech & Design Sys."
+  },
+  {
+   "tag": "SECTION",
+   "y": 0,
+   "h": 0,
+   "t": "Our Partners고객이 지향하는 브랜드 철학의 본질을 심도 있게 분석하여 최선의 결과물을 만들어냅니다. 브랜드의 메시지가"
+  },
+  {
+   "tag": "H2",
+   "y": 0,
+   "h": 0,
+   "t": "Our Partners"
+  },
+  {
+   "tag": "SECTION",
+   "y": 0,
+   "h": 0,
+   "t": "Our Projects차세대지급결제플랫폼온누리 디지털상품권Client조폐공사LaunchMar, 20"
+  },
+  {
+   "tag": "H2",
+   "y": 0,
+   "h": 0,
+   "t": "Our Projects"
+  },
+  {
+   "tag": "H3",
+   "y": 0,
+   "h": 0,
+   "t": "차세대지급결제플랫폼온누리 디지털상품권"
+  },
+  {
+   "tag": "H3",
+   "y": 0,
+   "h": 0,
+   "t": "신한은행HeyYoung Campus"
+  },
+  {
+   "tag": "H3",
+   "y": 0,
+   "h": 0,
+   "t": "LG CNSDAP GenAI"
+  },
+  {
+   "tag": "SECTION",
+   "y": 0,
+   "h": 0,
+   "t": "Say Hello!우리와 어떤 프로젝트를 함께 하고 싶으세요?"
+  },
+  {
+   "tag": "H2",
+   "y": 0,
+   "h": 0,
+   "t": "Say Hello!"
+  }
+ ]
+}

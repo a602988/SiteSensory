@@ -2,7 +2,6 @@ import type {
     AnalysisResult,
     CapturedPageInput,
     PageDetail,
-    PageSummary,
 } from '../../packages/contracts/src/index.js'
 
 import type { PageStore } from '../../apps/api/src/page-store.js'
@@ -18,6 +17,7 @@ const PAGE_VERSION_ID = '00000000-0000-4000-8000-000000000102'
 export function createMemoryPageStore(): PageStore
 {
     const pages = new Map<string, PageDetail>()
+    const published = new Set<string>()
 
     return {
         async applyAnalysis(pageId: string, analysis: AnalysisResult): Promise<PageDetail | null>
@@ -33,15 +33,17 @@ export function createMemoryPageStore(): PageStore
                 ...page,
                 language: analysis.languages.find(language => language.role === 'primary')?.code ?? null,
                 pageType: analysis.pageType.key,
+                publishedAt: new Date().toISOString(),
                 summary: analysis.analysisSummary,
                 tags,
             }
 
             pages.set(pageId, updated)
+            published.add(pageId)
 
             return updated
         },
-        async createCapturedPage(input: CapturedPageInput): Promise<PageSummary>
+        async createCapturedPage(input: CapturedPageInput): Promise<PageDetail>
         {
             const now = new Date().toISOString()
             const detail: PageDetail = {
@@ -53,10 +55,10 @@ export function createMemoryPageStore(): PageStore
                 language: input.language,
                 pageType: 'home',
                 pageVersionId: PAGE_VERSION_ID,
-                publishedAt: now,
+                publishedAt: null,
                 sourceUrl: input.finalUrl,
-                summary: input.summary,
-                tags: [{ group: 'style', key: 'minimal', name: '極簡' }],
+                summary: null,
+                tags: [],
                 thumbnailAssetUrl: `/thumbnails/${input.fullPageAsset.objectKey}`,
                 title: input.title,
                 viewportAssetUrl: `/assets/${input.viewportAsset.objectKey}`,
@@ -64,16 +66,20 @@ export function createMemoryPageStore(): PageStore
             }
 
             pages.set(detail.id, detail)
+            published.delete(detail.id)
 
             return detail
         },
         async getPage(pageId)
         {
+            if (!published.has(pageId)) return null
+
             return pages.get(pageId) ?? null
         },
         async listPages(search)
         {
             const items = [...pages.values()]
+                .filter(page => published.has(page.id))
                 .filter(page => !search.tag || page.tags.some(tag => tag.key === search.tag))
 
             return {

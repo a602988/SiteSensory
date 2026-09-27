@@ -1,0 +1,198 @@
+{
+  "completed": true,
+  "results": [
+    {
+      "name": "Ceramic Beats",
+      "postUrl": "https://www.dbcut.com/websites/25939",
+      "websiteId": "25939",
+      "capturedUrl": "https://ceramic-beats.zui.ooo/",
+      "externalUrl": "https://ceramic-beats.zui.ooo/",
+      "pageId": "374a6e59-d570-44b4-8e73-2e8d32f90162",
+      "pageType": "home",
+      "status": "imported"
+    },
+    {
+      "name": "Pensatori Irrazionali",
+      "postUrl": "https://www.dbcut.com/websites/25938",
+      "websiteId": "25938",
+      "capturedUrl": "https://pensatori-irrazionali.com/",
+      "externalUrl": "https://pensatori-irrazionali.com/",
+      "pageType": "home",
+      "reason": "網站將 12096px 的擷取位置改到 12463px，無法產生無缺口的完整頁面",
+      "status": "skipped"
+    },
+    {
+      "name": "인스플래닛",
+      "postUrl": "https://www.dbcut.com/websites/25937",
+      "websiteId": "25937",
+      "capturedUrl": "https://www.insplanet.co.kr/",
+      "externalUrl": "https://www.insplanet.co.kr/",
+      "pageType": "home",
+      "reason": "page.screenshot: Timeout 120000ms exceeded.\nCall log:\n  - taking page screenshot\n  - waiting for fonts to load...\n  - fonts loaded\n",
+      "status": "skipped"
+    },
+    {
+      "name": "LG CNS PhysicalWorks",
+      "postUrl": "https://www.dbcut.com/websites/25936",
+      "websiteId": "25936",
+      "capturedUrl": "",
+      "externalUrl": "",
+      "pageType": "home",
+      "reason": "dbcut link did not resolve",
+      "status": "skipped"
+    },
+    {
+      "name": "트리니티항공",
+      "postUrl": "https://www.dbcut.com/websites/25935",
+      "websiteId": "25935",
+      "capturedUrl": "",
+      "externalUrl": "",
+      "pageType": "home",
+      "reason": "dbcut link did not resolve",
+      "status": "skipped"
+    },
+    {
+      "name": "아트파이",
+      "postUrl": "https://www.dbcut.com/websites/25934",
+      "websiteId": "25934",
+      "capturedUrl": "",
+      "externalUrl": "",
+      "pageType": "home",
+      "reason": "dbcut link did not resolve",
+      "status": "skipped"
+    },
+    {
+      "name": "SQUIZ",
+      "postUrl": "https://www.dbcut.com/websites/25933",
+      "websiteId": "25933",
+      "capturedUrl": "",
+      "externalUrl": "",
+      "pageType": "home",
+      "reason": "dbcut link did not resolve",
+      "status": "skipped"
+    },
+    {
+      "name": "Khanh Nguyen",
+      "postUrl": "https://www.dbcut.com/websites/25932",
+      "websiteId": "25932",
+      "capturedUrl": "",
+      "externalUrl": "",
+      "pageType": "home",
+      "reason": "dbcut link did not resolve",
+      "status": "skipped"
+    },
+    {
+      "name": "Hobro Digital",
+      "postUrl": "https://www.dbcut.com/websites/25931",
+      "websiteId": "25931",
+      "capturedUrl": "",
+      "externalUrl": "",
+      "pageType": "home",
+      "reason": "dbcut link did not resolve",
+      "status": "skipped"
+    },
+    {
+      "name": "매쓰플랫",
+      "postUrl": "https://www.dbcut.com/websites/25929",
+      "websiteId": "25929",
+      "capturedUrl": "",
+      "externalUrl": "",
+      "pageType": "home",
+      "reason": "dbcut link did not resolve",
+      "status": "skipped"
+    },
+    {
+      "name": "SK디스커버리",
+      "postUrl": "https://www.dbcut.com/websites/25928",
+      "websiteId": "25928",
+      "capturedUrl": "",
+      "externalUrl": "",
+      "pageType": "home",
+      "reason": "dbcut link did not resolve",
+      "status": "skipped"
+    },
+    {
+      "name": "리커너스",
+      "postUrl": "https://www.dbcut.com/websites/25927",
+      "websiteId": "25927",
+      "capturedUrl": "",
+      "externalUrl": "",
+      "pageType": "home",
+      "reason": "dbcut link did not resolve",
+      "status": "skipped"
+    },
+    {
+      "name": "유한양행 창립 100주년 기념 온라인 역사관",
+      "postUrl": "https://www.dbcut.com/websites/25926",
+      "websiteId": "25926",
+      "capturedUrl": "",
+      "externalUrl": "",
+      "pageType": "home",
+      "reason": "dbcut link did not resolve",
+      "status": "skipped"
+    },
+    {
+      "name": "소이정 메디랩",
+      "postUrl": "https://www.dbcut.com/websites/25925",
+      "websiteId": "25925",
+      "capturedUrl": "",
+      "externalUrl": "",
+      "pageType": "home",
+      "reason": "dbcut link did not resolve",
+      "status": "skipped"
+    },
+    {
+      "name": "Weekend Max Mara Pasticcino Bag Wor…",
+      "postUrl": "https://www.dbcut.com/websites/25924",
+      "websiteId": "25924",
+      "capturedUrl": "",
+      "externalUrl": "",
+      "pageType": "home",
+      "reason": "dbcut link did not resolve",
+      "status": "skipped"
+    },
+    {
+      "name": "Cartier Le Chœur des Pierres",
+      "postUrl": "https://www.dbcut.com/websites/25923",
+      "websiteId": "25923",
+      "capturedUrl": "",
+      "externalUrl": "",
+      "pageType": "home",
+      "reason": "dbcut link did not resolve",
+      "status": "skipped"
+    },
+    {
+      "name": "하이브",
+      "postUrl": "https://www.dbcut.com/websites/25922",
+      "websiteId": "25922",
+      "capturedUrl": "",
+      "externalUrl": "",
+      "pageType": "home",
+      "reason": "dbcut link did not resolve",
+      "status": "skipped"
+    },
+    {
+      "name": "Sunbousai",
+      "postUrl": "https://www.dbcut.com/websites/25921",
+      "websiteId": "25921",
+      "capturedUrl": "",
+      "externalUrl": "",
+      "pageType": "home",
+      "reason": "dbcut link did not resolve",
+      "status": "skipped"
+    },
+    {
+      "name": "Goodpatch",
+      "postUrl": "https://www.dbcut.com/websites/25920",
+      "websiteId": "25920",
+      "capturedUrl": "",
+      "externalUrl": "",
+      "pageType": "home",
+      "reason": "dbcut link did not resolve",
+      "status": "skipped"
+    }
+  ],
+  "siteCount": 2,
+  "source": "https://www.dbcut.com/",
+  "updatedAt": "2026-09-26T11:39:01.983Z"
+}

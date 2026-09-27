@@ -142,6 +142,7 @@ export interface Pages {
   canonical_url: string;
   created_at: Generated<Timestamp>;
   current_version_id: string | null;
+  discovery_source_url: string | null;
   id: Generated<string>;
   last_checked_at: Timestamp | null;
   normalized_url_hash: string;

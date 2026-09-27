@@ -213,15 +213,14 @@ describe('API route boundaries', () => {
         expect(accepted.statusCode).toBe(201)
         expect(accepted.json().title).toBe('Example')
         expect(accepted.json().width).toBe(1920)
+        expect(accepted.json().publishedAt).toBeNull()
 
         const pageId = accepted.json().id as string
         const detail = await appA.inject({ method: 'GET', url: `/api/v1/pages/${pageId}` })
-        const taggedPages = await appA.inject({ method: 'GET', url: '/api/v1/pages?tag=minimal' })
-        const unmatchedPages = await appA.inject({ method: 'GET', url: '/api/v1/pages?tag=luxury' })
+        const listed = await appA.inject({ method: 'GET', url: '/api/v1/pages' })
 
-        expect(detail.json().tags).toEqual([{ group: 'style', key: 'minimal', name: '極簡' }])
-        expect(taggedPages.json().items).toHaveLength(1)
-        expect(unmatchedPages.json().items).toHaveLength(0)
+        expect(detail.statusCode).toBe(404)
+        expect(listed.json().items).toHaveLength(0)
     })
 
     it('protects and validates Codex analysis before updating public classification', async () => {
@@ -323,6 +322,13 @@ describe('API route boundaries', () => {
             summary: analysis.analysisSummary,
             tags: [{ group: 'style', key: 'minimal', name: '極簡' }],
         })
+
+        const detail = await appA.inject({ method: 'GET', url: `/api/v1/pages/${pageId}` })
+        const taggedPages = await appA.inject({ method: 'GET', url: '/api/v1/pages?tag=minimal' })
+
+        expect(detail.statusCode).toBe(200)
+        expect(detail.json().tags).toEqual([{ group: 'style', key: 'minimal', name: '極簡' }])
+        expect(taggedPages.json().items).toHaveLength(1)
     })
 })
 

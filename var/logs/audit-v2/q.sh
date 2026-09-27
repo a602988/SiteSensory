@@ -1,0 +1,2 @@
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+docker exec sitesensory-database sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At -F"|" -c "select p.id, p.status, p.discovery_source_url, pv.version_number, pv.status, pv.final_url, va.object_key, va.width, va.height, fa.object_key, fa.width, fa.height, pv.published_at from pages p join page_versions pv on pv.page_id=p.id join assets va on va.id=pv.viewport_asset_id join assets fa on fa.id=pv.full_page_asset_id order by pv.created_at"'
