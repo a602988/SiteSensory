@@ -526,8 +526,7 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
     let outputHeight = 0
     let previousSignature: Buffer | null = null
     let recentTail: Buffer | null = null
-    let keptFullViewport: Buffer | null = null
-    let keptFullScroll = 0
+    let scrubHeldUntil = 0
     let stickyHold: StickySignature | null = null
     let trimmedPixels = 0
     const protectedBands: MediaBand[] = []
@@ -710,31 +709,58 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
             continue
         }
 
-        if (
-            viewport
-            && keptFullViewport
-            && !hasVirtualCanvas
-            && !singleScreen
-            && actualScroll - keptFullScroll > 200
-            && await isUnshiftedScene(keptFullViewport, viewport, dimensions.width)
-        ) {
-            const lastIndex = keptSegments.length - 1
-            const previousBuffer = keptSegments[lastIndex]
-            const previousHeight = previousBuffer ? (await sharp(previousBuffer).metadata()).height ?? 0 : 0
-            const fullHeight = (await sharp(viewport).metadata()).height ?? 0
+        const scrubMedia = viewport && !hasVirtualCanvas && !singleScreen && actualScroll >= scrubHeldUntil
+            ? await readScrubbedMedia(page)
+            : null
 
-            if (lastIndex >= 0 && previousHeight > 0 && fullHeight > previousHeight + 24) {
-                const lastTop = Number(segments[lastIndex]?.top ?? 0)
+        if (scrubMedia && viewport) {
+            const chosen = await chooseScrubbedMediaFrame(
+                page,
+                viewport,
+                actualScroll,
+                dimensions.viewportHeight,
+                dimensions.width,
+            )
 
-                segments[lastIndex] = { input: viewport, left: 0, top: lastTop }
-                keptSegments[lastIndex] = viewport
-                outputHeight += fullHeight - previousHeight
-                recentTail = viewport
+            if (!chosen) {
+                await scrollPageToAndHold(page, actualScroll)
             }
+            else {
+                let image = chosen.image
+                let imageHeight = dimensions.viewportHeight
+                const alreadyShown = Math.max(0, documentCoveredUntil - chosen.scroll)
+                const cropTop = Math.min(alreadyShown, Math.max(0, imageHeight - 48))
 
-            trimmedPixels += Math.max(0, documentEnd - documentCoveredUntil)
-            documentCoveredUntil = Math.max(documentCoveredUntil, documentEnd)
-            continue
+                if (cropTop >= 8) {
+                    image = await sharp(chosen.image)
+                        .extract({
+                            height: imageHeight - cropTop,
+                            left: 0,
+                            top: cropTop,
+                            width: dimensions.width,
+                        })
+                        .png()
+                        .toBuffer()
+                    imageHeight -= cropTop
+                }
+
+                const depictedUntil = chosen.scroll + cropTop + imageHeight
+                const until = Math.min(
+                    dimensions.height,
+                    Math.max(chosen.until, depictedUntil),
+                )
+                const advance = Math.max(0, until - documentCoveredUntil)
+
+                segments.push({ input: image, left: 0, top: outputHeight })
+                keptSegments.push(image)
+                outputHeight += imageHeight
+                recentTail = image
+                trimmedPixels += Math.max(0, advance - imageHeight)
+                documentCoveredUntil = Math.max(documentCoveredUntil, until)
+                scrubHeldUntil = documentCoveredUntil
+                stickyHold = null
+                continue
+            }
         }
 
         const mediaBands = hasVirtualCanvas ? [] : await readUncroppedMediaBands(page)
@@ -986,10 +1012,6 @@ async function captureFullPage(page: import('playwright').Page): Promise<Buffer>
         segments.push({ input: segment, left: 0, top: outputHeight })
         keptSegments.push(segment)
 
-        if (viewport) {
-            keptFullViewport = viewport
-            keptFullScroll = actualScroll
-        }
         stickyHold = pendingSticky ?? (hasVirtualCanvas ? stickyHold : null)
 
         if (!hasVirtualCanvas) {
@@ -1638,70 +1660,180 @@ async function hideCustomCursorFollowers(page: import('playwright').Page): Promi
     }, CURSOR_FOLLOWER_ATTRIBUTE)
 }
 
+type ScrubbedMediaFrame = {
+    image: Buffer
+    scroll: number
+    until: number
+}
+
 /**
- * 釘住在視窗裡的場景，往下捲之後畫面幾乎沒有跟著文件往上移。
- * 這種畫面若仍按文件座標切片，會把同一幕的不同進度疊成三截。
- * 平坦的留白與飽和色不當成這種場景，避免把預留高度裁掉。
+ * 視窗裡是否有正在跟著捲動縮放的大影片或畫布。
+ * 這種畫面不是文件往下長出的新內容，按步進切開會把同一幕的不同縮放疊在一起。
  *
- * @param previous 上一張留下的完整視窗。
- * @param next 目前視窗。
- * @param width 視窗寬度。
- * @returns 中段仍是同一張有細節的畫面時為 true。
+ * @param page 停在擷取位置的頁面。
+ * @returns 有蓋住視窗的中間縮放媒體時為 true。
  */
-async function isUnshiftedScene(previous: Buffer, next: Buffer, width: number): Promise<boolean>
+async function readScrubbedMedia(page: import('playwright').Page): Promise<boolean>
 {
-    const previousRaw = await sharp(previous).removeAlpha().raw().toBuffer()
-    const nextRaw = await sharp(next).removeAlpha().raw().toBuffer()
-    const previousHeight = Math.floor(previousRaw.length / (width * 3))
-    const nextHeight = Math.floor(nextRaw.length / (width * 3))
-    const bandTop = 180
-    const bandBottom = Math.min(760, previousHeight, nextHeight)
+    return page.evaluate(() => {
+        const viewportArea = window.innerWidth * window.innerHeight
 
-    if (bandBottom - bandTop < 200) return false
+        for (const element of document.querySelectorAll<HTMLElement>('video, canvas')) {
+            const style = getComputedStyle(element)
 
-    let difference = 0
-    let compared = 0
+            if (style.position === 'fixed' || style.visibility === 'hidden' || Number(style.opacity) < 0.35) continue
+            if (!/scale/i.test(element.style.transform)) continue
+
+            const bounds = element.getBoundingClientRect()
+            const visibleTop = Math.max(bounds.top, 0)
+            const visibleBottom = Math.min(bounds.bottom, window.innerHeight)
+            const visible = visibleBottom - visibleTop
+
+            if (visible < 48 || bounds.width < window.innerWidth * 0.35) continue
+            if (bounds.width * bounds.height < viewportArea * 0.18) continue
+
+            const match = style.transform.match(/matrix\(\s*([^)]+)\)/u)
+
+            if (!match?.[1]) continue
+
+            const parts = match[1].split(',').map(value => Number.parseFloat(value))
+            const a = parts[0]
+            const b = parts[1]
+            const c = parts[2]
+            const d = parts[3]
+
+            if (a === undefined || b === undefined || c === undefined || d === undefined) continue
+
+            const scaleX = Math.hypot(a, b)
+            const scaleY = Math.hypot(c, d)
+
+            if (Math.abs(scaleX - scaleY) > 0.08) continue
+
+            const scale = Math.min(scaleX, scaleY)
+
+            if (scale < 0.42 || scale > 0.97) continue
+
+            const coversCenter = bounds.top < window.innerHeight * 0.72
+                && bounds.bottom > window.innerHeight * 0.28
+
+            if (coversCenter || visible > window.innerHeight * 0.18) return true
+        }
+
+        return false
+    })
+}
+
+/**
+ * 從目前捲動往後找這段縮放媒體最清楚的一幀，並記下它離開視窗中央的位置。
+ * 平坦的白幀不當選，以免把過場空白留成主畫面。
+ *
+ * @param page 停在擷取位置的頁面。
+ * @param current 目前視窗。
+ * @param origin 目前文件捲動。
+ * @param viewportHeight 視窗高度。
+ * @param width 視窗寬度。
+ * @returns 要留下的那一幀；這段沒有足夠細節時為 null。
+ */
+async function chooseScrubbedMediaFrame(
+    page: import('playwright').Page,
+    current: Buffer,
+    origin: number,
+    viewportHeight: number,
+    width: number,
+): Promise<ScrubbedMediaFrame | null>
+{
+    let bestImage = current
+    let bestScroll = origin
+    let bestDetail = await frameDetail(current, width)
+    let until = origin
+    let sawMedia = false
+
+    for (let step = 0; step <= 6; step += 1) {
+        const requested = origin + step * 240
+        const landed = step === 0 ? origin : await scrollPageToAndHold(page, requested)
+
+        if (step > 0 && landed < requested - 48) break
+
+        const present = await readScrubbedMedia(page)
+
+        if (!present) {
+            if (sawMedia) {
+                until = landed
+                break
+            }
+
+            continue
+        }
+
+        sawMedia = true
+        const image = step === 0 ? current : await screenshotViewport(page, 'allow')
+        const detail = step === 0 ? bestDetail : await frameDetail(image, width)
+
+        if (detail > bestDetail) {
+            bestDetail = detail
+            bestImage = image
+            bestScroll = landed
+        }
+
+        until = landed
+    }
+
+    if (!sawMedia || bestDetail < 8) return null
+
+    return {
+        image: bestImage,
+        scroll: bestScroll,
+        until: Math.max(until, bestScroll + Math.round(viewportHeight * 0.45)),
+    }
+}
+
+/**
+ * 視窗中段的亮度散布。過場白幀接近 0，有照片或介面細節時明顯更高。
+ *
+ * @param image 視窗 PNG。
+ * @param width 視窗寬度。
+ * @returns 平均亮度偏差。
+ */
+async function frameDetail(image: Buffer, width: number): Promise<number>
+{
+    const raw = await sharp(image).removeAlpha().raw().toBuffer()
+    const height = Math.floor(raw.length / (width * 3))
+    const bandTop = 160
+    const bandBottom = Math.min(height - 40, 900)
+
+    if (bandBottom - bandTop < 120) return 0
+
     let spread = 0
+    let compared = 0
 
-    for (let y = bandTop; y < bandBottom; y += 16) {
-        let rowDifference = 0
-        let rowSpread = 0
-        let count = 0
+    for (let y = bandTop; y < bandBottom; y += 20) {
         let lumaSum = 0
+        let count = 0
 
-        for (let x = 40; x < width - 40; x += 16) {
-            const left = (y * width + x) * 3
-            const leftLuma = ((previousRaw[left] ?? 0) + (previousRaw[left + 1] ?? 0) + (previousRaw[left + 2] ?? 0)) / 3
+        for (let x = 80; x < width - 80; x += 20) {
+            const index = (y * width + x) * 3
 
-            rowDifference += Math.abs((previousRaw[left] ?? 0) - (nextRaw[left] ?? 0))
-                + Math.abs((previousRaw[left + 1] ?? 0) - (nextRaw[left + 1] ?? 0))
-                + Math.abs((previousRaw[left + 2] ?? 0) - (nextRaw[left + 2] ?? 0))
-            lumaSum += leftLuma
+            lumaSum += ((raw[index] ?? 0) + (raw[index + 1] ?? 0) + (raw[index + 2] ?? 0)) / 3
             count += 1
         }
 
         if (count === 0) continue
 
         const mean = lumaSum / count
+        let rowSpread = 0
 
-        for (let x = 40; x < width - 40; x += 16) {
-            const left = (y * width + x) * 3
-            const luma = ((previousRaw[left] ?? 0) + (previousRaw[left + 1] ?? 0) + (previousRaw[left + 2] ?? 0)) / 3
+        for (let x = 80; x < width - 80; x += 20) {
+            const index = (y * width + x) * 3
+            const luma = ((raw[index] ?? 0) + (raw[index + 1] ?? 0) + (raw[index + 2] ?? 0)) / 3
 
             rowSpread += Math.abs(luma - mean)
         }
 
-        difference += rowDifference / (count * 255 * 3)
         spread += rowSpread / count
         compared += 1
     }
 
-    if (compared === 0) return false
-
-    const averageDifference = difference / compared
-    const averageSpread = spread / compared
-
-    return averageSpread > 12 && averageDifference < 0.045
+    return compared === 0 ? 0 : spread / compared
 }
 
 /**
@@ -1933,6 +2065,9 @@ async function settleScrollScrubbedFrame(page: import('playwright').Page): Promi
         for (const element of document.body.querySelectorAll<HTMLElement>('*')) {
             if (hasRunningFiniteAnimation(element)) continue
             if (getComputedStyle(element).position === 'fixed') continue
+            // 影片與畫布的縮放是捲動場景本身。收到 transform:none 會把畫面拉出框，
+            // 前後步進再切成花枝、空白螢幕與腳架三截。
+            if (element instanceof HTMLVideoElement || element instanceof HTMLCanvasElement) continue
 
             const inlineOpacity = element.style.opacity !== ''
             const inlineFilter = element.style.filter !== ''
